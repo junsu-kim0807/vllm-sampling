@@ -545,6 +545,11 @@ class EngineArgs:
     async_scheduling: bool = SchedulerConfig.async_scheduling
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
+    enable_starkv_super_cache: bool = CacheConfig.enable_starkv_super_cache
+    starkv_score_fn: str | None = CacheConfig.starkv_score_fn
+    starkv_compression_ratio: float | None = CacheConfig.starkv_compression_ratio
+    starkv_confidence_threshold: float | None = CacheConfig.starkv_confidence_threshold
+    starkv_max_reforward_steps: int | None = CacheConfig.starkv_max_reforward_steps
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1359,6 +1364,11 @@ class EngineArgs:
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
+            enable_starkv_super_cache=self.enable_starkv_super_cache,
+            starkv_score_fn=self.starkv_score_fn,
+            starkv_compression_ratio=self.starkv_compression_ratio,
+            starkv_confidence_threshold=self.starkv_confidence_threshold,
+            starkv_max_reforward_steps=self.starkv_max_reforward_steps,
         )
 
         ray_runtime_env = None

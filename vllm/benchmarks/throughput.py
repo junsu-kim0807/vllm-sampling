@@ -306,6 +306,170 @@ def run_hf(
     return end - start
 
 
+def run_starkv_super(
+    args: argparse.Namespace,
+    requests: list[SampleRequest],
+    tokenizer: PreTrainedTokenizerBase,
+) -> dict[str, Any]:
+    """Run throughput measurements using the StarkV SuperPress pipeline."""
+
+    if not requests:
+        raise ValueError("KVPress backend requires at least one sampled request.")
+
+    try:
+        from transformers import pipeline as hf_pipeline
+    except ImportError as exc:  # pragma: no cover - optional dependency guard
+        raise RuntimeError(
+            "The transformers package is required to run the KVPress backend."
+        ) from exc
+
+    try:
+        from starkv import SuperPress
+    except ImportError as exc:  # pragma: no cover - optional dependency guard
+        raise RuntimeError(
+            "StarkV is not installed. Install starkv to enable the '--backend starkv' option."
+        ) from exc
+
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - optional dependency guard
+        torch = None
+
+    def _configure_press() -> Any:
+        press = SuperPress()
+        if hasattr(press, "compression_ratio"):
+            press.compression_ratio = args.starkv_compression_ratio
+        if hasattr(press, "confidence_threshold"):
+            press.confidence_threshold = args.starkv_confidence_threshold
+        if hasattr(press, "score_fn") and args.starkv_score_fn:
+            press.score_fn = args.starkv_score_fn
+        return press
+
+    device = args.starkv_device
+    if device is None:
+        if torch is not None and torch.cuda.is_available():
+            device = "cuda:0"
+        else:
+            device = "cpu"
+
+    pipeline_kwargs: dict[str, Any] = {
+        "model": args.model,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    if args.tokenizer is not None:
+        pipeline_kwargs["tokenizer"] = args.tokenizer
+    if device == "auto":
+        pipeline_kwargs["device_map"] = "auto"
+    else:
+        pipeline_kwargs["device"] = device
+
+    model_kwargs: dict[str, Any] = {}
+    if torch is not None:
+        dtype_name = getattr(args, "dtype", None)
+        if isinstance(dtype_name, str) and hasattr(torch, dtype_name):
+            model_kwargs["torch_dtype"] = getattr(torch, dtype_name)
+    if model_kwargs:
+        pipeline_kwargs["model_kwargs"] = model_kwargs
+
+    starkv_pipeline = hf_pipeline("kv-press-text-generation", **pipeline_kwargs)
+
+    batch_sizes = args.starkv_batch_sizes or [len(requests)]
+    metrics: list[dict[str, Any]] = []
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_output_tokens = 0
+    total_requests = 0
+
+    def _prompt_text(prompt: str | list[str]) -> str:
+        if isinstance(prompt, str):
+            return prompt
+        return "\n".join(prompt)
+
+    for batch_size in batch_sizes:
+        if batch_size <= 0:
+            warnings.warn("Ignoring non-positive starkv batch size value.", stacklevel=1)
+            continue
+
+        if batch_size > len(requests):
+            warnings.warn(
+                (
+                    f"Requested starkv batch size {batch_size} exceeds the number "
+                    f"of sampled prompts ({len(requests)}); using {len(requests)}."
+                ),
+                stacklevel=1,
+            )
+        effective_batch = min(batch_size, len(requests))
+        batch = requests[:effective_batch]
+        press = _configure_press()
+
+        start = time.perf_counter()
+        for request in batch:
+            if request.multi_modal_data is not None:
+                raise ValueError(
+                    "KVPress backend does not support multi-modal inputs. "
+                    "Please select a text-only dataset."
+                )
+
+            prompt_text = _prompt_text(request.prompt)
+            call_kwargs: dict[str, Any] = {
+                "press": press,
+                "question": None,
+                "answer_prefix": "",
+                "max_new_tokens": request.expected_output_len,
+                "offload": args.starkv_offload,
+                "confidence_threshold": args.starkv_confidence_threshold,
+            }
+            if args.starkv_max_context_length is not None:
+                call_kwargs["max_context_length"] = args.starkv_max_context_length
+            if args.profile:
+                call_kwargs["profile"] = args.profile
+
+            starkv_pipeline(prompt_text, **call_kwargs)
+
+        latency = time.perf_counter() - start
+        prompt_tokens = sum(req.prompt_len for req in batch)
+        output_tokens = sum(req.expected_output_len for req in batch)
+        total_latency += latency
+        total_prompt_tokens += prompt_tokens
+        total_output_tokens += output_tokens
+        total_requests += len(batch)
+
+        denom = latency if latency > 0 else float("inf")
+        batch_metric = {
+            "batch_size": len(batch),
+            "latency_s": latency,
+            "requests_per_second": len(batch) / denom if latency > 0 else float("inf"),
+            "tokens_per_second": (prompt_tokens + output_tokens) / denom
+            if latency > 0
+            else float("inf"),
+        }
+        metrics.append(batch_metric)
+
+    total_tokens = total_prompt_tokens + total_output_tokens
+    if not metrics:
+        raise ValueError(
+            "No StarkV throughput measurements were produced. "
+            "Please provide at least one positive batch size via --starkv-batch-sizes."
+        )
+    summary = {
+        "elapsed_time": total_latency,
+        "total_elapsed_time": total_latency,
+        "num_requests": total_requests,
+        "total_num_tokens": total_tokens,
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_output_tokens": total_output_tokens,
+        "requests_per_second": total_requests / total_latency
+        if total_latency > 0
+        else float("inf"),
+        "tokens_per_second": total_tokens / total_latency if total_latency > 0 else float("inf"),
+        "batch_metrics": metrics,
+    }
+    if metrics:
+        summary["single_batch_latency_s"] = metrics[0]["latency_s"]
+        summary["single_batch_size"] = metrics[0]["batch_size"]
+    return summary
+
+
 def save_to_pytorch_benchmark_format(
     args: argparse.Namespace, results: dict[str, Any]
 ) -> None:
@@ -425,7 +589,7 @@ def validate_args(args):
         args.tokenizer = args.model
 
     # === Backend Validation ===
-    valid_backends = {"vllm", "hf", "mii", "vllm-chat"}
+    valid_backends = {"vllm", "hf", "mii", "vllm-chat", "starkv"}
     if args.backend not in valid_backends:
         raise ValueError(f"Unsupported backend: {args.backend}")
 
@@ -533,7 +697,7 @@ def add_cli_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["vllm", "hf", "mii", "vllm-chat"],
+        choices=["vllm", "hf", "mii", "vllm-chat", "starkv"],
         default="vllm",
     )
     parser.add_argument(
@@ -680,6 +844,51 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "repetition dataset.",
     )
 
+    starkv_group = parser.add_argument_group("StarkV SuperPress options")
+    starkv_group.add_argument(
+        "--starkv-score-fn",
+        type=str,
+        default="morphkv",
+        choices=["morphkv", "kvzip"],
+        help="Score function passed to StarkV SuperPress (only used with --backend starkv).",
+    )
+    starkv_group.add_argument(
+        "--starkv-compression-ratio",
+        type=float,
+        default=0.5,
+        help="Compression ratio applied to SuperPress when --backend starkv is selected.",
+    )
+    starkv_group.add_argument(
+        "--starkv-confidence-threshold",
+        type=float,
+        default=1.0,
+        help="Confidence threshold forwarded to the StarkV pipeline (starkv backend only).",
+    )
+    starkv_group.add_argument(
+        "--starkv-batch-sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Batch sizes evaluated sequentially for throughput scaling when using the starkv backend.",
+    )
+    starkv_group.add_argument(
+        "--starkv-device",
+        type=str,
+        default=None,
+        help="Device identifier for the StarkV transformers pipeline (e.g., cuda:0, cpu, auto).",
+    )
+    starkv_group.add_argument(
+        "--starkv-max-context-length",
+        type=int,
+        default=None,
+        help="Maximum context length hint forwarded to the StarkV pipeline.",
+    )
+    starkv_group.add_argument(
+        "--starkv-offload",
+        action="store_true",
+        help="Enable SuperCache offload mode inside the StarkV pipeline (starkv backend only).",
+    )
+
     parser = AsyncEngineArgs.add_cli_args(parser)
 
 
@@ -697,6 +906,38 @@ def main(args: argparse.Namespace):
     requests = get_requests(args, tokenizer)
     is_multi_modal = any(request.multi_modal_data is not None for request in requests)
     request_outputs: list[RequestOutput] | None = None
+    if args.backend == "starkv":
+        summary = run_starkv_super(args, requests, tokenizer)
+        print(
+            "StarkV SuperPress throughput: "
+            f"{summary['requests_per_second']:.2f} requests/s, "
+            f"{summary['tokens_per_second']:.2f} total tokens/s"
+        )
+        print(f"Total num prompt tokens:  {summary['total_prompt_tokens']}")
+        print(f"Total num output tokens:  {summary['total_output_tokens']}")
+        batch_metrics = summary.get("batch_metrics", [])
+        if batch_metrics:
+            first = batch_metrics[0]
+            print(
+                "Single batch latency "
+                f"(batch_size={first['batch_size']}): {first['latency_s']:.4f}s, "
+                f"{first['requests_per_second']:.2f} requests/s, "
+                f"{first['tokens_per_second']:.2f} tokens/s"
+            )
+            if len(batch_metrics) > 1:
+                print("Batch size scaling results:")
+                for metric in batch_metrics:
+                    print(
+                        f"  batch={metric['batch_size']}: "
+                        f"{metric['requests_per_second']:.2f} requests/s, "
+                        f"{metric['tokens_per_second']:.2f} tokens/s "
+                        f"(latency {metric['latency_s']:.4f}s)"
+                    )
+        if args.output_json:
+            with open(args.output_json, "w") as f:
+                json.dump(summary, f, indent=4)
+            save_to_pytorch_benchmark_format(args, summary)
+        return
     if args.backend == "vllm":
         if args.async_engine:
             elapsed_time = uvloop.run(

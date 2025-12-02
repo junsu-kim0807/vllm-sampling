@@ -101,6 +101,18 @@ class CacheConfig:
     still be controlled by mamba_cache_dtype). If set to 'auto', the data type
     for the ssm state will be determined by mamba_cache_dtype."""
 
+    enable_starkv_super_cache: bool = False
+    """Enable StarkV SuperCache integration. When true, additional StarkV-specific
+    knobs below control the SuperPress behaviour."""
+    starkv_score_fn: str | None = None
+    """Score function identifier to pass to StarkV SuperPress (e.g., morphkv, kvzip)."""
+    starkv_compression_ratio: float | None = None
+    """Target compression ratio for StarkV SuperPress."""
+    starkv_confidence_threshold: float | None = None
+    """Confidence threshold used to trigger reforwarding with StarkV."""
+    starkv_max_reforward_steps: int | None = None
+    """Maximum number of reforward steps StarkV is allowed to perform."""
+
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
     """The number of blocks to allocate for GPU memory."""

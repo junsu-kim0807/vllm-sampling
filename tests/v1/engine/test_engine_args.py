@@ -48,6 +48,30 @@ def test_prefix_caching_from_cli():
         args = parser.parse_args(["--prefix-caching-hash-algo", "invalid"])
 
 
+def test_starkv_flags_propagate():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--enable-starkv-super-cache",
+            "--starkv-score-fn",
+            "morphkv",
+            "--starkv-compression-ratio",
+            "0.4",
+            "--starkv-confidence-threshold",
+            "0.75",
+            "--starkv-max-reforward-steps",
+            "3",
+        ]
+    )
+    vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
+    cache_config = vllm_config.cache_config
+    assert cache_config.enable_starkv_super_cache
+    assert cache_config.starkv_score_fn == "morphkv"
+    assert cache_config.starkv_compression_ratio == 0.4
+    assert cache_config.starkv_confidence_threshold == 0.75
+    assert cache_config.starkv_max_reforward_steps == 3
+
+
 def test_defaults_with_usage_context():
     engine_args = EngineArgs(model="facebook/opt-125m")
     vllm_config: VllmConfig = engine_args.create_engine_config(UsageContext.LLM_CLASS)
