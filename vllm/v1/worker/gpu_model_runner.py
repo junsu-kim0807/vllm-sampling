@@ -225,6 +225,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self.starkv_adapter = None
+        if self.cache_config.enable_starkv_super_cache:
+            from vllm.starkv import StarkVPressAdapter
+
+            self.starkv_adapter = StarkVPressAdapter(self.cache_config)
+            self.starkv_adapter.log_placeholder_event()
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 
