@@ -22,6 +22,7 @@ class StarkVCacheManager(KVCacheManager):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._events: list[dict[str, Any]] = []
+        self._prefill_feedback: list[dict[str, Any]] = []
         logger.info(
             "StarkV cache manager enabled (placeholder). "
             "Future phases will hook SuperPress decisions here."
@@ -61,4 +62,18 @@ class StarkVCacheManager(KVCacheManager):
 
     def get_placeholder_events(self) -> list[dict[str, Any]]:
         return list(self._events)
+
+    def record_prefill_feedback(
+        self, layer_name: str, request_ids: list[str], num_tokens: int
+    ) -> None:
+        feedback = {
+            "layer": layer_name,
+            "requests": list(request_ids),
+            "tokens": num_tokens,
+        }
+        self._prefill_feedback.append(feedback)
+        logger.debug("StarkV prefill feedback: %s", feedback)
+
+    def get_prefill_feedback(self) -> list[dict[str, Any]]:
+        return list(self._prefill_feedback)
 

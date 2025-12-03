@@ -1402,6 +1402,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         for layer_name in kv_cache_group_spec.layer_names:
                             assert type(attn_metadata) is list
                             attn_metadata[ubid][layer_name] = attn_metadata_i
+                            self._notify_starkv_prefill(
+                                layer_name,
+                                attn_metadata_i,
+                                num_reqs,
+                                total_num_scheduled_tokens,
+                            )
                 else:
                     assert isinstance(attn_metadata, dict)
                     attn_metadata_i = builder.build(
@@ -1412,6 +1418,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     use_cascade_attn |= getattr(attn_metadata_i, "use_cascade", False)
                     for layer_name in attn_group.layer_names:
                         attn_metadata[layer_name] = attn_metadata_i
+                        self._notify_starkv_prefill(
+                            layer_name,
+                            attn_metadata_i,
+                            num_reqs,
+                            total_num_scheduled_tokens,
+                        )
 
         # disable cascade attention when DBO
         if ubatch_slices is not None:
@@ -1432,6 +1444,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_tokens_across_dp,
             use_cascade_attn,
         )
+
+    def _notify_starkv_prefill(
+        self,
+        layer_name: str,
+        attn_metadata_i: AttentionMetadata,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+    ) -> None:
+        if self.starkv_adapter is None:
+            return
+        req_ids = [
+            str(req_id)
+            for req_id in self.input_batch.req_ids[:num_reqs]  # type: ignore[index]
+        ]
+        self.starkv_adapter.process_prefill_metadata(
+            layer_name, total_num_scheduled_tokens, req_ids
+        )
+        recorder = getattr(self.kv_cache_manager, "record_prefill_feedback", None)
+        if callable(recorder):
+            recorder(layer_name, req_ids, total_num_scheduled_tokens)
 
     def _compute_cascade_attn_prefix_len(
         self,

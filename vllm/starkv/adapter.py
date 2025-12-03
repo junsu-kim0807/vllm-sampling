@@ -87,3 +87,29 @@ class StarkVPressAdapter:
         else:
             logger.debug("StarkV adapter placeholder invoked.")
 
+    def process_prefill_metadata(
+        self,
+        layer_name: str,
+        num_tokens: int,
+        request_ids: list[str],
+    ) -> None:
+        """
+        Placeholder bridge that will eventually ship real KV tensors into
+        StarKV. For now it simply logs the metadata to prove the hook is wired.
+        """
+
+        if not self.is_available:
+            logger.debug(
+                "StarkV unavailable; skipping metadata for layer %s (tokens=%d).",
+                layer_name,
+                num_tokens,
+            )
+            return
+
+        logger.debug(
+            "StarkV metadata: layer=%s tokens=%d reqs=%d",
+            layer_name,
+            num_tokens,
+            len(request_ids),
+        )
+

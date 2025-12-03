@@ -68,3 +68,7 @@ def test_starkv_cache_manager_records_placeholder_events():
     events = manager.get_placeholder_events()
     assert any(event["kind"] == "free" for event in events)
 
+    manager.record_prefill_feedback("layer", ["req"], 32)
+    feedback = manager.get_prefill_feedback()
+    assert feedback and feedback[-1]["layer"] == "layer"
+
