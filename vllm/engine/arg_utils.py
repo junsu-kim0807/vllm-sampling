@@ -891,6 +891,24 @@ class EngineArgs:
         cache_group.add_argument(
             "--mamba-ssm-cache-dtype", **cache_kwargs["mamba_ssm_cache_dtype"]
         )
+        cache_group.add_argument(
+            "--enable-starkv-super-cache", **cache_kwargs["enable_starkv_super_cache"]
+        )
+        cache_group.add_argument(
+            "--starkv-score-fn", **cache_kwargs["starkv_score_fn"]
+        )
+        cache_group.add_argument(
+            "--starkv-compression-ratio",
+            **cache_kwargs["starkv_compression_ratio"],
+        )
+        cache_group.add_argument(
+            "--starkv-confidence-threshold",
+            **cache_kwargs["starkv_confidence_threshold"],
+        )
+        cache_group.add_argument(
+            "--starkv-max-reforward-steps",
+            **cache_kwargs["starkv_max_reforward_steps"],
+        )
 
         # Multimodal related configs
         multimodal_kwargs = get_kwargs(MultiModalConfig)

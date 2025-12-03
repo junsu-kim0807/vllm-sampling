@@ -23,7 +23,7 @@ def fake_starkv_module(monkeypatch):
     module.SuperPress = FakeSuperPress
     monkeypatch.setitem(sys.modules, "starkv", module)
     yield module
-    monkeypatch.delen(sys.modules["starkv"], raising=False)
+    monkeypatch.delitem(sys.modules, "starkv", raising=False)
 
 
 def test_adapter_initializes_with_fake_module(fake_starkv_module):
@@ -41,7 +41,7 @@ def test_adapter_initializes_with_fake_module(fake_starkv_module):
 
 
 def test_adapter_raises_without_dependency(monkeypatch):
-    monkeypatch.delen(sys.modules["starkv"], raising=False)
+    monkeypatch.delitem(sys.modules, "starkv", raising=False)
     cache_config = CacheConfig()
     cache_config.enable_starkv_super_cache = True
 
