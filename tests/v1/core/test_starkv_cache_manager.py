@@ -11,6 +11,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 
 
 def _make_request(request_id: str, token_ids: list[int], block_size: int) -> Request:
+    hash_fn = lambda data: str(data).encode("utf-8")
     return Request(
         request_id=request_id,
         prompt_token_ids=token_ids,
@@ -19,7 +20,7 @@ def _make_request(request_id: str, token_ids: list[int], block_size: int) -> Req
         eos_token_id=100,
         lora_request=None,
         cache_salt=None,
-        block_hasher=get_request_block_hasher(block_size, hash_fn=lambda x: x),
+        block_hasher=get_request_block_hasher(block_size, caching_hash_fn=hash_fn),
     )
 
 
