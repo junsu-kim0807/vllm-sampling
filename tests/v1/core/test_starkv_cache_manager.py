@@ -5,13 +5,13 @@ import torch
 
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import Request
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+from vllm.v1.core.kv_cache_utils import NONE_HASH, get_request_block_hasher
 from vllm.v1.core.starkv_cache_manager import StarkVCacheManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 
 
 def _make_request(request_id: str, token_ids: list[int], block_size: int) -> Request:
-    hash_fn = lambda data: str(data).encode("utf-8")
+    hash_fn = lambda data: (str(data).encode("utf-8") if data is not None else NONE_HASH)
     return Request(
         request_id=request_id,
         prompt_token_ids=token_ids,
