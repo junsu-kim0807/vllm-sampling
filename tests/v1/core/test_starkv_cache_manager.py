@@ -4,6 +4,7 @@
 import torch
 
 from vllm.sampling_params import SamplingParams
+from vllm.starkv.adapter import StarkVPrefillResult
 from vllm.v1.core.kv_cache_manager import Request
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.starkv_cache_manager import StarkVCacheManager
@@ -68,7 +69,11 @@ def test_starkv_cache_manager_records_placeholder_events():
     events = manager.get_placeholder_events()
     assert any(event["kind"] == "free" for event in events)
 
-    manager.record_prefill_feedback("layer", ["req"], 32)
+    result = StarkVPrefillResult(
+        low_confidence_requests=["req"], confidence_by_request={"req": 0.5}
+    )
+    manager.record_prefill_feedback("layer", ["req"], 32, result)
     feedback = manager.get_prefill_feedback()
     assert feedback and feedback[-1]["layer"] == "layer"
+    assert manager.consume_reforward_flag("req")
 

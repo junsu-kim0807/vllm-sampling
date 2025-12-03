@@ -312,6 +312,12 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            consume_ref = getattr(
+                self.kv_cache_manager, "consume_reforward_flag", None
+            )
+            if callable(consume_ref) and consume_ref(request.request_id):
+                request.starkv_reforward_count += 1
+                request.starkv_reforward_steps += num_new_tokens
             req_index += 1
 
             # Speculative decode related.

@@ -121,6 +121,10 @@ class Request:
         # The number of requests being preempted by the scheduler
         self.num_preemptions = 0
 
+        # StarKV metrics
+        self.starkv_reforward_count = 0
+        self.starkv_reforward_steps = 0
+
         self.block_hashes: list[BlockHash] = []
         self.get_hash_new_full_blocks: Callable[[], list[BlockHash]] | None = None
         if block_hasher is not None:

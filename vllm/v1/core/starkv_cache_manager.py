@@ -23,6 +23,7 @@ class StarkVCacheManager(KVCacheManager):
         super().__init__(*args, **kwargs)
         self._events: list[dict[str, Any]] = []
         self._prefill_feedback: list[dict[str, Any]] = []
+        self._reforward_pending: set[str] = set()
         logger.info(
             "StarkV cache manager enabled (placeholder). "
             "Future phases will hook SuperPress decisions here."
@@ -64,16 +65,33 @@ class StarkVCacheManager(KVCacheManager):
         return list(self._events)
 
     def record_prefill_feedback(
-        self, layer_name: str, request_ids: list[str], num_tokens: int
+        self,
+        layer_name: str,
+        request_ids: list[str],
+        num_tokens: int,
+        result: Any | None = None,
     ) -> None:
         feedback = {
             "layer": layer_name,
             "requests": list(request_ids),
             "tokens": num_tokens,
+            "result": result,
         }
         self._prefill_feedback.append(feedback)
         logger.debug("StarkV prefill feedback: %s", feedback)
+        if result is not None:
+            for request_id in result.low_confidence_requests:
+                self._reforward_pending.add(request_id)
 
     def get_prefill_feedback(self) -> list[dict[str, Any]]:
         return list(self._prefill_feedback)
+
+    def mark_reforward_needed(self, request_id: str) -> None:
+        self._reforward_pending.add(request_id)
+
+    def consume_reforward_flag(self, request_id: str) -> bool:
+        if request_id in self._reforward_pending:
+            self._reforward_pending.remove(request_id)
+            return True
+        return False
 

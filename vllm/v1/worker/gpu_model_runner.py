@@ -1458,12 +1458,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             str(req_id)
             for req_id in self.input_batch.req_ids[:num_reqs]  # type: ignore[index]
         ]
-        self.starkv_adapter.process_prefill_metadata(
+        result = self.starkv_adapter.process_prefill_metadata(
             layer_name, total_num_scheduled_tokens, req_ids
         )
         recorder = getattr(self.kv_cache_manager, "record_prefill_feedback", None)
         if callable(recorder):
-            recorder(layer_name, req_ids, total_num_scheduled_tokens)
+            recorder(layer_name, req_ids, total_num_scheduled_tokens, result)
 
     def _compute_cascade_attn_prefix_len(
         self,

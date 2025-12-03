@@ -3,12 +3,19 @@
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Dict, List
 
 from vllm.config.cache import CacheConfig
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class StarkVPrefillResult:
+    low_confidence_requests: list[str]
+    confidence_by_request: dict[str, float]
 
 
 class StarkVPressAdapter:
@@ -22,6 +29,7 @@ class StarkVPressAdapter:
         self.cache_config = cache_config
         self._press: Any | None = None
         self.is_available: bool = False
+        self.force_low_confidence: bool = False
         self._initialize_press()
 
     @property
@@ -92,10 +100,11 @@ class StarkVPressAdapter:
         layer_name: str,
         num_tokens: int,
         request_ids: list[str],
-    ) -> None:
+    ) -> StarkVPrefillResult | None:
         """
         Placeholder bridge that will eventually ship real KV tensors into
-        StarKV. For now it simply logs the metadata to prove the hook is wired.
+        StarKV. For now it simply logs the metadata and emits dummy confidence
+        signals to drive the reforward plumbing.
         """
 
         if not self.is_available:
@@ -104,12 +113,24 @@ class StarkVPressAdapter:
                 layer_name,
                 num_tokens,
             )
-            return
+            return None
 
         logger.debug(
             "StarkV metadata: layer=%s tokens=%d reqs=%d",
             layer_name,
             num_tokens,
             len(request_ids),
+        )
+
+        base_confidence = 0.0 if self.force_low_confidence else 1.0
+        confidences = {rid: base_confidence for rid in request_ids}
+        low_conf = []
+        threshold = self.cache_config.starkv_confidence_threshold
+        if threshold is not None and base_confidence < threshold:
+            low_conf = list(request_ids)
+
+        return StarkVPrefillResult(
+            low_confidence_requests=low_conf,
+            confidence_by_request=confidences,
         )
 
