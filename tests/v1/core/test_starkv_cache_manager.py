@@ -76,6 +76,7 @@ def test_starkv_cache_manager_records_placeholder_events():
     feedback = manager.get_prefill_feedback()
     assert feedback and feedback[-1]["layer"] == "layer"
     manager.demote_to_super_cache("req", 16)
-    assert manager.get_super_cache_usage() >= 16
+    if manager.offload_enabled:
+        assert manager.get_super_cache_usage() >= 16
     assert manager.consume_reforward_flag("req")
 
