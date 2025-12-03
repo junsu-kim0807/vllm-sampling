@@ -22,6 +22,7 @@ from vllm.v1.core.encoder_cache_manager import (
     compute_encoder_budget,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.starkv_cache_manager import StarkVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
@@ -162,7 +163,12 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
 
         # Create the KV cache manager.
-        self.kv_cache_manager = KVCacheManager(
+        manager_cls = (
+            StarkVCacheManager
+            if kv_cache_config.enable_starkv_super_cache
+            else KVCacheManager
+        )
+        self.kv_cache_manager = manager_cls(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             enable_caching=self.cache_config.enable_prefix_caching,

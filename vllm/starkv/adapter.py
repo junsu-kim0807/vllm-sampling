@@ -21,6 +21,7 @@ class StarkVPressAdapter:
     def __init__(self, cache_config: CacheConfig):
         self.cache_config = cache_config
         self._press: Any | None = None
+        self.is_available: bool = False
         self._initialize_press()
 
     @property
@@ -30,15 +31,19 @@ class StarkVPressAdapter:
     def _initialize_press(self) -> None:
         try:
             from starkv import SuperPress  # type: ignore[attr-defined]
-        except ImportError as exc:  # pragma: no cover - exercised via tests
-            raise RuntimeError(
+        except ImportError:  # pragma: no cover - exercised via tests
+            logger.warning(
                 "StarkV SuperCache requested but the 'starkv' package is not "
-                "installed. Please install starkv to enable this feature."
-            ) from exc
+                "installed. Running without StarkV integration."
+            )
+            self.is_available = False
+            self._press = None
+            return
 
         press = SuperPress()
         self._apply_cache_config(press)
         self._press = press
+        self.is_available = True
         logger.info(
             "Initialized StarkV SuperPress (compression_ratio=%s, score_fn=%s, "
             "confidence_threshold=%s, max_reforward_steps=%s)",
@@ -75,9 +80,9 @@ class StarkVPressAdapter:
         Later phases will replace this with real compression hooks.
         """
 
-        if self._press is None:
+        if not self.is_available:
             logger.debug(
-                "StarkV adapter placeholder invoked but SuperPress is not initialized."
+                "StarkV adapter placeholder invoked but StarkV is unavailable."
             )
         else:
             logger.debug("StarkV adapter placeholder invoked.")

@@ -395,3 +395,4 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
     kv_cache_groups: list[KVCacheGroupSpec]
+    enable_starkv_super_cache: bool = False

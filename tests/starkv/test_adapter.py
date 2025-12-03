@@ -35,16 +35,18 @@ def test_adapter_initializes_with_fake_module(fake_starkv_module):
 
     adapter = StarkVPressAdapter(cache_config)
     assert adapter.press is not None
+    assert adapter.is_available
     assert adapter.press.compression_ratio == 0.4
     assert adapter.press.score_fn == "morphkv"
     assert adapter.press.confidence_threshold == 0.8
 
 
-def test_adapter_raises_without_dependency(monkeypatch):
+def test_adapter_handles_missing_dependency(monkeypatch):
     monkeypatch.delitem(sys.modules, "starkv", raising=False)
     cache_config = CacheConfig()
     cache_config.enable_starkv_super_cache = True
 
-    with pytest.raises(RuntimeError):
-        StarkVPressAdapter(cache_config)
+    adapter = StarkVPressAdapter(cache_config)
+    assert adapter.press is None
+    assert not adapter.is_available
 

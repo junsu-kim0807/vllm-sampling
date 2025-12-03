@@ -988,6 +988,7 @@ def get_kv_cache_config_from_groups(
     Returns:
         The generated KVCacheConfig
     """
+    starkv_enabled = vllm_config.cache_config.enable_starkv_super_cache
     if len(kv_cache_groups) == 0:
         # Attention free models do not have KV cache.
         # Return num_blocks=1 as BlockPool always needs a null_block.
@@ -995,6 +996,7 @@ def get_kv_cache_config_from_groups(
             num_blocks=1,
             kv_cache_tensors=[],
             kv_cache_groups=kv_cache_groups,
+            enable_starkv_super_cache=starkv_enabled,
         )
 
     # Determine how model runners should initialize the KV cache tensors.
@@ -1046,6 +1048,7 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        enable_starkv_super_cache=starkv_enabled,
     )
 
 
