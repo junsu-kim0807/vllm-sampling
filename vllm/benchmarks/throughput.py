@@ -846,25 +846,6 @@ def add_cli_args(parser: argparse.ArgumentParser):
 
     starkv_group = parser.add_argument_group("StarkV SuperPress options")
     starkv_group.add_argument(
-        "--starkv-score-fn",
-        type=str,
-        default="morphkv",
-        choices=["morphkv", "kvzip"],
-        help="Score function passed to StarkV SuperPress (only used with --backend starkv).",
-    )
-    starkv_group.add_argument(
-        "--starkv-compression-ratio",
-        type=float,
-        default=0.5,
-        help="Compression ratio applied to SuperPress when --backend starkv is selected.",
-    )
-    starkv_group.add_argument(
-        "--starkv-confidence-threshold",
-        type=float,
-        default=1.0,
-        help="Confidence threshold forwarded to the StarkV pipeline (starkv backend only).",
-    )
-    starkv_group.add_argument(
         "--starkv-batch-sizes",
         type=int,
         nargs="+",
