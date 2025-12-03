@@ -1464,6 +1464,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         recorder = getattr(self.kv_cache_manager, "record_prefill_feedback", None)
         if callable(recorder):
             recorder(layer_name, req_ids, total_num_scheduled_tokens, result)
+        if (
+            result is not None
+            and getattr(self.kv_cache_manager, "demote_to_super_cache", None)
+            and result.low_confidence_requests
+        ):
+            share = max(total_num_scheduled_tokens // len(result.low_confidence_requests), 1)
+            for req_id in result.low_confidence_requests:
+                self.kv_cache_manager.demote_to_super_cache(req_id, share)
 
     def _compute_cascade_attn_prefix_len(
         self,

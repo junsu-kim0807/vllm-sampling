@@ -550,6 +550,7 @@ class EngineArgs:
     starkv_compression_ratio: float | None = CacheConfig.starkv_compression_ratio
     starkv_confidence_threshold: float | None = CacheConfig.starkv_confidence_threshold
     starkv_max_reforward_steps: int | None = CacheConfig.starkv_max_reforward_steps
+    starkv_offload: bool = CacheConfig.starkv_offload
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -908,6 +909,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--starkv-max-reforward-steps",
             **cache_kwargs["starkv_max_reforward_steps"],
+        )
+        cache_group.add_argument(
+            "--starkv-offload",
+            **cache_kwargs["starkv_offload"],
         )
 
         # Multimodal related configs
@@ -1387,6 +1392,7 @@ class EngineArgs:
             starkv_compression_ratio=self.starkv_compression_ratio,
             starkv_confidence_threshold=self.starkv_confidence_threshold,
             starkv_max_reforward_steps=self.starkv_max_reforward_steps,
+            starkv_offload=self.starkv_offload,
         )
 
         ray_runtime_env = None

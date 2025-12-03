@@ -864,12 +864,6 @@ def add_cli_args(parser: argparse.ArgumentParser):
         default=None,
         help="Maximum context length hint forwarded to the StarkV pipeline.",
     )
-    starkv_group.add_argument(
-        "--starkv-offload",
-        action="store_true",
-        help="Enable SuperCache offload mode inside the StarkV pipeline (starkv backend only).",
-    )
-
     parser = AsyncEngineArgs.add_cli_args(parser)
 
 

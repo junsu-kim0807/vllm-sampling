@@ -129,8 +129,9 @@ class StarkVPressAdapter:
         if threshold is not None and base_confidence < threshold:
             low_conf = list(request_ids)
 
-        return StarkVPrefillResult(
+        result = StarkVPrefillResult(
             low_confidence_requests=low_conf,
             confidence_by_request=confidences,
         )
+        return result
 

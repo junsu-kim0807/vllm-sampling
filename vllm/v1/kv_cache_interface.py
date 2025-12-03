@@ -396,3 +396,4 @@ class KVCacheConfig:
     """
     kv_cache_groups: list[KVCacheGroupSpec]
     enable_starkv_super_cache: bool = False
+    starkv_offload: bool = False

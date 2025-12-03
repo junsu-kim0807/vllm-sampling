@@ -112,6 +112,8 @@ class CacheConfig:
     """Confidence threshold used to trigger reforwarding with StarkV."""
     starkv_max_reforward_steps: int | None = None
     """Maximum number of reforward steps StarkV is allowed to perform."""
+    starkv_offload: bool = False
+    """Whether demoted StarKV blocks should be offloaded to CPU/super cache."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)

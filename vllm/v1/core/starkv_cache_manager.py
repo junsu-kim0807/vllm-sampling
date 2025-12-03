@@ -24,6 +24,10 @@ class StarkVCacheManager(KVCacheManager):
         self._events: list[dict[str, Any]] = []
         self._prefill_feedback: list[dict[str, Any]] = []
         self._reforward_pending: set[str] = set()
+        self._super_cache_tokens: int = 0
+        self.offload_enabled = getattr(
+            self.kv_cache_config, "starkv_offload", False
+        )
         logger.info(
             "StarkV cache manager enabled (placeholder). "
             "Future phases will hook SuperPress decisions here."
@@ -94,4 +98,19 @@ class StarkVCacheManager(KVCacheManager):
             self._reforward_pending.remove(request_id)
             return True
         return False
+
+    def demote_to_super_cache(self, request_id: str, num_tokens: int) -> None:
+        if not self.offload_enabled:
+            return
+        self._super_cache_tokens += num_tokens
+        logger.debug(
+            "StarkV offload placeholder: request %s demoted %d tokens "
+            "(total super cache=%d)",
+            request_id,
+            num_tokens,
+            self._super_cache_tokens,
+        )
+
+    def get_super_cache_usage(self) -> int:
+        return self._super_cache_tokens
 
