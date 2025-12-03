@@ -33,7 +33,7 @@ from vllm.v1.utils import APIServerProcessManager, wait_for_completion_or_failur
 logger = init_logger(__name__)
 
 DESCRIPTION = """Launch a local OpenAI-compatible API server to serve LLM
-completions via HTTP. Defaults to Qwen/Qwen3-0.6B if no model is specified.
+completions via HTTP. Defaults to meta-llama/Meta-Llama-3.1-8B-Instruct if no model is specified.
 
 Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 --help=ModelConfig, --help=Frontend)
