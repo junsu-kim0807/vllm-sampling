@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
-
 from vllm.config.cache import CacheConfig
 from vllm.logger import init_logger
 
@@ -27,9 +27,11 @@ class StarkVPressAdapter:
 
     def __init__(self, cache_config: CacheConfig):
         self.cache_config = cache_config
+        self.force_low_confidence = bool(
+            int(os.getenv("STARKV_FORCE_LOW_CONF", "0"))
+        )
         self._press: Any | None = None
         self.is_available: bool = False
-        self.force_low_confidence: bool = False
         self._initialize_press()
 
     @property
