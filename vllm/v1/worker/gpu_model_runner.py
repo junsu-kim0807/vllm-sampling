@@ -227,7 +227,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.observability_config = vllm_config.observability_config
         self.starkv_adapter = None
         if self.cache_config.enable_starkv_super_cache:
-            from vllm.starkv import StarkVPressAdapter
+from vllm.starkv import StarkVPressAdapter, StarkVLayerSnapshot
 
             self.starkv_adapter = StarkVPressAdapter(self.cache_config)
             self.starkv_adapter.log_placeholder_event()
@@ -1407,6 +1407,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                 attn_metadata_i,
                                 num_reqs,
                                 total_num_scheduled_tokens,
+                                slot_mapping,
                             )
                 else:
                     assert isinstance(attn_metadata, dict)
@@ -1423,6 +1424,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             attn_metadata_i,
                             num_reqs,
                             total_num_scheduled_tokens,
+                            slot_mapping,
                         )
 
         # disable cascade attention when DBO
@@ -1451,6 +1453,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         attn_metadata_i: AttentionMetadata,
         num_reqs: int,
         total_num_scheduled_tokens: int,
+        slot_mapping,
     ) -> None:
         if self.starkv_adapter is None:
             return
@@ -1458,20 +1461,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             str(req_id)
             for req_id in self.input_batch.req_ids[:num_reqs]  # type: ignore[index]
         ]
-        result = self.starkv_adapter.process_prefill_metadata(
-            layer_name, total_num_scheduled_tokens, req_ids
+        snapshot = StarkVLayerSnapshot(
+            layer_name=layer_name,
+            request_ids=req_ids,
+            num_tokens=total_num_scheduled_tokens,
+            slot_mapping=slot_mapping.detach().cpu().clone(),
         )
-        recorder = getattr(self.kv_cache_manager, "record_prefill_feedback", None)
-        if callable(recorder):
-            recorder(layer_name, req_ids, total_num_scheduled_tokens, result)
-        if (
-            result is not None
-            and getattr(self.kv_cache_manager, "demote_to_super_cache", None)
-            and result.low_confidence_requests
-        ):
-            share = max(total_num_scheduled_tokens // len(result.low_confidence_requests), 1)
-            for req_id in result.low_confidence_requests:
-                self.kv_cache_manager.demote_to_super_cache(req_id, share)
+        result = self.starkv_adapter.process_prefill_snapshot(snapshot)
+        if result is None:
+            return
 
     def _compute_cascade_attn_prefix_len(
         self,

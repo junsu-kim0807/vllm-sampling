@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
+
 from vllm.config.cache import CacheConfig
 from vllm.logger import init_logger
 
@@ -16,6 +17,14 @@ logger = init_logger(__name__)
 class StarkVPrefillResult:
     low_confidence_requests: list[str]
     confidence_by_request: dict[str, float]
+
+
+@dataclass
+class StarkVLayerSnapshot:
+    layer_name: str
+    request_ids: list[str]
+    num_tokens: int
+    slot_mapping: Any  # CPU tensor or list representing slot mapping
 
 
 class StarkVPressAdapter:
@@ -97,39 +106,38 @@ class StarkVPressAdapter:
         else:
             logger.debug("StarkV adapter placeholder invoked.")
 
-    def process_prefill_metadata(
+    def process_prefill_snapshot(
         self,
-        layer_name: str,
-        num_tokens: int,
-        request_ids: list[str],
+        snapshot: StarkVLayerSnapshot,
     ) -> StarkVPrefillResult | None:
         """
-        Placeholder bridge that will eventually ship real KV tensors into
-        StarKV. For now it simply logs the metadata and emits dummy confidence
-        signals to drive the reforward plumbing.
+        Placeholder bridge that receives a per-layer snapshot (including the
+        slot mapping). Until the real StarKV scorer is integrated, we emit
+        dummy confidence data to exercise the control flow.
         """
 
         if not self.is_available:
             logger.debug(
                 "StarkV unavailable; skipping metadata for layer %s (tokens=%d).",
-                layer_name,
-                num_tokens,
+                snapshot.layer_name,
+                snapshot.num_tokens,
             )
             return None
 
         logger.debug(
-            "StarkV metadata: layer=%s tokens=%d reqs=%d",
-            layer_name,
-            num_tokens,
-            len(request_ids),
+            "StarkV snapshot: layer=%s tokens=%d reqs=%d slots_shape=%s",
+            snapshot.layer_name,
+            snapshot.num_tokens,
+            len(snapshot.request_ids),
+            getattr(snapshot.slot_mapping, "shape", None),
         )
 
         base_confidence = 0.0 if self.force_low_confidence else 1.0
-        confidences = {rid: base_confidence for rid in request_ids}
+        confidences = {rid: base_confidence for rid in snapshot.request_ids}
         low_conf = []
         threshold = self.cache_config.starkv_confidence_threshold
         if threshold is not None and base_confidence < threshold:
-            low_conf = list(request_ids)
+            low_conf = list(snapshot.request_ids)
 
         result = StarkVPrefillResult(
             low_confidence_requests=low_conf,
