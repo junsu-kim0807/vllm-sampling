@@ -12,9 +12,9 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
-class StarkVCacheManager(KVCacheManager):
+class StarKVCacheManager(KVCacheManager):
     """
-    Placeholder StarkV-aware cache manager. Phase 3 introduces the plumbing
+    Placeholder StarKV-aware cache manager. Phase 3 introduces the plumbing
     needed to track future SuperCache demotions/promotions without altering the
     underlying KV allocation behaviour yet.
     """
@@ -29,7 +29,7 @@ class StarkVCacheManager(KVCacheManager):
             self.kv_cache_config, "starkv_offload", False
         )
         logger.info(
-            "StarkV cache manager enabled (placeholder). "
+            "StarKV cache manager enabled (placeholder). "
             "Future phases will hook SuperPress decisions here."
         )
 
@@ -63,7 +63,7 @@ class StarkVCacheManager(KVCacheManager):
     def _record_event(self, kind: str, request_id: str, tokens: int | None) -> None:
         event = {"kind": kind, "request_id": request_id, "tokens": tokens}
         self._events.append(event)
-        logger.debug("StarkV cache placeholder event: %s", event)
+        logger.debug("StarKV cache placeholder event: %s", event)
 
     def get_placeholder_events(self) -> list[dict[str, Any]]:
         return list(self._events)
@@ -82,7 +82,7 @@ class StarkVCacheManager(KVCacheManager):
             "result": result,
         }
         self._prefill_feedback.append(feedback)
-        logger.debug("StarkV prefill feedback: %s", feedback)
+        logger.debug("StarKV prefill feedback: %s", feedback)
         if result is not None:
             for request_id in result.low_confidence_requests:
                 self._reforward_pending.add(request_id)
@@ -104,7 +104,7 @@ class StarkVCacheManager(KVCacheManager):
             return
         self._super_cache_tokens += num_tokens
         logger.debug(
-            "StarkV offload placeholder: request %s demoted %d tokens "
+            "StarKV offload placeholder: request %s demoted %d tokens "
             "(total super cache=%d)",
             request_id,
             num_tokens,

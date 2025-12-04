@@ -7,7 +7,7 @@ import types
 import pytest
 
 from vllm.config.cache import CacheConfig
-from vllm.starkv.adapter import StarkVPressAdapter
+from vllm.starkv.adapter import StarKVPressAdapter
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ def test_adapter_initializes_with_fake_module(fake_starkv_module):
     cache_config.starkv_score_fn = "morphkv"
     cache_config.starkv_confidence_threshold = 0.8
 
-    adapter = StarkVPressAdapter(cache_config)
+    adapter = StarKVPressAdapter(cache_config)
     assert adapter.press is not None
     assert adapter.is_available
     assert adapter.press.compression_ratio == 0.4
@@ -46,7 +46,7 @@ def test_adapter_handles_missing_dependency(monkeypatch):
     cache_config = CacheConfig()
     cache_config.enable_starkv_super_cache = True
 
-    adapter = StarkVPressAdapter(cache_config)
+    adapter = StarKVPressAdapter(cache_config)
     assert adapter.press is None
     assert not adapter.is_available
 
