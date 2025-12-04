@@ -17,6 +17,8 @@ logger = init_logger(__name__)
 class StarKVPrefillResult:
     low_confidence_requests: list[str]
     confidence_by_request: dict[str, float]
+    keep_tokens_by_request: dict[str, list[int]] | None = None
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass
@@ -111,9 +113,8 @@ class StarKVPressAdapter:
         snapshot: StarKVLayerSnapshot,
     ) -> StarKVPrefillResult | None:
         """
-        Placeholder bridge that receives a per-layer snapshot (including the
-        slot mapping). Until the real StarKV scorer is integrated, we emit
-        dummy confidence data to exercise the control flow.
+        Forward a prefill snapshot to StarKV's scorer (if available) and convert
+        the output into a StarKVPrefillResult consumed by the cache manager.
         """
 
         if not self.is_available:
@@ -124,24 +125,150 @@ class StarKVPressAdapter:
             )
             return None
 
+        payload = self._build_payload(snapshot)
         logger.debug(
             "StarKV snapshot: layer=%s tokens=%d reqs=%d slots_shape=%s",
             snapshot.layer_name,
             snapshot.num_tokens,
             len(snapshot.request_ids),
-            getattr(snapshot.slot_mapping, "shape", None),
+            payload["slot_mapping_shape"],
         )
 
+        result = self._score_with_press(snapshot, payload)
+        return result
+
+    def _build_payload(self, snapshot: StarKVLayerSnapshot) -> Dict[str, Any]:
+        slot_mapping = snapshot.slot_mapping
+        slot_shape = None
+        if hasattr(slot_mapping, "shape"):
+            slot_shape = tuple(slot_mapping.shape)  # type: ignore[arg-type]
+        if hasattr(slot_mapping, "numpy"):
+            slot_mapping = slot_mapping.numpy()
+        elif hasattr(slot_mapping, "tolist"):
+            slot_mapping = slot_mapping.tolist()
+
+        return {
+            "layer_name": snapshot.layer_name,
+            "request_ids": snapshot.request_ids,
+            "num_tokens": snapshot.num_tokens,
+            "slot_mapping": slot_mapping,
+            "slot_mapping_shape": slot_shape,
+        }
+
+    def _score_with_press(
+        self,
+        snapshot: StarKVLayerSnapshot,
+        payload: Dict[str, Any],
+    ) -> StarKVPrefillResult | None:
+        press = self.press
+        if press is None or not hasattr(press, "score_prefill"):
+            logger.debug(
+                "StarKV SuperPress does not expose score_prefill(); "
+                "falling back to placeholder confidences."
+            )
+            return self._placeholder_result(snapshot)
+
+        try:
+            raw_result = press.score_prefill(payload)  # type: ignore[attr-defined]
+        except Exception:
+            logger.exception(
+                "StarKV score_prefill() raised; using placeholder confidences."
+            )
+            return self._placeholder_result(snapshot)
+
+        parsed = self._parse_press_result(snapshot, raw_result)
+        if parsed is None:
+            logger.warning(
+                "StarKV score_prefill() returned an unexpected payload. "
+                "Using placeholder confidences."
+            )
+            return self._placeholder_result(snapshot)
+        return parsed
+
+    def _parse_press_result(
+        self,
+        snapshot: StarKVLayerSnapshot,
+        raw_result: Any,
+    ) -> StarKVPrefillResult | None:
+        if raw_result is None:
+            return None
+        if isinstance(raw_result, StarKVPrefillResult):
+            return raw_result
+        if not isinstance(raw_result, dict):
+            logger.debug("StarKV score_prefill returned non-dict result: %s", type(raw_result))
+            return None
+
+        confidence_map: Dict[str, float] = {}
+        raw_conf = raw_result.get("confidence_by_request") or raw_result.get("confidence")
+        if isinstance(raw_conf, dict):
+            confidence_map = {
+                str(req_id): float(score)
+                for req_id, score in raw_conf.items()
+            }
+        elif isinstance(raw_conf, (int, float)):
+            confidence_map = {
+                rid: float(raw_conf) for rid in snapshot.request_ids
+            }
+        else:
+            confidence_map = {rid: 1.0 for rid in snapshot.request_ids}
+
+        keep_tokens = None
+        raw_keep = raw_result.get("keep_tokens_by_request") or raw_result.get(
+            "keep_tokens"
+        )
+        if isinstance(raw_keep, dict):
+            keep_tokens = {
+                str(req_id): list(map(int, indices))
+                for req_id, indices in raw_keep.items()
+            }
+
+        threshold = self.cache_config.starkv_confidence_threshold
+        low_conf_from_press = raw_result.get("low_confidence_requests")
+        if isinstance(low_conf_from_press, list):
+            low_conf = [str(rid) for rid in low_conf_from_press]
+        elif threshold is not None:
+            low_conf = [
+                rid
+                for rid, score in confidence_map.items()
+                if score < threshold
+            ]
+        else:
+            low_conf = []
+
+        metadata = {
+            k: v
+            for k, v in raw_result.items()
+            if k
+            not in {
+                "confidence_by_request",
+                "confidence",
+                "keep_tokens_by_request",
+                "keep_tokens",
+                "low_confidence_requests",
+            }
+        }
+
+        return StarKVPrefillResult(
+            low_confidence_requests=low_conf,
+            confidence_by_request=confidence_map,
+            keep_tokens_by_request=keep_tokens,
+            metadata=metadata or None,
+        )
+
+    def _placeholder_result(self, snapshot: StarKVLayerSnapshot) -> StarKVPrefillResult:
         base_confidence = 0.0 if self.force_low_confidence else 1.0
         confidences = {rid: base_confidence for rid in snapshot.request_ids}
-        low_conf = []
         threshold = self.cache_config.starkv_confidence_threshold
-        if threshold is not None and base_confidence < threshold:
-            low_conf = list(snapshot.request_ids)
+        low_conf = []
+        if threshold is not None:
+            low_conf = [
+                rid
+                for rid, score in confidences.items()
+                if score < threshold
+            ]
 
-        result = StarKVPrefillResult(
+        return StarKVPrefillResult(
             low_confidence_requests=low_conf,
             confidence_by_request=confidences,
         )
-        return result
 
