@@ -4,7 +4,7 @@
 import torch
 
 from vllm.sampling_params import SamplingParams
-from vllm.starKV.adapter import StarKVPrefillResult
+from vllm.starkv.adapter import StarKVPrefillResult
 from vllm.v1.core.kv_cache_manager import Request
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.starkv_cache_manager import StarKVCacheManager
