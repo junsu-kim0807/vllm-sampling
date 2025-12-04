@@ -61,6 +61,9 @@ def test_starkv_flags_propagate():
             "0.75",
             "--starkv-max-reforward-steps",
             "3",
+            "--starkv-policy-layers",
+            "layer0",
+            "layer1",
         ]
     )
     vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
@@ -70,6 +73,7 @@ def test_starkv_flags_propagate():
     assert cache_config.starkv_compression_ratio == 0.4
     assert cache_config.starkv_confidence_threshold == 0.75
     assert cache_config.starkv_max_reforward_steps == 3
+    assert cache_config.starkv_policy_layers == ["layer0", "layer1"]
 
 
 def test_defaults_with_usage_context():

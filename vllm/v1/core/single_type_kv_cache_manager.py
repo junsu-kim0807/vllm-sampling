@@ -676,6 +676,21 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         pass
 
 
+class StarkVSingleTypeManager(FullAttentionManager):
+    """Placeholder manager for StarkV-specific policies on full attention."""
+
+    def __init__(self, kv_cache_spec: KVCacheSpec, **kwargs):
+        super().__init__(kv_cache_spec, **kwargs)
+        self.starkv_enabled = True
+
+    def apply_starv_plan(self, request_id: str, keep_blocks: list[int]) -> None:
+        logger.debug(
+            "StarkV plan placeholder for request %s keeps %d blocks",
+            request_id,
+            len(keep_blocks),
+        )
+
+
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
@@ -687,8 +702,12 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
 
 
 def get_manager_for_kv_cache_spec(
-    kv_cache_spec: KVCacheSpec, **kwargs
+    kv_cache_spec: KVCacheSpec,
+    use_starkv_policy: bool = False,
+    **kwargs,
 ) -> SingleTypeKVCacheManager:
     manager_class = spec_manager_map[type(kv_cache_spec)]
+    if use_starkv_policy and issubclass(manager_class, FullAttentionManager):
+        manager_class = StarkVSingleTypeManager
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager

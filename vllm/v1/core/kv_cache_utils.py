@@ -967,7 +967,15 @@ def _get_kv_cache_groups_uniform_page_size(
         # instead of layers[i * group_size: (i + 1) * group_size]
         for i in range(num_groups):
             grouped_layers.append(layers[i::num_groups])
-    return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+    kv_groups = create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+    starkv_prefixes = set(vllm_config.cache_config.starkv_policy_layers or [])
+    if starkv_prefixes:
+        for group in kv_groups:
+            group.starkv_policy = any(
+                any(layer.startswith(prefix) for prefix in starkv_prefixes)
+                for layer in group.layer_names
+            )
+    return kv_groups
 
 
 def get_kv_cache_config_from_groups(

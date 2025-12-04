@@ -44,6 +44,7 @@ class KVCacheCoordinator(ABC):
                 block_pool=self.block_pool,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
+                use_starkv_policy=getattr(kv_cache_group, "starkv_policy", False),
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )

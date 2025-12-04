@@ -375,6 +375,7 @@ class KVCacheGroupSpec:
     layer_names: list[str]
     # The KV cache spec of this manager layer
     kv_cache_spec: KVCacheSpec
+    starkv_policy: bool = False
 
 
 @dataclass
