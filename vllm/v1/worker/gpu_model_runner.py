@@ -227,9 +227,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.observability_config = vllm_config.observability_config
         self.starkv_adapter = None
         if self.cache_config.enable_starkv_super_cache:
-from vllm.starkv import StarkVPressAdapter, StarkVLayerSnapshot
-
-            self.starkv_adapter = StarkVPressAdapter(self.cache_config)
+            self.starkv_adapter = StarKVPressAdapter(self.cache_config)
             self.starkv_adapter.log_placeholder_event()
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
@@ -1461,7 +1459,7 @@ from vllm.starkv import StarkVPressAdapter, StarkVLayerSnapshot
             str(req_id)
             for req_id in self.input_batch.req_ids[:num_reqs]  # type: ignore[index]
         ]
-        snapshot = StarkVLayerSnapshot(
+        snapshot = StarKVLayerSnapshot(
             layer_name=layer_name,
             request_ids=req_ids,
             num_tokens=total_num_scheduled_tokens,

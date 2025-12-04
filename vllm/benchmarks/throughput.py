@@ -311,7 +311,7 @@ def run_starkv_super(
     requests: list[SampleRequest],
     tokenizer: PreTrainedTokenizerBase,
 ) -> dict[str, Any]:
-    """Run throughput measurements using the StarkV SuperPress pipeline."""
+    """Run throughput measurements using the StarKV SuperPress pipeline."""
 
     if not requests:
         raise ValueError("KVPress backend requires at least one sampled request.")
@@ -327,7 +327,7 @@ def run_starkv_super(
         from starkv import SuperPress
     except ImportError as exc:  # pragma: no cover - optional dependency guard
         raise RuntimeError(
-            "StarkV is not installed. Install starkv to enable the '--backend starkv' option."
+            "StarKV is not installed. Install starkv to enable the '--backend starkv' option."
         ) from exc
 
     try:
@@ -448,7 +448,7 @@ def run_starkv_super(
     total_tokens = total_prompt_tokens + total_output_tokens
     if not metrics:
         raise ValueError(
-            "No StarkV throughput measurements were produced. "
+            "No StarKV throughput measurements were produced. "
             "Please provide at least one positive batch size via --starkv-batch-sizes."
         )
     summary = {
@@ -844,7 +844,7 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "repetition dataset.",
     )
 
-    starkv_group = parser.add_argument_group("StarkV SuperPress options")
+    starkv_group = parser.add_argument_group("StarKV SuperPress options")
     starkv_group.add_argument(
         "--starkv-batch-sizes",
         type=int,
@@ -856,13 +856,13 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "--starkv-device",
         type=str,
         default=None,
-        help="Device identifier for the StarkV transformers pipeline (e.g., cuda:0, cpu, auto).",
+        help="Device identifier for the StarKV transformers pipeline (e.g., cuda:0, cpu, auto).",
     )
     starkv_group.add_argument(
         "--starkv-max-context-length",
         type=int,
         default=None,
-        help="Maximum context length hint forwarded to the StarkV pipeline.",
+        help="Maximum context length hint forwarded to the StarKV pipeline.",
     )
     parser = AsyncEngineArgs.add_cli_args(parser)
 
@@ -884,7 +884,7 @@ def main(args: argparse.Namespace):
     if args.backend == "starkv":
         summary = run_starkv_super(args, requests, tokenizer)
         print(
-            "StarkV SuperPress throughput: "
+            "StarKV SuperPress throughput: "
             f"{summary['requests_per_second']:.2f} requests/s, "
             f"{summary['tokens_per_second']:.2f} total tokens/s"
         )

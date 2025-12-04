@@ -14,22 +14,22 @@ logger = init_logger(__name__)
 
 
 @dataclass
-class StarkVPrefillResult:
+class StarKVPrefillResult:
     low_confidence_requests: list[str]
     confidence_by_request: dict[str, float]
 
 
 @dataclass
-class StarkVLayerSnapshot:
+class StarKVLayerSnapshot:
     layer_name: str
     request_ids: list[str]
     num_tokens: int
     slot_mapping: Any  # CPU tensor or list representing slot mapping
 
 
-class StarkVPressAdapter:
+class StarKVPressAdapter:
     """
-    Thin wrapper around StarkV's SuperPress. Phase 2 only ensures that the
+    Thin wrapper around StarKV's SuperPress. Phase 2 only ensures that the
     dependency is imported and configured; actual compression hooks are added
     in later phases.
     """
@@ -52,8 +52,8 @@ class StarkVPressAdapter:
             from starkv import SuperPress  # type: ignore[attr-defined]
         except ImportError:  # pragma: no cover - exercised via tests
             logger.warning(
-                "StarkV SuperCache requested but the 'starkv' package is not "
-                "installed. Running without StarkV integration."
+                "StarKV SuperCache requested but the 'starkv' package is not "
+                "installed. Running without StarKV integration."
             )
             self.is_available = False
             self._press = None
@@ -64,7 +64,7 @@ class StarkVPressAdapter:
         self._press = press
         self.is_available = True
         logger.info(
-            "Initialized StarkV SuperPress (compression_ratio=%s, score_fn=%s, "
+            "Initialized StarKV SuperPress (compression_ratio=%s, score_fn=%s, "
             "confidence_threshold=%s, max_reforward_steps=%s)",
             getattr(press, "compression_ratio", "default"),
             getattr(press, "score_fn", "default"),
@@ -101,15 +101,15 @@ class StarkVPressAdapter:
 
         if not self.is_available:
             logger.debug(
-                "StarkV adapter placeholder invoked but StarkV is unavailable."
+                "StarKV adapter placeholder invoked but StarKV is unavailable."
             )
         else:
-            logger.debug("StarkV adapter placeholder invoked.")
+            logger.debug("StarKV adapter placeholder invoked.")
 
     def process_prefill_snapshot(
         self,
-        snapshot: StarkVLayerSnapshot,
-    ) -> StarkVPrefillResult | None:
+        snapshot: StarKVLayerSnapshot,
+    ) -> StarKVPrefillResult | None:
         """
         Placeholder bridge that receives a per-layer snapshot (including the
         slot mapping). Until the real StarKV scorer is integrated, we emit
@@ -118,14 +118,14 @@ class StarkVPressAdapter:
 
         if not self.is_available:
             logger.debug(
-                "StarkV unavailable; skipping metadata for layer %s (tokens=%d).",
+                "StarKV unavailable; skipping metadata for layer %s (tokens=%d).",
                 snapshot.layer_name,
                 snapshot.num_tokens,
             )
             return None
 
         logger.debug(
-            "StarkV snapshot: layer=%s tokens=%d reqs=%d slots_shape=%s",
+            "StarKV snapshot: layer=%s tokens=%d reqs=%d slots_shape=%s",
             snapshot.layer_name,
             snapshot.num_tokens,
             len(snapshot.request_ids),
@@ -139,7 +139,7 @@ class StarkVPressAdapter:
         if threshold is not None and base_confidence < threshold:
             low_conf = list(snapshot.request_ids)
 
-        result = StarkVPrefillResult(
+        result = StarKVPrefillResult(
             low_confidence_requests=low_conf,
             confidence_by_request=confidences,
         )
