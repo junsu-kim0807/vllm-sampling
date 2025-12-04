@@ -551,7 +551,6 @@ class EngineArgs:
     starkv_confidence_threshold: float | None = CacheConfig.starkv_confidence_threshold
     starkv_max_reforward_steps: int | None = CacheConfig.starkv_max_reforward_steps
     starkv_offload: bool = CacheConfig.starkv_offload
-    starkv_policy_layers: list[str] = CacheConfig.starkv_policy_layers
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -914,10 +913,6 @@ class EngineArgs:
         cache_group.add_argument(
             "--starkv-offload",
             **cache_kwargs["starkv_offload"],
-        )
-        cache_group.add_argument(
-            "--starkv-policy-layers",
-            **cache_kwargs["starkv_policy_layers"],
         )
 
         # Multimodal related configs
@@ -1398,7 +1393,6 @@ class EngineArgs:
             starkv_confidence_threshold=self.starkv_confidence_threshold,
             starkv_max_reforward_steps=self.starkv_max_reforward_steps,
             starkv_offload=self.starkv_offload,
-            starkv_policy_layers=self.starkv_policy_layers,
         )
 
         ray_runtime_env = None

@@ -114,9 +114,6 @@ class CacheConfig:
     """Maximum number of reforward steps StarKV is allowed to perform."""
     starkv_offload: bool = False
     """Whether demoted StarKV blocks should be offloaded to CPU/super cache."""
-    starkv_policy_layers: list[str] = field(default_factory=list)
-    """Optional list of layer name prefixes that should opt into StarKV policy."""
-
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
     """The number of blocks to allocate for GPU memory."""
