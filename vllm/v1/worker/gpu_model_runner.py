@@ -68,6 +68,11 @@ from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
+from vllm.starkv import (
+    StarKVLayerFeedback,
+    StarKVLayerSnapshot,
+    StarKVPressAdapter,
+)
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils import (
     cdiv,
@@ -226,6 +231,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
         self.starkv_adapter = None
+        self._starkv_feedback: list[StarKVLayerFeedback] | None = None
         if self.cache_config.enable_starkv_super_cache:
             self.starkv_adapter = StarKVPressAdapter(self.cache_config)
             self.starkv_adapter.log_placeholder_event()
@@ -1468,6 +1474,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         result = self.starkv_adapter.process_prefill_snapshot(snapshot)
         if result is None:
             return
+        if self._starkv_feedback is not None:
+            self._starkv_feedback.append(
+                StarKVLayerFeedback(snapshot=snapshot, result=result)
+            )
 
     def _compute_cascade_attn_prefix_len(
         self,
@@ -2115,6 +2125,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=pooler_output,
+            starkv_feedback=self._starkv_feedback,
         )
 
     def _get_num_input_tokens(self, num_scheduled_tokens: int) -> int:
@@ -2470,6 +2481,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
 
+                if self.starkv_adapter is not None:
+                    self._starkv_feedback = []
+                else:
+                    self._starkv_feedback = None
+
                 if not scheduler_output.total_num_scheduled_tokens:
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
@@ -2709,6 +2725,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pooler_output=[],
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
+            starkv_feedback=self._starkv_feedback,
         )
 
         if not self.use_async_scheduling:

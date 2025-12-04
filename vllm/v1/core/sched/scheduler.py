@@ -925,6 +925,12 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        starkv_feedback = model_runner_output.starkv_feedback
+        if (
+            starkv_feedback
+            and isinstance(self.kv_cache_manager, StarKVCacheManager)
+        ):
+            self.kv_cache_manager.ingest_layer_feedbacks(starkv_feedback)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None

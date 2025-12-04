@@ -86,8 +86,9 @@ def test_adapter_falls_back_when_press_lacks_score(fake_starkv_module):
     cache_config.enable_starkv_super_cache = True
     adapter = StarKVPressAdapter(cache_config)
     assert adapter.press is not None
-    if hasattr(adapter.press, "score_prefill"):
-        delattr(adapter.press, "score_prefill")
+    press_cls = type(adapter.press)
+    if hasattr(press_cls, "score_prefill"):
+        delattr(press_cls, "score_prefill")
 
     snapshot = StarKVLayerSnapshot(
         layer_name="layer0",

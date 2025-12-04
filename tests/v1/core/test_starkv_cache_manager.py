@@ -4,7 +4,11 @@
 import torch
 
 from vllm.sampling_params import SamplingParams
-from vllm.starkv.adapter import StarKVPrefillResult
+from vllm.starkv.adapter import (
+    StarKVLayerFeedback,
+    StarKVLayerSnapshot,
+    StarKVPrefillResult,
+)
 from vllm.v1.core.kv_cache_manager import Request
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.starkv_cache_manager import StarKVCacheManager
@@ -79,4 +83,30 @@ def test_starkv_cache_manager_records_placeholder_events():
     if manager.offload_enabled:
         assert manager.get_super_cache_usage() >= 16
     assert manager.consume_reforward_flag("req")
+
+
+def test_starkv_cache_manager_ingests_feedbacks():
+    manager = StarKVCacheManager(
+        kv_cache_config=_make_config(16, 8),
+        max_model_len=1024,
+        enable_caching=True,
+        use_eagle=False,
+        log_stats=False,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+    )
+    snapshot = StarKVLayerSnapshot(
+        layer_name="layer0",
+        request_ids=["r0"],
+        num_tokens=8,
+        slot_mapping=torch.zeros((1, 1), dtype=torch.int64),
+    )
+    result = StarKVPrefillResult(
+        low_confidence_requests=["r0"], confidence_by_request={"r0": 0.4}
+    )
+    feedback = StarKVLayerFeedback(snapshot=snapshot, result=result)
+    manager.ingest_layer_feedbacks([feedback])
+    stored = manager.get_prefill_feedback()
+    assert stored[-1]["layer"] == "layer0"
+    assert manager.consume_reforward_flag("r0")
 

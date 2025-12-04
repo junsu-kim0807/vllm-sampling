@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from vllm.starkv.adapter import StarKVLayerFeedback
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 else:
@@ -131,6 +132,7 @@ class ModelRunnerOutput:
 
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
+    starkv_feedback: list[StarKVLayerFeedback] | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.
@@ -162,4 +164,5 @@ EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(
     prompt_logprobs_dict={},
     pooler_output=[],
     num_nans_in_logits=None,
+    starkv_feedback=None,
 )

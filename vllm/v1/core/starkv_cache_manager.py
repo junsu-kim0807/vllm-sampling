@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from vllm.logger import init_logger
+from vllm.starkv.adapter import StarKVLayerFeedback
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.request import Request
 
@@ -86,6 +87,18 @@ class StarKVCacheManager(KVCacheManager):
         if result is not None:
             for request_id in result.low_confidence_requests:
                 self._reforward_pending.add(request_id)
+
+    def ingest_layer_feedbacks(
+        self, feedbacks: list[StarKVLayerFeedback]
+    ) -> None:
+        for feedback in feedbacks:
+            snapshot = feedback.snapshot
+            self.record_prefill_feedback(
+                snapshot.layer_name,
+                snapshot.request_ids,
+                snapshot.num_tokens,
+                feedback.result,
+            )
 
     def get_prefill_feedback(self) -> list[dict[str, Any]]:
         return list(self._prefill_feedback)

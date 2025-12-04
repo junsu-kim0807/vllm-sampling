@@ -29,6 +29,12 @@ class StarKVLayerSnapshot:
     slot_mapping: Any  # CPU tensor or list representing slot mapping
 
 
+@dataclass
+class StarKVLayerFeedback:
+    snapshot: StarKVLayerSnapshot
+    result: StarKVPrefillResult
+
+
 class StarKVPressAdapter:
     """
     Thin wrapper around StarKV's SuperPress. Phase 2 only ensures that the
