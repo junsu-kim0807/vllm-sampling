@@ -34,7 +34,6 @@ def _make_config(block_size: int, num_blocks: int) -> KVCacheConfig:
             KVCacheGroupSpec(
                 ["layer"],
                 FullAttentionSpec(block_size, 1, 1, torch.float32),
-                starkv_policy=True,
             )
         ],
         enable_starkv_super_cache=True,
