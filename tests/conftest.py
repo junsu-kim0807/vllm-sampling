@@ -43,7 +43,9 @@ from transformers import (
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from tests.models.utils import TokensTextLogprobs, TokensTextLogprobsPromptLogprobs
-from vllm import LLM, SamplingParams, envs
+from vllm import envs
+from vllm.entrypoints.llm import LLM
+from vllm.sampling_params import SamplingParams
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
