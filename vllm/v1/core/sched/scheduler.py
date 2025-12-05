@@ -309,9 +309,6 @@ class Scheduler(SchedulerInterface):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
-            req_to_new_blocks[request.request_id] = new_blocks
-            num_scheduled_tokens[request.request_id] = num_new_tokens
-            token_budget -= num_new_tokens
             consume_ref = getattr(
                 self.kv_cache_manager, "consume_reforward_flag", None
             )
@@ -321,13 +318,27 @@ class Scheduler(SchedulerInterface):
                     reforward_plan = self.kv_cache_manager.pop_reforward_plan(
                         request.request_id
                     )
-                request.starkv_reforward_count += 1
-                request.starkv_reforward_steps += num_new_tokens
             if reforward_plan:
-                start_pos = max(int(reforward_plan.get("start_pos", 0)), 0)
-                suffix_len = max(int(reforward_plan.get("suffix_len", num_new_tokens)), 1)
+                start_pos = max(
+                    int(reforward_plan.get("start_pos", request.num_computed_tokens)), 0
+                )
+                suffix_len = max(
+                    int(reforward_plan.get("suffix_len", num_new_tokens)), 1
+                )
+                request.starkv_reforward_count += 1
+                request.starkv_reforward_steps += suffix_len
                 request.num_computed_tokens = start_pos
                 num_new_tokens = suffix_len
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                self._free_new_blocks(new_blocks)
+                req_to_new_blocks[request.request_id] = (
+                    self.kv_cache_manager.empty_kv_cache_blocks
+                )
+            else:
+                req_to_new_blocks[request.request_id] = new_blocks
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+            token_budget -= num_new_tokens
+            req_index += 1
             req_index += 1
 
             # Speculative decode related.
@@ -781,6 +792,15 @@ class Scheduler(SchedulerInterface):
             num_output_tokens=num_output_tokens,
             starkv_restore_handles=starkv_restore_handles,
         )
+
+    def _free_new_blocks(self, new_blocks: KVCacheBlocks) -> None:
+        try:
+            block_pool = self.kv_cache_manager.block_pool
+        except AttributeError:
+            return
+        for block_group in new_blocks.blocks:
+            if block_group:
+                block_pool.free_blocks(block_group)
 
     def _try_schedule_encoder_inputs(
         self,

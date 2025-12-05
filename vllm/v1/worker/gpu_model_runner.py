@@ -1093,7 +1093,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
         max_num_scheduled_tokens = max(tokens)
-        prev_computed_tokens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        prev_computed_tokens = self.input_batch.num_computed_tokens_cpu[
+            :num_reqs
+        ].copy()
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1501,7 +1503,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             prev_tokens = int(prev_computed_tokens[idx])
             reforward_info[req_id] = {
                 "request_id": req_id,
-                "start_pos": max(prev_tokens - suffix_len, 0),
+                "start_pos": prev_tokens,
                 "suffix_len": suffix_len,
             }
         slot_mapping_cpu = slot_mapping.detach().cpu().clone()
