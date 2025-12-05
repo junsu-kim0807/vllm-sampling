@@ -419,6 +419,17 @@ class EngineCore:
     def reset_prefix_cache(self):
         self.scheduler.reset_prefix_cache()
 
+    def reset_starkv_stats(self):
+        reset_fn = getattr(self.scheduler, "reset_starkv_stats", None)
+        if callable(reset_fn):
+            reset_fn()
+
+    def get_starkv_stats(self) -> dict[str, int]:
+        snapshot_fn = getattr(self.scheduler, "get_starkv_stats_snapshot", None)
+        if callable(snapshot_fn):
+            return snapshot_fn()
+        return {}
+
     def sleep(self, level: int = 1):
         self.model_executor.sleep(level)
 

@@ -23,7 +23,7 @@ COMMON_ARGS=(
 RESULTS_FILE="${RESULTS_FILE:-starkv_perf_results.csv}"
 mkdir -p scripts/integration/results
 
-echo "scenario,backend,requests_per_second,tokens_per_second,output_tokens_per_second,elapsed_time" > "$RESULTS_FILE"
+echo "scenario,backend,requests_per_second,tokens_per_second,output_tokens_per_second,elapsed_time,starkv_reforward_requests,starkv_reforward_tokens" > "$RESULTS_FILE"
 
 run_case() {
   local scenario=$1
@@ -38,6 +38,7 @@ import json, sys
 results_file, json_file, scenario = sys.argv[1:]
 with open(json_file) as f:
     data = json.load(f)
+starkv_stats = data.get("starkv_stats") or {}
 row = [
     scenario,
     data.get("backend", "vllm"),
@@ -45,6 +46,8 @@ row = [
     f'{data["tokens_per_second"]:.4f}',
     f'{data.get("output_tokens_per_second", 0.0):.4f}',
     f'{data["elapsed_time"]:.4f}',
+    str(starkv_stats.get("total_reforward_requests", 0)),
+    str(starkv_stats.get("total_reforward_tokens", 0)),
 ]
 with open(results_file, "a") as out:
     out.write(",".join(row) + "\n")
@@ -92,6 +95,14 @@ for threshold in 0.2 0.5 0.8 0.95; do
     --starkv-compression-ratio 0.5 \
     --starkv-confidence-threshold "$threshold"
 done
+
+# 5) Offload + reforward observability
+STARKV_FORCE_LOW_CONF=1 run_case "starkv_offload_reforward" \
+  --enable-starkv-super-cache \
+  --starkv-score-fn morphkv \
+  --starkv-compression-ratio 0.5 \
+  --starkv-confidence-threshold 0.7 \
+  --starkv-offload
 
 echo "Results written to $RESULTS_FILE"
 

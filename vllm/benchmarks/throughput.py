@@ -47,6 +47,9 @@ def run_vllm(
     from vllm import LLM, SamplingParams
 
     llm = LLM(**dataclasses.asdict(engine_args))
+    reset_fn = getattr(llm.llm_engine, "reset_starkv_stats", None)
+    if callable(reset_fn):
+        reset_fn()
     assert all(
         llm.llm_engine.model_config.max_model_len
         >= (request.prompt_len + request.expected_output_len)
@@ -86,6 +89,7 @@ def run_vllm(
     use_beam_search = False
 
     outputs = None
+    starkv_stats: dict[str, int] | None = None
     if not use_beam_search:
         start = time.perf_counter()
         if do_profile:
@@ -117,7 +121,10 @@ def run_vllm(
         if do_profile:
             llm.stop_profile()
         end = time.perf_counter()
-    return end - start, outputs
+    stats_getter = getattr(llm.llm_engine, "get_starkv_stats", None)
+    if callable(stats_getter):
+        starkv_stats = stats_getter()
+    return end - start, outputs, (starkv_stats or {})
 
 
 def run_vllm_chat(
@@ -881,6 +888,7 @@ def main(args: argparse.Namespace):
     requests = get_requests(args, tokenizer)
     is_multi_modal = any(request.multi_modal_data is not None for request in requests)
     request_outputs: list[RequestOutput] | None = None
+    starkv_stats: dict[str, int] = {}
     if args.backend == "starkv":
         summary = run_starkv_super(args, requests, tokenizer)
         print(
@@ -926,7 +934,7 @@ def main(args: argparse.Namespace):
                 )
             )
         else:
-            elapsed_time, request_outputs = run_vllm(
+            elapsed_time, request_outputs, starkv_stats = run_vllm(
                 requests,
                 args.n,
                 EngineArgs.from_cli_args(args),
@@ -992,6 +1000,12 @@ def main(args: argparse.Namespace):
     )
     print(f"Total num prompt tokens:  {total_prompt_tokens}")
     print(f"Total num output tokens:  {total_output_tokens}")
+    if starkv_stats:
+        print(
+            "StarKV reforward stats: "
+            f"{starkv_stats.get('total_reforward_requests', 0)} events / "
+            f"{starkv_stats.get('total_reforward_tokens', 0)} tokens"
+        )
 
     # Output JSON results if specified
     if args.output_json:
@@ -1002,6 +1016,8 @@ def main(args: argparse.Namespace):
             "requests_per_second": len(requests) / elapsed_time,
             "tokens_per_second": total_num_tokens / elapsed_time,
         }
+        if starkv_stats:
+            results["starkv_stats"] = starkv_stats
         with open(args.output_json, "w") as f:
             json.dump(results, f, indent=4)
         save_to_pytorch_benchmark_format(args, results)

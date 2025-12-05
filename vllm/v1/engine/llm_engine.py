@@ -331,6 +331,17 @@ class LLMEngine:
     def reset_prefix_cache(self, device: Device | None = None):
         self.engine_core.reset_prefix_cache()
 
+    def reset_starkv_stats(self) -> None:
+        reset_fn = getattr(self.engine_core, "reset_starkv_stats", None)
+        if callable(reset_fn):
+            reset_fn()
+
+    def get_starkv_stats(self) -> dict[str, int]:
+        getter = getattr(self.engine_core, "get_starkv_stats", None)
+        if callable(getter):
+            return getter()
+        return {}
+
     def sleep(self, level: int = 1):
         self.engine_core.sleep(level)
 

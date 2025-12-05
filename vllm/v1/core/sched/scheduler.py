@@ -102,6 +102,11 @@ class Scheduler(SchedulerInterface):
             self.parallel_config.data_parallel_rank,
         )
 
+        self._starkv_stats = {
+            "total_reforward_requests": 0,
+            "total_reforward_tokens": 0,
+        }
+
         num_gpu_blocks = self.cache_config.num_gpu_blocks
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
@@ -327,6 +332,7 @@ class Scheduler(SchedulerInterface):
                 )
                 request.starkv_reforward_count += 1
                 request.starkv_reforward_steps += suffix_len
+                self._record_starkv_reforward(suffix_len)
                 request.num_computed_tokens = start_pos
                 num_new_tokens = suffix_len
                 num_scheduled_tokens[request.request_id] = num_new_tokens
@@ -1333,6 +1339,19 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
+
+    def _record_starkv_reforward(self, suffix_len: int) -> None:
+        if suffix_len <= 0:
+            return
+        self._starkv_stats["total_reforward_requests"] += 1
+        self._starkv_stats["total_reforward_tokens"] += suffix_len
+
+    def reset_starkv_stats(self) -> None:
+        self._starkv_stats["total_reforward_requests"] = 0
+        self._starkv_stats["total_reforward_tokens"] = 0
+
+    def get_starkv_stats_snapshot(self) -> dict[str, int]:
+        return dict(self._starkv_stats)
 
     ########################################################################
     # KV Connector Related Methods

@@ -186,6 +186,18 @@ def test_schedule_partial_requests():
     assert requests[2].request_id not in output.num_scheduled_tokens
 
 
+def test_scheduler_starkv_stats_reset():
+    scheduler = create_scheduler()
+    scheduler._record_starkv_reforward(5)
+    stats = scheduler.get_starkv_stats_snapshot()
+    assert stats["total_reforward_requests"] == 1
+    assert stats["total_reforward_tokens"] == 5
+    scheduler.reset_starkv_stats()
+    stats = scheduler.get_starkv_stats_snapshot()
+    assert stats["total_reforward_requests"] == 0
+    assert stats["total_reforward_tokens"] == 0
+
+
 def test_no_mm_input_chunking():
     # Disable multimodal input chunking.
     scheduler = create_scheduler(

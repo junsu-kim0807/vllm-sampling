@@ -141,6 +141,12 @@ class EngineCoreClient(ABC):
     def reset_prefix_cache(self) -> None:
         raise NotImplementedError
 
+    def reset_starkv_stats(self) -> None:
+        return None
+
+    def get_starkv_stats(self) -> dict[str, int]:
+        return {}
+
     def sleep(self, level: int = 1) -> None:
         raise NotImplementedError
 
@@ -289,6 +295,12 @@ class InprocClient(EngineCoreClient):
 
     def reset_prefix_cache(self) -> None:
         self.engine_core.reset_prefix_cache()
+
+    def reset_starkv_stats(self) -> None:
+        self.engine_core.reset_starkv_stats()
+
+    def get_starkv_stats(self) -> dict[str, int]:
+        return self.engine_core.get_starkv_stats()
 
     def sleep(self, level: int = 1) -> None:
         self.engine_core.sleep(level)
@@ -752,6 +764,12 @@ class SyncMPClient(MPClient):
 
     def reset_prefix_cache(self) -> None:
         self.call_utility("reset_prefix_cache")
+
+    def reset_starkv_stats(self) -> None:
+        self.call_utility("reset_starkv_stats")
+
+    def get_starkv_stats(self) -> dict[str, int]:
+        return self.call_utility("get_starkv_stats")
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
