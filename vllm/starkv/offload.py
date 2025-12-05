@@ -38,29 +38,18 @@ class StarKVOffloadStore:
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
-        layer_kv_caches: Dict[str, torch.Tensor],
+        host_buffers: Dict[str, torch.Tensor],
+        gpu_kv_caches: Dict[str, torch.Tensor],
     ) -> None:
         self._kv_cache_config = kv_cache_config
-        self._layer_kv_caches = layer_kv_caches
-        self._host_buffers: dict[str, torch.Tensor] = {}
+        self._host_buffers = host_buffers
+        self._layer_kv_caches = gpu_kv_caches
         self._entries: dict[int, _StoredEntry] = {}
         self._next_handle_id = 1
         self._group_to_layers: dict[int, list[str]] = {
             idx: list(group.layer_names)
             for idx, group in enumerate(kv_cache_config.kv_cache_groups)
         }
-        self._initialize_host_buffers()
-
-    def _initialize_host_buffers(self) -> None:
-        for layer_name, kv_tensor in self._layer_kv_caches.items():
-            try:
-                host_tensor = torch.empty_like(kv_tensor, device="cpu")
-            except RuntimeError:
-                logger.exception(
-                    "Failed to allocate StarKV host buffer for layer %s", layer_name
-                )
-                raise
-            self._host_buffers[layer_name] = host_tensor
 
     def _iter_layer_pairs(
         self, kv_group_id: int

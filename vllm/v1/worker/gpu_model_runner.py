@@ -236,7 +236,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.starkv_adapter = None
         self._starkv_feedback: list[StarKVLayerFeedback] | None = None
         self.starkv_offload_store: StarKVOffloadStore | None = None
-        self._starkv_offload_handles: dict[str, list[StarKVOffloadHandle]] = {}
+        self._starkv_handle_registry: dict[int, StarKVOffloadHandle] = {}
+        self._starkv_handles_by_request: dict[str, list[int]] = {}
         if self.cache_config.enable_starkv_super_cache:
             self.starkv_adapter = StarKVPressAdapter(self.cache_config)
             self.starkv_adapter.log_placeholder_event()
@@ -635,6 +636,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            self._cleanup_starkv_handles(req_id)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -712,6 +714,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
+        starkv_restore_handles = getattr(
+            req_data, "starkv_restore_handles", None
+        )
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
@@ -723,6 +728,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             req_state.num_computed_tokens = num_computed_tokens
             req_index = self.input_batch.req_id_to_index.get(req_id)
+            restore_entries = None
+            if starkv_restore_handles is not None:
+                restore_entries = starkv_restore_handles[i]
+            self._restore_starkv_blocks(req_id, restore_entries)
 
             if not is_last_rank:
                 # When using PP, the scheduler sends the sampled tokens back,
@@ -1562,12 +1571,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     kv_group_id=snapshot.kv_cache_group_id,
                     block_ids=sorted(blocks_to_drop),
                 )
-                if handle:
-                    offload_handles.append(handle)
 
             if self._drop_blocks_for_request(
                 snapshot.kv_cache_group_id, req_id, req_index, blocks_to_drop
             ):
+                if handle:
+                    offload_handles.append(handle)
+                    self._starkv_handle_registry[handle.handle_id] = handle
+                    self._starkv_handles_by_request.setdefault(req_id, []).append(
+                        handle.handle_id
+                    )
                 block_plan_entries.append(
                     {
                         "request_id": req_id,
@@ -1575,8 +1588,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         "dropped_blocks": sorted(blocks_to_drop),
                     }
                 )
-                if handle:
-                    self._starkv_offload_handles.setdefault(req_id, []).append(handle)
 
         if block_plan_entries:
             metadata = result.metadata.copy() if result.metadata else {}
@@ -1616,6 +1627,40 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         req_state.block_ids = tuple(block_lists)
         self.input_batch.block_table.add_row(req_state.block_ids, req_index)
         return True
+
+    def _restore_starkv_blocks(
+        self,
+        request_id: str,
+        handles_metadata: list[dict[str, Any]] | None,
+    ) -> None:
+        if (
+            not handles_metadata
+            or self.starkv_offload_store is None
+            or not self._starkv_handle_registry
+        ):
+            return
+        for entry in handles_metadata:
+            handle_id = entry.get("handle_id")
+            if handle_id is None:
+                continue
+            handle = self._starkv_handle_registry.pop(handle_id, None)
+            if handle is None:
+                continue
+            restored = self.starkv_offload_store.restore_blocks(handle)
+            if not restored:
+                continue
+            req_handles = self._starkv_handles_by_request.get(request_id)
+            if req_handles and handle_id in req_handles:
+                req_handles.remove(handle_id)
+            if req_handles == []:
+                self._starkv_handles_by_request.pop(request_id, None)
+
+    def _cleanup_starkv_handles(self, request_id: str) -> None:
+        handle_ids = self._starkv_handles_by_request.pop(request_id, None)
+        if not handle_ids:
+            return
+        for handle_id in handle_ids:
+            self._starkv_handle_registry.pop(handle_id, None)
 
     def _compute_cascade_attn_prefix_len(
         self,
@@ -4715,13 +4760,34 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         kv_caches: dict[str, torch.Tensor],
     ) -> None:
         try:
+            host_buffers = self._create_starkv_host_buffers(kv_caches)
             self.starkv_offload_store = StarKVOffloadStore(
                 kv_cache_config=kv_cache_config,
-                layer_kv_caches=kv_caches,
+                host_buffers=host_buffers,
+                gpu_kv_caches=kv_caches,
             )
         except Exception:
             logger.exception("Unable to initialize StarKV offload store.")
             self.starkv_offload_store = None
+
+    def _create_starkv_host_buffers(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        host_buffers: dict[str, torch.Tensor] = {}
+        for layer_name, tensor in kv_caches.items():
+            try:
+                host_buffers[layer_name] = torch.empty(
+                    tensor.shape,
+                    dtype=tensor.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            except RuntimeError:
+                logger.exception(
+                    "Failed to allocate StarKV host buffer for layer %s", layer_name
+                )
+                raise
+        return host_buffers
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig

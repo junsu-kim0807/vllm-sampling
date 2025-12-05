@@ -27,6 +27,7 @@ class StarKVCacheManager(KVCacheManager):
         self._reforward_pending: set[str] = set()
         self._super_cache_tokens: int = 0
         self._offloaded_blocks: dict[str, list[dict[str, Any]]] = {}
+        self._pending_restore: set[str] = set()
         self.offload_enabled = getattr(
             self.kv_cache_config, "starkv_offload", False
         )
@@ -61,6 +62,8 @@ class StarKVCacheManager(KVCacheManager):
     def free(self, request: Request) -> None:
         super().free(request)
         self._record_event("free", request.request_id, None)
+        self._offloaded_blocks.pop(request.request_id, None)
+        self._pending_restore.discard(request.request_id)
 
     def _record_event(self, kind: str, request_id: str, tokens: int | None) -> None:
         event = {"kind": kind, "request_id": request_id, "tokens": tokens}
@@ -149,6 +152,7 @@ class StarKVCacheManager(KVCacheManager):
     def consume_reforward_flag(self, request_id: str) -> bool:
         if request_id in self._reforward_pending:
             self._reforward_pending.remove(request_id)
+            self._pending_restore.add(request_id)
             return True
         return False
 
@@ -177,4 +181,10 @@ class StarKVCacheManager(KVCacheManager):
             if req_id is None:
                 continue
             self._offloaded_blocks.setdefault(req_id, []).append(entry)
+
+    def pop_offloaded_handles(self, request_id: str) -> list[dict[str, Any]] | None:
+        if request_id not in self._pending_restore:
+            return None
+        self._pending_restore.discard(request_id)
+        return self._offloaded_blocks.pop(request_id, None)
 

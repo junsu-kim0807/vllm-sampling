@@ -718,6 +718,7 @@ class Scheduler(SchedulerInterface):
         resumed_req_token_ids: list[list[int] | None] = []
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        starkv_restore_handles: list[list[dict[str, Any]] | None] = []
 
         # Because resumed_reqs is usually empty, it is more efficient to do
         # in-place appending so that we don't need to allocate a new list.
@@ -752,6 +753,10 @@ class Scheduler(SchedulerInterface):
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
+            restore_handles = None
+            if isinstance(self.kv_cache_manager, StarKVCacheManager):
+                restore_handles = self.kv_cache_manager.pop_offloaded_handles(req_id)
+            starkv_restore_handles.append(restore_handles)
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -761,6 +766,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            starkv_restore_handles=starkv_restore_handles,
         )
 
     def _try_schedule_encoder_inputs(

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm._bc_linter import bc_linter_include
 
@@ -109,6 +109,7 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    starkv_restore_handles: list[list[dict[str, Any]] | None] | None = None
 
     @property
     def num_reqs(self) -> int:
@@ -124,6 +125,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            starkv_restore_handles=[],
         )
 
 
