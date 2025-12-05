@@ -28,6 +28,7 @@ class StarKVCacheManager(KVCacheManager):
         self._super_cache_tokens: int = 0
         self._offloaded_blocks: dict[str, list[dict[str, Any]]] = {}
         self._pending_restore: set[str] = set()
+        self._reforward_plans: dict[str, dict[str, Any]] = {}
         self.offload_enabled = getattr(
             self.kv_cache_config, "starkv_offload", False
         )
@@ -64,6 +65,7 @@ class StarKVCacheManager(KVCacheManager):
         self._record_event("free", request.request_id, None)
         self._offloaded_blocks.pop(request.request_id, None)
         self._pending_restore.discard(request.request_id)
+        self._reforward_plans.pop(request.request_id, None)
 
     def _record_event(self, kind: str, request_id: str, tokens: int | None) -> None:
         event = {"kind": kind, "request_id": request_id, "tokens": tokens}
@@ -105,6 +107,7 @@ class StarKVCacheManager(KVCacheManager):
             )
             self._apply_scheduler_block_plan(feedback.result)
             self._record_offloaded_blocks(feedback.result)
+            self._record_reforward_plans(feedback.result)
 
     def _apply_scheduler_block_plan(self, result: StarKVPrefillResult) -> None:
         metadata = result.metadata or {}
@@ -187,4 +190,18 @@ class StarKVCacheManager(KVCacheManager):
             return None
         self._pending_restore.discard(request_id)
         return self._offloaded_blocks.pop(request_id, None)
+
+    def _record_reforward_plans(self, result: StarKVPrefillResult) -> None:
+        metadata = result.metadata or {}
+        entries = metadata.get("starkv_reforward_requests")
+        if not entries:
+            return
+        for entry in entries:
+            req_id = entry.get("request_id")
+            if req_id is None:
+                continue
+            self._reforward_plans[req_id] = entry
+
+    def pop_reforward_plan(self, request_id: str) -> dict[str, Any] | None:
+        return self._reforward_plans.pop(request_id, None)
 

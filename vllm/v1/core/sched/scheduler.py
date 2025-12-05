@@ -315,9 +315,19 @@ class Scheduler(SchedulerInterface):
             consume_ref = getattr(
                 self.kv_cache_manager, "consume_reforward_flag", None
             )
+            reforward_plan = None
             if callable(consume_ref) and consume_ref(request.request_id):
+                if isinstance(self.kv_cache_manager, StarKVCacheManager):
+                    reforward_plan = self.kv_cache_manager.pop_reforward_plan(
+                        request.request_id
+                    )
                 request.starkv_reforward_count += 1
                 request.starkv_reforward_steps += num_new_tokens
+            if reforward_plan:
+                start_pos = max(int(reforward_plan.get("start_pos", 0)), 0)
+                suffix_len = max(int(reforward_plan.get("suffix_len", num_new_tokens)), 1)
+                request.num_computed_tokens = start_pos
+                num_new_tokens = suffix_len
             req_index += 1
 
             # Speculative decode related.
@@ -757,6 +767,9 @@ class Scheduler(SchedulerInterface):
             if isinstance(self.kv_cache_manager, StarKVCacheManager):
                 restore_handles = self.kv_cache_manager.pop_offloaded_handles(req_id)
             starkv_restore_handles.append(restore_handles)
+
+        if starkv_restore_handles and not any(starkv_restore_handles):
+            starkv_restore_handles = None
 
         return CachedRequestData(
             req_ids=req_ids,

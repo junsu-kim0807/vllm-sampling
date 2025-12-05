@@ -125,7 +125,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
-            starkv_restore_handles=[],
+            starkv_restore_handles=None,
         )
 
 

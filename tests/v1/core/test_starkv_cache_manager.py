@@ -157,11 +157,20 @@ def test_starkv_cache_manager_ingests_feedbacks():
         token_positions=[0],
     )
     result = StarKVPrefillResult(
-        low_confidence_requests=["r0"], confidence_by_request={"r0": 0.4}
+        low_confidence_requests=["r0"],
+        confidence_by_request={"r0": 0.4},
+        metadata={
+            "starkv_reforward_requests": [
+                {"request_id": "r0", "start_pos": 0, "suffix_len": 4}
+            ]
+        },
     )
     feedback = StarKVLayerFeedback(snapshot=snapshot, result=result)
     manager.ingest_layer_feedbacks([feedback])
     stored = manager.get_prefill_feedback()
     assert stored[-1]["layer"] == "layer0"
     assert manager.consume_reforward_flag("r0")
+    plan = manager.pop_reforward_plan("r0")
+    assert plan is not None
+    assert plan["suffix_len"] == 4
 

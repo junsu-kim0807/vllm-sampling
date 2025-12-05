@@ -1093,6 +1093,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
         max_num_scheduled_tokens = max(tokens)
+        prev_computed_tokens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1429,6 +1430,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                 slot_mapping=slot_mapping,
                                 req_indices=req_indices,
                                 token_positions=positions_np,
+                                req_scheduled_tokens=num_scheduled_tokens,
+                                prev_computed_tokens=prev_computed_tokens,
                             )
                 else:
                     assert isinstance(attn_metadata, dict)
@@ -1449,6 +1452,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             slot_mapping=slot_mapping,
                             req_indices=req_indices,
                             token_positions=positions_np,
+                            req_scheduled_tokens=num_scheduled_tokens,
+                            prev_computed_tokens=prev_computed_tokens,
                         )
 
         # disable cascade attention when DBO
@@ -1481,6 +1486,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         slot_mapping,
         req_indices: np.ndarray,
         token_positions: np.ndarray,
+        req_scheduled_tokens: np.ndarray,
+        prev_computed_tokens: np.ndarray,
     ) -> None:
         if self.starkv_adapter is None:
             return
@@ -1488,6 +1495,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             str(req_id)
             for req_id in self.input_batch.req_ids[:num_reqs]  # type: ignore[index]
         ]
+        reforward_info: dict[str, dict[str, int]] = {}
+        for idx, req_id in enumerate(req_ids):
+            suffix_len = int(req_scheduled_tokens[idx])
+            prev_tokens = int(prev_computed_tokens[idx])
+            reforward_info[req_id] = {
+                "request_id": req_id,
+                "start_pos": max(prev_tokens - suffix_len, 0),
+                "suffix_len": suffix_len,
+            }
         slot_mapping_cpu = slot_mapping.detach().cpu().clone()
         snapshot = StarKVLayerSnapshot(
             layer_name=layer_name,
@@ -1501,11 +1517,35 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         result = self.starkv_adapter.process_prefill_snapshot(snapshot)
         if result is None:
             return
+        self._attach_starkv_reforward_metadata(result, reforward_info)
         self._apply_starkv_keep_plan(snapshot, result)
         if self._starkv_feedback is not None:
             self._starkv_feedback.append(
                 StarKVLayerFeedback(snapshot=snapshot, result=result)
             )
+
+    def _attach_starkv_reforward_metadata(
+        self,
+        result: StarKVPrefillResult,
+        reforward_info: dict[str, dict[str, int]],
+    ) -> None:
+        low_conf = result.low_confidence_requests
+        if not low_conf:
+            return
+        entries: list[dict[str, int]] = []
+        for req_id in low_conf:
+            entry = reforward_info.get(req_id)
+            if not entry:
+                continue
+            if entry["suffix_len"] <= 0:
+                continue
+            entries.append(entry)
+        if not entries:
+            return
+        metadata = result.metadata.copy() if result.metadata else {}
+        existing = metadata.get("starkv_reforward_requests", [])
+        metadata["starkv_reforward_requests"] = existing + entries
+        result.metadata = metadata
 
     def _apply_starkv_keep_plan(
         self,
@@ -1564,17 +1604,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if req_index is None:
                 continue
 
-            handle: StarKVOffloadHandle | None = None
-            if self.starkv_offload_store is not None:
-                handle = self.starkv_offload_store.offload_blocks(
-                    request_id=req_id,
-                    kv_group_id=snapshot.kv_cache_group_id,
-                    block_ids=sorted(blocks_to_drop),
-                )
-
             if self._drop_blocks_for_request(
                 snapshot.kv_cache_group_id, req_id, req_index, blocks_to_drop
             ):
+                handle: StarKVOffloadHandle | None = None
+                if self.starkv_offload_store is not None:
+                    handle = self.starkv_offload_store.offload_blocks(
+                        request_id=req_id,
+                        kv_group_id=snapshot.kv_cache_group_id,
+                        block_ids=sorted(blocks_to_drop),
+                    )
                 if handle:
                     offload_handles.append(handle)
                     self._starkv_handle_registry[handle.handle_id] = handle
