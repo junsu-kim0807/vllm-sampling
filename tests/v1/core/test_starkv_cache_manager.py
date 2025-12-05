@@ -149,9 +149,12 @@ def test_starkv_cache_manager_ingests_feedbacks():
     )
     snapshot = StarKVLayerSnapshot(
         layer_name="layer0",
+        kv_cache_group_id=0,
         request_ids=["r0"],
         num_tokens=8,
         slot_mapping=torch.zeros((1, 1), dtype=torch.int64),
+        token_request_indices=[0],
+        token_positions=[0],
     )
     result = StarKVPrefillResult(
         low_confidence_requests=["r0"], confidence_by_request={"r0": 0.4}
