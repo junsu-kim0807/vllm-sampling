@@ -24,9 +24,12 @@ class StarKVPrefillResult:
 @dataclass
 class StarKVLayerSnapshot:
     layer_name: str
+    kv_cache_group_id: int
     request_ids: list[str]
     num_tokens: int
     slot_mapping: Any  # CPU tensor or list representing slot mapping
+    token_request_indices: list[int]
+    token_positions: list[int]
 
 
 @dataclass
@@ -155,10 +158,13 @@ class StarKVPressAdapter:
 
         return {
             "layer_name": snapshot.layer_name,
+            "kv_cache_group_id": snapshot.kv_cache_group_id,
             "request_ids": snapshot.request_ids,
             "num_tokens": snapshot.num_tokens,
             "slot_mapping": slot_mapping,
             "slot_mapping_shape": slot_shape,
+            "token_request_indices": list(snapshot.token_request_indices),
+            "token_positions": list(snapshot.token_positions),
         }
 
     def _score_with_press(

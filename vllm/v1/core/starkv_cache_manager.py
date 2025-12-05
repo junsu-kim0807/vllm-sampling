@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from vllm.logger import init_logger
-from vllm.starkv.adapter import StarKVLayerFeedback
+from vllm.starkv.adapter import StarKVLayerFeedback, StarKVPrefillResult
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.request import Request
 
@@ -26,6 +26,7 @@ class StarKVCacheManager(KVCacheManager):
         self._prefill_feedback: list[dict[str, Any]] = []
         self._reforward_pending: set[str] = set()
         self._super_cache_tokens: int = 0
+        self._offloaded_blocks: dict[str, list[dict[str, Any]]] = {}
         self.offload_enabled = getattr(
             self.kv_cache_config, "starkv_offload", False
         )
@@ -99,6 +100,45 @@ class StarKVCacheManager(KVCacheManager):
                 snapshot.num_tokens,
                 feedback.result,
             )
+            self._apply_scheduler_block_plan(feedback.result)
+            self._record_offloaded_blocks(feedback.result)
+
+    def _apply_scheduler_block_plan(self, result: StarKVPrefillResult) -> None:
+        metadata = result.metadata or {}
+        plans = metadata.get("starkv_block_plan")
+        if not plans:
+            return
+        for plan in plans:
+            req_id = plan.get("request_id")
+            group_id = plan.get("kv_group_id")
+            dropped_blocks = plan.get("dropped_blocks")
+            if (
+                req_id is None
+                or group_id is None
+                or not dropped_blocks
+                or group_id >= len(self.coordinator.single_type_managers)
+            ):
+                continue
+            manager = self.coordinator.single_type_managers[group_id]
+            req_blocks = manager.req_to_blocks.get(req_id)
+            if not req_blocks:
+                continue
+            drop_set = set(dropped_blocks)
+            new_blocks: list[KVCacheBlock] = []
+            freed_blocks: list[KVCacheBlock] = []
+            for block in req_blocks:
+                if block.block_id in drop_set:
+                    freed_blocks.append(block)
+                else:
+                    new_blocks.append(block)
+            if not freed_blocks:
+                continue
+            manager.req_to_blocks[req_id] = new_blocks
+            manager.num_cached_block[req_id] = min(
+                manager.num_cached_block.get(req_id, 0),
+                len(new_blocks),
+            )
+            self.block_pool.free_blocks(reversed(freed_blocks))
 
     def get_prefill_feedback(self) -> list[dict[str, Any]]:
         return list(self._prefill_feedback)
@@ -126,4 +166,15 @@ class StarKVCacheManager(KVCacheManager):
 
     def get_super_cache_usage(self) -> int:
         return self._super_cache_tokens
+
+    def _record_offloaded_blocks(self, result: StarKVPrefillResult) -> None:
+        metadata = result.metadata or {}
+        entries = metadata.get("starkv_offloaded_blocks")
+        if not entries:
+            return
+        for entry in entries:
+            req_id = entry.get("request_id")
+            if req_id is None:
+                continue
+            self._offloaded_blocks.setdefault(req_id, []).append(entry)
 

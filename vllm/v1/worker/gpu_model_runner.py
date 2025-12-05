@@ -71,6 +71,9 @@ from vllm.sequence import IntermediateTensors
 from vllm.starkv import (
     StarKVLayerFeedback,
     StarKVLayerSnapshot,
+    StarKVOffloadHandle,
+    StarKVOffloadStore,
+    StarKVPrefillResult,
     StarKVPressAdapter,
 )
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
@@ -232,6 +235,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.observability_config = vllm_config.observability_config
         self.starkv_adapter = None
         self._starkv_feedback: list[StarKVLayerFeedback] | None = None
+        self.starkv_offload_store: StarKVOffloadStore | None = None
+        self._starkv_offload_handles: dict[str, list[StarKVOffloadHandle]] = {}
         if self.cache_config.enable_starkv_super_cache:
             self.starkv_adapter = StarKVPressAdapter(self.cache_config)
             self.starkv_adapter.log_placeholder_event()
@@ -1407,11 +1412,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             assert type(attn_metadata) is list
                             attn_metadata[ubid][layer_name] = attn_metadata_i
                             self._notify_starkv_prefill(
-                                layer_name,
-                                attn_metadata_i,
-                                num_reqs,
-                                total_num_scheduled_tokens,
-                                slot_mapping,
+                                layer_name=layer_name,
+                                kv_cache_group_id=kv_cache_group_id,
+                                attn_metadata_i=attn_metadata_i,
+                                num_reqs=num_reqs,
+                                total_num_scheduled_tokens=total_num_scheduled_tokens,
+                                slot_mapping=slot_mapping,
+                                req_indices=req_indices,
+                                token_positions=positions_np,
                             )
                 else:
                     assert isinstance(attn_metadata, dict)
@@ -1424,11 +1432,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     for layer_name in attn_group.layer_names:
                         attn_metadata[layer_name] = attn_metadata_i
                         self._notify_starkv_prefill(
-                            layer_name,
-                            attn_metadata_i,
-                            num_reqs,
-                            total_num_scheduled_tokens,
-                            slot_mapping,
+                            layer_name=layer_name,
+                            kv_cache_group_id=kv_cache_group_id,
+                            attn_metadata_i=attn_metadata_i,
+                            num_reqs=num_reqs,
+                            total_num_scheduled_tokens=total_num_scheduled_tokens,
+                            slot_mapping=slot_mapping,
+                            req_indices=req_indices,
+                            token_positions=positions_np,
                         )
 
         # disable cascade attention when DBO
@@ -1454,10 +1465,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _notify_starkv_prefill(
         self,
         layer_name: str,
+        kv_cache_group_id: int,
         attn_metadata_i: AttentionMetadata,
         num_reqs: int,
         total_num_scheduled_tokens: int,
         slot_mapping,
+        req_indices: np.ndarray,
+        token_positions: np.ndarray,
     ) -> None:
         if self.starkv_adapter is None:
             return
@@ -1465,19 +1479,143 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             str(req_id)
             for req_id in self.input_batch.req_ids[:num_reqs]  # type: ignore[index]
         ]
+        slot_mapping_cpu = slot_mapping.detach().cpu().clone()
         snapshot = StarKVLayerSnapshot(
             layer_name=layer_name,
+            kv_cache_group_id=kv_cache_group_id,
             request_ids=req_ids,
             num_tokens=total_num_scheduled_tokens,
-            slot_mapping=slot_mapping.detach().cpu().clone(),
+            slot_mapping=slot_mapping_cpu,
+            token_request_indices=req_indices.tolist(),
+            token_positions=token_positions.tolist(),
         )
         result = self.starkv_adapter.process_prefill_snapshot(snapshot)
         if result is None:
             return
+        self._apply_starkv_keep_plan(snapshot, result)
         if self._starkv_feedback is not None:
             self._starkv_feedback.append(
                 StarKVLayerFeedback(snapshot=snapshot, result=result)
             )
+
+    def _apply_starkv_keep_plan(
+        self,
+        snapshot: StarKVLayerSnapshot,
+        result: StarKVPrefillResult,
+    ) -> None:
+        keep_tokens = result.keep_tokens_by_request
+        if not keep_tokens:
+            return
+
+        block_table = self.input_batch.block_table[snapshot.kv_cache_group_id]
+        kernel_block_size = block_table.block_size
+        blocks_per_kv_block = getattr(block_table, "blocks_per_kv_block", 1)
+        kv_block_size = kernel_block_size * blocks_per_kv_block
+
+        slot_tensor = snapshot.slot_mapping
+        if isinstance(slot_tensor, torch.Tensor):
+            slot_np = slot_tensor.cpu().numpy()
+        else:
+            slot_np = np.asarray(slot_tensor)
+
+        if slot_np.size == 0:
+            return
+
+        token_req_indices = np.asarray(snapshot.token_request_indices, dtype=np.int64)
+        token_positions = np.asarray(snapshot.token_positions, dtype=np.int64)
+        valid_mask = slot_np >= 0
+        kernel_block_ids = np.full_like(slot_np, -1, dtype=np.int64)
+        kernel_block_ids[valid_mask] = slot_np[valid_mask] // kernel_block_size
+        kv_block_ids = np.full_like(kernel_block_ids, -1, dtype=np.int64)
+        if blocks_per_kv_block > 1:
+            kv_block_ids[valid_mask] = kernel_block_ids[valid_mask] // blocks_per_kv_block
+        else:
+            kv_block_ids = kernel_block_ids
+
+        block_plan_entries: list[dict[str, Any]] = []
+        offload_handles: list[StarKVOffloadHandle] = []
+        for req_idx, req_id in enumerate(snapshot.request_ids):
+            keep_positions = keep_tokens.get(req_id)
+            if keep_positions is None:
+                continue
+            mask = token_req_indices == req_idx
+            candidate_blocks = set(
+                kv_block_ids[np.logical_and(mask, valid_mask)].tolist()
+            )
+            candidate_blocks.discard(-1)
+            if not candidate_blocks:
+                continue
+
+            keep_block_ids = {pos // kv_block_size for pos in keep_positions}
+            blocks_to_drop = candidate_blocks - keep_block_ids
+            if not blocks_to_drop:
+                continue
+
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+
+            handle: StarKVOffloadHandle | None = None
+            if self.starkv_offload_store is not None:
+                handle = self.starkv_offload_store.offload_blocks(
+                    request_id=req_id,
+                    kv_group_id=snapshot.kv_cache_group_id,
+                    block_ids=sorted(blocks_to_drop),
+                )
+                if handle:
+                    offload_handles.append(handle)
+
+            if self._drop_blocks_for_request(
+                snapshot.kv_cache_group_id, req_id, req_index, blocks_to_drop
+            ):
+                block_plan_entries.append(
+                    {
+                        "request_id": req_id,
+                        "kv_group_id": snapshot.kv_cache_group_id,
+                        "dropped_blocks": sorted(blocks_to_drop),
+                    }
+                )
+                if handle:
+                    self._starkv_offload_handles.setdefault(req_id, []).append(handle)
+
+        if block_plan_entries:
+            metadata = result.metadata.copy() if result.metadata else {}
+            plans = metadata.get("starkv_block_plan", [])
+            plans.extend(block_plan_entries)
+            metadata["starkv_block_plan"] = plans
+            if offload_handles:
+                metadata["starkv_offloaded_blocks"] = [
+                    {
+                        "request_id": handle.request_id,
+                        "kv_group_id": handle.kv_group_id,
+                        "block_ids": list(handle.block_ids),
+                        "handle_id": handle.handle_id,
+                    }
+                    for handle in offload_handles
+                ]
+            result.metadata = metadata
+
+    def _drop_blocks_for_request(
+        self,
+        kv_cache_group_id: int,
+        req_id: str,
+        req_index: int,
+        blocks_to_drop: set[int],
+    ) -> bool:
+        if not blocks_to_drop:
+            return False
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return False
+        block_lists = [list(block_ids) for block_ids in req_state.block_ids]
+        group_blocks = block_lists[kv_cache_group_id]
+        new_group_blocks = [blk for blk in group_blocks if blk not in blocks_to_drop]
+        if len(new_group_blocks) == len(group_blocks):
+            return False
+        block_lists[kv_cache_group_id] = new_group_blocks
+        req_state.block_ids = tuple(block_lists)
+        self.input_batch.block_table.add_row(req_state.block_ids, req_index)
+        return True
 
     def _compute_cascade_attn_prefix_len(
         self,
@@ -4571,6 +4709,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         return kv_caches
 
+    def _initialize_starkv_offload_store(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> None:
+        try:
+            self.starkv_offload_store = StarKVOffloadStore(
+                kv_cache_config=kv_cache_config,
+                layer_kv_caches=kv_caches,
+            )
+        except Exception:
+            logger.exception("Unable to initialize StarKV offload store.")
+            self.starkv_offload_store = None
+
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig
     ) -> None:
@@ -4614,6 +4766,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        if self.cache_config.enable_starkv_super_cache:
+            self._initialize_starkv_offload_store(kv_cache_config, kv_caches)
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)

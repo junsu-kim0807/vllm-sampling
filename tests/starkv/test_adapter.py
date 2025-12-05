@@ -71,9 +71,12 @@ def test_adapter_scores_snapshot_with_press(fake_starkv_module):
     adapter = StarKVPressAdapter(cache_config)
     snapshot = StarKVLayerSnapshot(
         layer_name="layer0",
+        kv_cache_group_id=0,
         request_ids=["req0", "req1"],
         num_tokens=4,
         slot_mapping=torch.zeros((2, 2), dtype=torch.int64),
+        token_request_indices=[0, 0, 1, 1],
+        token_positions=[0, 1, 0, 1],
     )
     result = adapter.process_prefill_snapshot(snapshot)
     assert result is not None
@@ -92,9 +95,12 @@ def test_adapter_falls_back_when_press_lacks_score(fake_starkv_module):
 
     snapshot = StarKVLayerSnapshot(
         layer_name="layer0",
+        kv_cache_group_id=0,
         request_ids=["req0"],
         num_tokens=2,
         slot_mapping=torch.ones((1, 1), dtype=torch.int64),
+        token_request_indices=[0, 0],
+        token_positions=[0, 1],
     )
     result = adapter.process_prefill_snapshot(snapshot)
     assert result is not None

@@ -7,12 +7,15 @@ from .adapter import (
     StarKVPrefillResult,
     StarKVPressAdapter,
 )
+from .offload import StarKVOffloadHandle, StarKVOffloadStore
 
 __all__ = [
     "StarKVPressAdapter",
     "StarKVLayerSnapshot",
     "StarKVPrefillResult",
     "StarKVLayerFeedback",
+    "StarKVOffloadHandle",
+    "StarKVOffloadStore",
 ]
 
 

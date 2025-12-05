@@ -86,6 +86,58 @@ def test_starkv_cache_manager_records_placeholder_events():
 
 
 def test_starkv_cache_manager_ingests_feedbacks():
+    block_size = 16
+    manager = StarKVCacheManager(
+        kv_cache_config=_make_config(block_size, 8),
+        max_model_len=1024,
+        enable_caching=True,
+        use_eagle=False,
+        log_stats=False,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+    )
+    tokens = list(range(block_size * 2))
+    req = _make_request("reqx", tokens, block_size)
+    computed_blocks, num_tokens = manager.get_computed_blocks(req)
+    new_blocks = manager.allocate_slots(
+        req,
+        num_new_tokens=len(tokens),
+        num_new_computed_tokens=num_tokens,
+        new_computed_blocks=computed_blocks,
+    )
+    assert new_blocks is not None
+    snapshot = StarKVLayerSnapshot(
+        layer_name="layer",
+        kv_cache_group_id=0,
+        request_ids=["reqx"],
+        num_tokens=len(tokens),
+        slot_mapping=torch.arange(len(tokens), dtype=torch.int64),
+        token_request_indices=[0] * len(tokens),
+        token_positions=list(range(len(tokens))),
+    )
+    first_block_id = manager.coordinator.get_blocks("reqx")[0][0].block_id
+    result = StarKVPrefillResult(
+        low_confidence_requests=["reqx"],
+        confidence_by_request={"reqx": 0.6},
+        keep_tokens_by_request={"reqx": []},
+        metadata={
+            "starkv_block_plan": [
+                {
+                    "request_id": "reqx",
+                    "kv_group_id": 0,
+                    "dropped_blocks": [first_block_id],
+                }
+            ]
+        },
+    )
+    feedback = StarKVLayerFeedback(snapshot=snapshot, result=result)
+    manager.ingest_layer_feedbacks([feedback])
+    blocks = manager.coordinator.get_blocks("reqx")[0]
+    assert all(block.block_id != first_block_id for block in blocks)
+    assert manager.consume_reforward_flag("reqx")
+
+
+def test_starkv_cache_manager_ingests_feedbacks():
     manager = StarKVCacheManager(
         kv_cache_config=_make_config(16, 8),
         max_model_len=1024,
