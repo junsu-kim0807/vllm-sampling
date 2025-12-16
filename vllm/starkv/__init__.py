@@ -8,6 +8,7 @@ from .adapter import (
     StarKVPressAdapter,
 )
 from .offload import StarKVOffloadHandle, StarKVOffloadStore
+from .superpress import SuperPress
 
 __all__ = [
     "StarKVPressAdapter",
@@ -16,6 +17,7 @@ __all__ = [
     "StarKVLayerFeedback",
     "StarKVOffloadHandle",
     "StarKVOffloadStore",
+    "SuperPress",
 ]
 
 

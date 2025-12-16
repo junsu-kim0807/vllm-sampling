@@ -59,18 +59,30 @@ class StarKVPressAdapter:
         return self._press
 
     def _initialize_press(self) -> None:
+        # Try external package first
         try:
             from starkv import SuperPress  # type: ignore[attr-defined]
-        except ImportError:  # pragma: no cover - exercised via tests
-            logger.warning(
-                "StarKV SuperCache requested but the 'starkv' package is not "
-                "installed. Running without StarKV integration."
-            )
-            self.is_available = False
-            self._press = None
-            return
+            press = SuperPress()
+            logger.info("Using external starkv package for SuperPress")
+        except ImportError:
+            # Fall back to internal implementation
+            try:
+                from vllm.starkv.superpress import SuperPress
+                press = SuperPress()
+                logger.info(
+                    "External 'starkv' package not found. "
+                    "Using internal SuperPress implementation for testing."
+                )
+            except ImportError:
+                logger.warning(
+                    "StarKV SuperCache requested but neither external 'starkv' package "
+                    "nor internal SuperPress implementation is available. "
+                    "Running without StarKV integration."
+                )
+                self.is_available = False
+                self._press = None
+                return
 
-        press = SuperPress()
         self._apply_cache_config(press)
         self._press = press
         self.is_available = True
