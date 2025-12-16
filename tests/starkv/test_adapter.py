@@ -61,8 +61,10 @@ def test_adapter_handles_missing_dependency(monkeypatch):
     cache_config.enable_starkv_super_cache = True
 
     adapter = StarKVPressAdapter(cache_config)
-    assert adapter.press is None
-    assert not adapter.is_available
+    # External 'starkv' package is missing, but the adapter should fall back to
+    # vLLM's internal SuperPress implementation.
+    assert adapter.press is not None
+    assert adapter.is_available
 
 
 def test_adapter_scores_snapshot_with_press(fake_starkv_module):

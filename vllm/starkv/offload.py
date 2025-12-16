@@ -75,10 +75,35 @@ class StarKVOffloadStore:
         for layer_name, (gpu_tensor, host_tensor) in self._iter_layer_pairs(
             kv_group_id
         ):
-            idx_gpu = idx_cpu.to(gpu_tensor.device)
             try:
-                data = torch.index_select(gpu_tensor, 0, idx_gpu).to("cpu")
-                host_tensor.index_copy_(0, idx_cpu, data)
+                # KV cache tensors can be shaped either:
+                # - (num_blocks, ...)  -> blocks along dim 0
+                # - (2, num_blocks, ...) -> blocks along dim 1 (K/V in dim 0)
+                # We must offload/restore along the block dimension.
+                block_dim = 0
+                if gpu_tensor.dim() >= 2 and gpu_tensor.shape[0] == 2 and gpu_tensor.shape[1] != 2:
+                    block_dim = 1
+
+                dim_size = gpu_tensor.size(block_dim)
+                if dim_size <= 0:
+                    continue
+
+                # Filter invalid indices to avoid CUDA device-side asserts.
+                idx_valid_cpu = idx_cpu[(idx_cpu >= 0) & (idx_cpu < dim_size)]
+                if idx_valid_cpu.numel() == 0:
+                    logger.debug(
+                        "StarKV offload: all indices out of range for layer %s "
+                        "(group %d, block_dim=%d, dim_size=%d). Skipping.",
+                        layer_name,
+                        kv_group_id,
+                        block_dim,
+                        dim_size,
+                    )
+                    continue
+
+                idx_gpu = idx_valid_cpu.to(gpu_tensor.device)
+                data = torch.index_select(gpu_tensor, block_dim, idx_gpu).to("cpu")
+                host_tensor.index_copy_(block_dim, idx_valid_cpu, data)
             except Exception:  # pragma: no cover - defensive
                 logger.exception(
                     "StarKV offload failed for layer %s (group %d)", layer_name, kv_group_id
@@ -111,11 +136,31 @@ class StarKVOffloadStore:
             return True
 
         idx_cpu = torch.tensor(block_ids, dtype=torch.long, device="cpu")
-        for _, (gpu_tensor, host_tensor) in self._iter_layer_pairs(entry.kv_group_id):
-            idx_gpu = idx_cpu.to(gpu_tensor.device)
+        for layer_name, (gpu_tensor, host_tensor) in self._iter_layer_pairs(entry.kv_group_id):
             try:
-                data = torch.index_select(host_tensor, 0, idx_cpu).to(gpu_tensor.device)
-                gpu_tensor.index_copy_(0, idx_gpu, data)
+                block_dim = 0
+                if gpu_tensor.dim() >= 2 and gpu_tensor.shape[0] == 2 and gpu_tensor.shape[1] != 2:
+                    block_dim = 1
+
+                dim_size = gpu_tensor.size(block_dim)
+                if dim_size <= 0:
+                    continue
+
+                idx_valid_cpu = idx_cpu[(idx_cpu >= 0) & (idx_cpu < dim_size)]
+                if idx_valid_cpu.numel() == 0:
+                    logger.debug(
+                        "StarKV restore: all indices out of range for layer %s "
+                        "(group %d, block_dim=%d, dim_size=%d). Skipping.",
+                        layer_name,
+                        entry.kv_group_id,
+                        block_dim,
+                        dim_size,
+                    )
+                    continue
+
+                idx_gpu = idx_valid_cpu.to(gpu_tensor.device)
+                data = torch.index_select(host_tensor, block_dim, idx_valid_cpu).to(gpu_tensor.device)
+                gpu_tensor.index_copy_(block_dim, idx_gpu, data)
             except Exception:  # pragma: no cover - defensive
                 logger.exception(
                     "StarKV restore failed for request %s blocks %s",

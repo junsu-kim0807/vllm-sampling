@@ -8,6 +8,7 @@ without requiring an external starkv package.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 from vllm.logger import init_logger
@@ -74,18 +75,19 @@ class SuperPress:
         }
         
         # Determine which tokens to keep based on compression ratio
+        # IMPORTANT:
+        # Returning keep_tokens_by_request triggers vLLM's current placeholder
+        # block-drop/offload plumbing (see GPUModelRunner._apply_starkv_keep_plan).
+        # Without a real SuperPress that understands vLLM's KV/block mapping, this
+        # can corrupt state or crash. Therefore, internal SuperPress only emits
+        # keep plans when explicitly requested.
         keep_tokens_by_request = None
-        if self.compression_ratio is not None and num_tokens > 0:
-            # Keep a fraction of tokens based on compression ratio
+        enable_keep_plan = bool(int(os.getenv("STARKV_INTERNAL_ENABLE_KEEP_PLAN", "0")))
+        if enable_keep_plan and self.compression_ratio is not None and num_tokens > 0:
+            # Keep a fraction of tokens based on compression ratio.
             num_keep = max(1, int(num_tokens * (1.0 - self.compression_ratio)))
-            # Keep tokens evenly distributed
-            keep_indices = [
-                int(i * num_tokens / num_keep) 
-                for i in range(num_keep)
-            ]
-            keep_tokens_by_request = {
-                rid: keep_indices for rid in request_ids
-            }
+            keep_indices = [int(i * num_tokens / num_keep) for i in range(num_keep)]
+            keep_tokens_by_request = {rid: keep_indices for rid in request_ids}
         
         # Determine low confidence requests
         low_confidence_requests = []
