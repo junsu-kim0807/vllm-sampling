@@ -250,6 +250,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # signals when we reach the end position of that reforward segment.
         self._starkv_last_end_pos: dict[str, int] = {}
         self._starkv_skip_confidence_at_pos: dict[str, int] = {}
+        # Track the end position of the last successful reforward segment per request.
+        # This mirrors the reference algorithm's `last_superkv_index`.
+        self._starkv_last_reforward_index: dict[str, int] = {}
         if self.cache_config.enable_starkv_super_cache:
             self.starkv_adapter = StarKVPressAdapter(self.cache_config)
             self.starkv_adapter.log_placeholder_event()
@@ -1522,6 +1525,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # skip confidence-triggered reforwarding on the very next step
                 # which will start at end_pos.
                 self._starkv_skip_confidence_at_pos[req_id] = prev_tokens + suffix_len
+                # Also record the last reforward end position (reference: last_superkv_index=end).
+                self._starkv_last_reforward_index[req_id] = prev_tokens + max(suffix_len, 0)
             # If this step starts exactly at the end_pos of the last reforward,
             # suppress low-confidence signals (one step).
             if prev_tokens == self._starkv_skip_confidence_at_pos.get(req_id):
@@ -1736,6 +1741,113 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             return
         for handle_id in handle_ids:
             self._starkv_handle_registry.pop(handle_id, None)
+
+    def _maybe_trigger_starkv_reforward_from_logits(
+        self,
+        logits: torch.Tensor | None,
+        req_ids: list[str],
+        invalid_req_indices: list[int] | None,
+    ) -> None:
+        """Decode-stage confidence check: trigger reforward if top-1 softmax prob <= threshold.
+
+        This is a placeholder implementation to mimic the reference algorithm:
+        measure confidence as top-1 softmax probability of the output-token
+        distribution at each decode step; if below threshold, request is marked
+        for reforwarding.
+
+        Notes:
+        - We use the logits used for sampling in this step (one row per request).
+        - We compute top-1 prob as exp(max_logit - logsumexp(logits)).
+        - We enqueue a minimal reforward plan that rewinds 1 token and replays 1 token.
+        - We respect the existing \"skip confidence after reforward\" one-step guard.
+        """
+        if logits is None or self.starkv_adapter is None:
+            return
+        threshold = self.cache_config.starkv_confidence_threshold
+        if threshold is None:
+            return
+        # Threshold >= 1.0 can never trigger; threshold <= 0 triggers always.
+        if threshold >= 1.0:
+            return
+
+        if not isinstance(logits, torch.Tensor) or logits.numel() == 0:
+            return
+        if logits.dim() != 2:
+            return
+        if len(req_ids) != logits.shape[0]:
+            # Defensive: if shapes mismatch, skip rather than risk wrong mapping.
+            return
+
+        invalid_set: set[int] = set(invalid_req_indices or [])
+
+        # Compute top-1 softmax probability efficiently in float32.
+        logits_f = logits.float()
+        max_logit, _ = logits_f.max(dim=-1)  # [num_reqs]
+        lse = torch.logsumexp(logits_f, dim=-1)  # [num_reqs]
+        top1_prob = (max_logit - lse).exp()  # [num_reqs], in (0,1]
+
+        low_conf_reqs: list[str] = []
+        confidence_by_request: dict[str, float] = {}
+        plans: list[dict[str, int]] = []
+
+        for i, req_id in enumerate(req_ids):
+            if i in invalid_set:
+                continue
+            conf = float(top1_prob[i].item())
+            confidence_by_request[req_id] = conf
+            if conf > float(threshold):
+                continue
+            # Skip confidence-triggered reforward right after a reforward (one step).
+            state = self.requests.get(req_id)
+            current_pos = state.num_computed_tokens if state is not None else None
+            if current_pos is not None and current_pos == self._starkv_skip_confidence_at_pos.get(req_id):
+                # One-shot: consume the skip marker once we've used it.
+                self._starkv_skip_confidence_at_pos.pop(req_id, None)
+                continue
+
+            low_conf_reqs.append(req_id)
+            # Reforward plan (reference behavior):
+            # Reforward all decoded tokens since the last reforward.
+            #
+            # We approximate the reference `step_idx = len(generated_ids)` with the
+            # current computed-token cursor for the request. The scheduler will
+            # rewind to start_pos and replay suffix_len tokens.
+            start_pos = 0
+            if current_pos is not None:
+                start_pos = int(self._starkv_last_reforward_index.get(req_id, max(int(current_pos) - 1, 0)))
+                start_pos = max(start_pos, 0)
+                end_pos = max(int(current_pos), start_pos + 1)
+                suffix_len = max(end_pos - start_pos, 1)
+            else:
+                # Fallback: if cursor is unknown, do a minimal 1-token replay.
+                suffix_len = 1
+            plans.append({"request_id": req_id, "start_pos": start_pos, "suffix_len": suffix_len})
+            # Mark the next step to skip confidence-based reforward at the reforward end.
+            self._starkv_skip_confidence_at_pos[req_id] = start_pos + suffix_len
+
+        if not low_conf_reqs or not plans:
+            return
+
+        # Attach reforward requests into scheduler-visible starkv_feedback.
+        # We intentionally keep snapshot payload minimal; the cache manager only
+        # needs low_confidence_requests + metadata plans.
+        result = StarKVPrefillResult(
+            low_confidence_requests=low_conf_reqs,
+            confidence_by_request=confidence_by_request,
+            keep_tokens_by_request=None,
+            metadata={"starkv_reforward_requests": plans},
+        )
+        snapshot = StarKVLayerSnapshot(
+            layer_name="__decode_confidence__",
+            kv_cache_group_id=0,
+            request_ids=req_ids,
+            num_tokens=0,
+            slot_mapping=[],
+            token_request_indices=[],
+            token_positions=[],
+        )
+        if self._starkv_feedback is not None:
+            self._starkv_feedback.append(StarKVLayerFeedback(snapshot=snapshot, result=result))
 
     def _compute_cascade_attn_prefix_len(
         self,
@@ -2961,6 +3073,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 hidden_states,
                 num_scheduled_tokens,
             )
+
+        # Decode-stage StarKV confidence check (top-1 softmax probability).
+        # This may enqueue reforward plans for the scheduler via starkv_feedback.
+        self._maybe_trigger_starkv_reforward_from_logits(
+            logits=logits,
+            req_ids=req_ids_output_copy,
+            invalid_req_indices=invalid_req_indices,
+        )
 
         if (
             self.speculative_config
