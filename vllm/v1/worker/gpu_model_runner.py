@@ -238,6 +238,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.starkv_offload_store: StarKVOffloadStore | None = None
         self._starkv_handle_registry: dict[int, StarKVOffloadHandle] = {}
         self._starkv_handles_by_request: dict[str, list[int]] = {}
+        # StarKV reforward guard:
+        # When a request is reforwarded, the scheduler rewinds its num_computed_tokens.
+        # In the current placeholder plumbing, repeated low-confidence checks can
+        # immediately trigger another reforward and lead to stalls. We therefore
+        # skip confidence-triggered reforwarding for a request on the *first*
+        # step immediately after a reforward.
+        #
+        # We implement this purely on the worker side by tracking when a
+        # request's "start_pos" moves backwards and then suppressing low-confidence
+        # signals when we reach the end position of that reforward segment.
+        self._starkv_last_end_pos: dict[str, int] = {}
+        self._starkv_skip_confidence_at_pos: dict[str, int] = {}
         if self.cache_config.enable_starkv_super_cache:
             self.starkv_adapter = StarKVPressAdapter(self.cache_config)
             self.starkv_adapter.log_placeholder_event()
@@ -1498,14 +1510,29 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             for req_id in self.input_batch.req_ids[:num_reqs]  # type: ignore[index]
         ]
         reforward_info: dict[str, dict[str, int]] = {}
+        skip_confidence_req_ids: set[str] = set()
         for idx, req_id in enumerate(req_ids):
             suffix_len = int(req_scheduled_tokens[idx])
             prev_tokens = int(prev_computed_tokens[idx])
+            # Detect a reforward by observing a backwards jump in the scheduled
+            # start position vs what we previously computed up to.
+            last_end = self._starkv_last_end_pos.get(req_id, prev_tokens)
+            if prev_tokens < last_end:
+                # After we finish recomputing [prev_tokens, prev_tokens+suffix_len),
+                # skip confidence-triggered reforwarding on the very next step
+                # which will start at end_pos.
+                self._starkv_skip_confidence_at_pos[req_id] = prev_tokens + suffix_len
+            # If this step starts exactly at the end_pos of the last reforward,
+            # suppress low-confidence signals (one step).
+            if prev_tokens == self._starkv_skip_confidence_at_pos.get(req_id):
+                skip_confidence_req_ids.add(req_id)
             reforward_info[req_id] = {
                 "request_id": req_id,
                 "start_pos": prev_tokens,
                 "suffix_len": suffix_len,
             }
+            # Update last seen end position for the request.
+            self._starkv_last_end_pos[req_id] = prev_tokens + max(suffix_len, 0)
         slot_mapping_cpu = slot_mapping.detach().cpu().clone()
         snapshot = StarKVLayerSnapshot(
             layer_name=layer_name,
@@ -1519,6 +1546,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         result = self.starkv_adapter.process_prefill_snapshot(snapshot)
         if result is None:
             return
+        # If we are immediately after a reforward for some requests, do not let
+        # this step's confidence check trigger another reforward.
+        if skip_confidence_req_ids and result.low_confidence_requests:
+            result.low_confidence_requests = [
+                rid for rid in result.low_confidence_requests
+                if rid not in skip_confidence_req_ids
+            ]
         self._attach_starkv_reforward_metadata(result, reforward_info)
         self._apply_starkv_keep_plan(snapshot, result)
         if self._starkv_feedback is not None:

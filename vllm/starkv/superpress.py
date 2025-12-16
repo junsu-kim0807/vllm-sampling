@@ -60,14 +60,15 @@ class SuperPress:
         request_ids = payload.get("request_ids", [])
         num_tokens = payload.get("num_tokens", 0)
         
-        # Default confidence calculation
-        # This is a placeholder - real implementation would use actual scoring
-        base_confidence = 0.8  # Default confidence
-        
-        # Adjust based on compression ratio if set
-        if self.compression_ratio is not None:
-            # Higher compression ratio -> lower confidence (more aggressive compression)
-            base_confidence = max(0.1, 1.0 - self.compression_ratio)
+        # Default confidence calculation.
+        #
+        # IMPORTANT: In vLLM's current placeholder StarKV plumbing, marking
+        # requests as low-confidence can trigger reforward scheduling, which can
+        # lead to stalls if the signal is always-on. Therefore the internal
+        # SuperPress defaults to "high confidence" unless explicitly overridden
+        # for testing.
+        base_confidence = float(os.getenv("STARKV_INTERNAL_CONFIDENCE", "1.0"))
+        base_confidence = max(0.0, min(1.0, base_confidence))
         
         # Generate confidence scores for each request
         confidence_by_request = {
