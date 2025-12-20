@@ -251,7 +251,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._starkv_last_end_pos: dict[str, int] = {}
         self._starkv_skip_confidence_at_pos: dict[str, int] = {}
         # Track the end position of the last successful reforward segment per request.
-        # This mirrors the reference algorithm's `last_superkv_index`.
+        # This mirrors the reference algorithm's `last_superkv_index` (but in
+        # absolute token positions that include the prompt).
         self._starkv_last_reforward_index: dict[str, int] = {}
         if self.cache_config.enable_starkv_super_cache:
             self.starkv_adapter = StarKVPressAdapter(self.cache_config)
@@ -1525,8 +1526,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # skip confidence-triggered reforwarding on the very next step
                 # which will start at end_pos.
                 self._starkv_skip_confidence_at_pos[req_id] = prev_tokens + suffix_len
-                # Also record the last reforward end position (reference: last_superkv_index=end).
-                self._starkv_last_reforward_index[req_id] = prev_tokens + max(suffix_len, 0)
             # If this step starts exactly at the end_pos of the last reforward,
             # suppress low-confidence signals (one step).
             if prev_tokens == self._starkv_skip_confidence_at_pos.get(req_id):
@@ -1803,27 +1802,71 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if current_pos is not None and current_pos == self._starkv_skip_confidence_at_pos.get(req_id):
                 # One-shot: consume the skip marker once we've used it.
                 self._starkv_skip_confidence_at_pos.pop(req_id, None)
+                logger.debug(
+                    "StarKV decode-confidence: skipping reforward check right after reforward "
+                    "(req_id=%s, pos=%s, conf=%.6f, threshold=%.6f)",
+                    req_id,
+                    current_pos,
+                    conf,
+                    float(threshold),
+                )
                 continue
 
             low_conf_reqs.append(req_id)
             # Reforward plan (reference behavior):
             # Reforward all decoded tokens since the last reforward.
             #
-            # We approximate the reference `step_idx = len(generated_ids)` with the
-            # current computed-token cursor for the request. The scheduler will
-            # rewind to start_pos and replay suffix_len tokens.
-            start_pos = 0
+            # Reference logic:
+            #   start = last_superkv_index
+            #   end = step_idx (= len(generated_ids))
+            #   suffix_tokens = generated_ids[start:end]
+            #
+            # In vLLM we model this as a scheduler reforward plan:
+            #   rewind to start_pos and replay suffix_len tokens.
+            #
+            # We store `last_reforward_index` as an absolute position
+            # (including prompt tokens), and initialize it to prompt_len so we
+            # never rewind into the prompt.
+            prompt_len = getattr(state, "num_prompt_tokens", 0) if state is not None else 0
+            start_pos = int(self._starkv_last_reforward_index.get(req_id, prompt_len))
+            start_pos = max(start_pos, int(prompt_len))
             if current_pos is not None:
-                start_pos = int(self._starkv_last_reforward_index.get(req_id, max(int(current_pos) - 1, 0)))
-                start_pos = max(start_pos, 0)
                 end_pos = max(int(current_pos), start_pos + 1)
                 suffix_len = max(end_pos - start_pos, 1)
             else:
-                # Fallback: if cursor is unknown, do a minimal 1-token replay.
+                end_pos = start_pos + 1
                 suffix_len = 1
             plans.append({"request_id": req_id, "start_pos": start_pos, "suffix_len": suffix_len})
-            # Mark the next step to skip confidence-based reforward at the reforward end.
-            self._starkv_skip_confidence_at_pos[req_id] = start_pos + suffix_len
+            # Update reference pointer: after we reforward [start_pos, end_pos),
+            # consider that segment as committed for future reforwarding.
+            self._starkv_last_reforward_index[req_id] = end_pos
+            # Also guard the very next step from immediately re-triggering.
+            self._starkv_skip_confidence_at_pos[req_id] = end_pos
+
+            # Debug log for visibility. If you want INFO-level logs, set:
+            #   STARKV_LOG_REFORWARD=1
+            if bool(int(os.getenv("STARKV_LOG_REFORWARD", "0"))):
+                logger.info(
+                    "StarKV decode-confidence reforward trigger: req_id=%s conf=%.6f thr=%.6f "
+                    "start_pos=%d end_pos=%d suffix_len=%d",
+                    req_id,
+                    conf,
+                    float(threshold),
+                    start_pos,
+                    end_pos,
+                    suffix_len,
+                )
+            else:
+                logger.debug(
+                    "StarKV decode-confidence reforward trigger: req_id=%s conf=%.6f thr=%.6f "
+                    "start_pos=%d end_pos=%d suffix_len=%d",
+                    req_id,
+                    conf,
+                    float(threshold),
+                    start_pos,
+                    end_pos,
+                    suffix_len,
+                )
 
         if not low_conf_reqs or not plans:
             return
