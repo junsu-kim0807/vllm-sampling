@@ -76,6 +76,7 @@ from vllm.starkv import (
     StarKVOffloadStore,
     StarKVPrefillResult,
     StarKVPressAdapter,
+    StarKVTierStore,
 )
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils import (
@@ -237,8 +238,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.starkv_adapter = None
         self._starkv_feedback: list[StarKVLayerFeedback] | None = None
         self.starkv_offload_store: StarKVOffloadStore | None = None
+        self.starkv_super_store: StarKVTierStore | None = None
         self._starkv_handle_registry: dict[int, StarKVOffloadHandle] = {}
         self._starkv_handles_by_request: dict[str, list[int]] = {}
+        self._starkv_restored_this_step: set[tuple[str, int]] = set()
         # StarKV reforward guard:
         # When a request is reforwarded, the scheduler rewinds its num_computed_tokens.
         # In the current placeholder plumbing, repeated low-confidence checks can
@@ -1523,6 +1526,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # start position vs what we previously computed up to.
             last_end = self._starkv_last_end_pos.get(req_id, prev_tokens)
             if prev_tokens < last_end:
+                # Reforward is happening: restore sub-tier KV blocks from the
+                # super tier so the replay uses the full (super) cache.
+                if self.starkv_super_store is not None:
+                    key = (req_id, kv_cache_group_id)
+                    if key not in self._starkv_restored_this_step:
+                        req_state = self.requests.get(req_id)
+                        if req_state is not None and kv_cache_group_id < len(req_state.block_ids):
+                            self.starkv_super_store.restore_blocks(
+                                kv_group_id=kv_cache_group_id,
+                                block_ids=list(req_state.block_ids[kv_cache_group_id]),
+                            )
+                        self._starkv_restored_this_step.add(key)
                 # After we finish recomputing [prev_tokens, prev_tokens+suffix_len),
                 # skip confidence-triggered reforwarding on the very next step
                 # which will start at end_pos.
@@ -1892,6 +1907,44 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         if self._starkv_feedback is not None:
             self._starkv_feedback.append(StarKVLayerFeedback(snapshot=snapshot, result=result))
+
+    def _starkv_mirror_kv_blocks_after_step(self, scheduler_output: "SchedulerOutput") -> None:
+        """Mirror updated KV blocks from sub tier into super tier after a model step."""
+        if self.starkv_super_store is None:
+            return
+
+        # Mirror blocks for newly scheduled requests (prefill).
+        for new_req in scheduler_output.scheduled_new_reqs:
+            for kv_group_id, block_ids in enumerate(new_req.block_ids):
+                self.starkv_super_store.mirror_blocks(
+                    kv_group_id=kv_group_id,
+                    block_ids=list(block_ids),
+                )
+
+        # Mirror newly allocated blocks for cached requests (decode/prefill chunks).
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, new_block_ids in zip(cached.req_ids, cached.new_block_ids):
+            if new_block_ids is None:
+                continue
+            for kv_group_id, block_ids in enumerate(new_block_ids):
+                self.starkv_super_store.mirror_blocks(
+                    kv_group_id=kv_group_id,
+                    block_ids=list(block_ids),
+                )
+
+        # Also mirror the tail block for each active request so that in-block writes
+        # (appending tokens within an already-allocated block) are captured.
+        for req_id in itertools.chain(cached.req_ids, (r.req_id for r in scheduler_output.scheduled_new_reqs)):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            for kv_group_id, group_blocks in enumerate(req_state.block_ids):
+                if not group_blocks:
+                    continue
+                self.starkv_super_store.mirror_blocks(
+                    kv_group_id=kv_group_id,
+                    block_ids=[int(group_blocks[-1])],
+                )
 
     def _compute_cascade_attn_prefix_len(
         self,
@@ -3118,6 +3171,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_scheduled_tokens,
             )
 
+        # Reset per-step restore guards.
+        self._starkv_restored_this_step.clear()
+
         # Decode-stage StarKV confidence check (top-1 softmax probability).
         # This may enqueue reforward plans for the scheduler via starkv_feedback.
         self._maybe_trigger_starkv_reforward_from_logits(
@@ -3125,6 +3181,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req_ids=req_ids_output_copy,
             invalid_req_indices=invalid_req_indices,
         )
+
+        # Mirror updated KV blocks into the super tier after this step completes.
+        self._starkv_mirror_kv_blocks_after_step(scheduler_output)
 
         if (
             self.speculative_config
@@ -4999,15 +5058,39 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         kv_caches: dict[str, torch.Tensor],
     ) -> None:
         try:
-            host_buffers = self._create_starkv_host_buffers(kv_caches)
-            self.starkv_offload_store = StarKVOffloadStore(
+            starkv_offload = getattr(kv_cache_config, "starkv_offload", False)
+
+            # Super tier buffers:
+            # - If starkv_offload is enabled, super tier lives on CPU (pinned).
+            # - Otherwise, super tier lives on GPU (same device as sub tier).
+            if starkv_offload:
+                super_buffers = self._create_starkv_host_buffers(kv_caches)
+            else:
+                # NOTE: This doubles KV-cache memory on GPU.
+                super_buffers = {
+                    layer_name: torch.empty_like(tensor, device=tensor.device)
+                    for layer_name, tensor in kv_caches.items()
+                }
+
+            self.starkv_super_store = StarKVTierStore(
                 kv_cache_config=kv_cache_config,
-                host_buffers=host_buffers,
-                gpu_kv_caches=kv_caches,
+                super_buffers=super_buffers,
+                sub_kv_caches=kv_caches,
             )
+
+            # Optional offload store: only used when starkv_offload=True.
+            if starkv_offload:
+                self.starkv_offload_store = StarKVOffloadStore(
+                    kv_cache_config=kv_cache_config,
+                    host_buffers=super_buffers,
+                    gpu_kv_caches=kv_caches,
+                )
+            else:
+                self.starkv_offload_store = None
         except Exception:
             logger.exception("Unable to initialize StarKV offload store.")
             self.starkv_offload_store = None
+            self.starkv_super_store = None
 
     def _create_starkv_host_buffers(
         self, kv_caches: dict[str, torch.Tensor]

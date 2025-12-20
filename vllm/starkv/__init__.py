@@ -9,6 +9,7 @@ from .adapter import (
 )
 from .offload import StarKVOffloadHandle, StarKVOffloadStore
 from .superpress import SuperPress
+from .tier_store import StarKVTierStore
 
 __all__ = [
     "StarKVPressAdapter",
@@ -18,6 +19,7 @@ __all__ = [
     "StarKVOffloadHandle",
     "StarKVOffloadStore",
     "SuperPress",
+    "StarKVTierStore",
 ]
 
 
