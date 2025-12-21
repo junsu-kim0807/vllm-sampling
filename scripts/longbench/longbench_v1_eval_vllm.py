@@ -5,12 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import csv
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
-
-import pandas as pd
 
 
 LONGCHENCH_V1_TASKS: list[str] = [
@@ -97,6 +96,15 @@ def _load_longbench_scorer() -> tuple[callable, callable | None]:
     )
 
     return longbench_scorer, longbench_scorer_e
+
+
+def _maybe_make_dataframe(rows: list[dict[str, Any]]):
+    """Create a pandas DataFrame if pandas is available; otherwise return None."""
+    try:
+        import pandas as pd  # type: ignore
+    except ImportError:
+        return None
+    return pd.DataFrame(rows)
 
 
 @dataclass
@@ -186,7 +194,14 @@ def main() -> None:
 
     scorer, scorer_e = (None, None)
     if not args.skip_metrics:
-        scorer, scorer_e = _load_longbench_scorer()
+        try:
+            scorer, scorer_e = _load_longbench_scorer()
+        except Exception as exc:
+            print(
+                "WARN: LongBench scorer could not be loaded; will skip metrics. "
+                f"Reason: {exc}"
+            )
+            scorer, scorer_e = (None, None)
 
     for task in cfg.tasks:
         examples = _load_longbench_split(cfg.repo, task, cfg.split)
@@ -209,28 +224,52 @@ def main() -> None:
                 else:
                     outputs.append("")
 
-        df = pd.DataFrame(
-            {
-                "task": [task] * len(examples),
-                "predicted_answer": outputs,
-                "answers": [ex.get("answers") for ex in examples],
-                "all_classes": [ex.get("all_classes") for ex in examples],
-            }
-        )
-        # For longbench-e variants, dataset uses "length" column for bucketed metrics.
-        if "length" in examples[0]:
-            df["length"] = [ex.get("length") for ex in examples]
-
         pred_path = cfg.out_dir / f"predictions__{task}.csv"
-        df.to_csv(pred_path, index=False)
+        # Write predictions CSV without requiring pandas.
+        fieldnames = ["task", "predicted_answer", "answers", "all_classes"]
+        has_length = "length" in examples[0]
+        if has_length:
+            fieldnames.append("length")
+        with open(pred_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for ex, pred in zip(examples, outputs):
+                row = {
+                    "task": task,
+                    "predicted_answer": pred,
+                    "answers": ex.get("answers"),
+                    "all_classes": ex.get("all_classes"),
+                }
+                if has_length:
+                    row["length"] = ex.get("length")
+                w.writerow(row)
         predictions_paths[task] = str(pred_path)
 
         if scorer is not None:
-            # Decide which scorer to use based on presence of length column and task naming.
-            if "length" in df.columns and scorer_e is not None:
-                per_task_scores[task] = scorer_e(df)
+            # The scorer expects a pandas DataFrame.
+            df = _maybe_make_dataframe(
+                [
+                    {
+                        "task": task,
+                        "predicted_answer": pred,
+                        "answers": ex.get("answers"),
+                        "all_classes": ex.get("all_classes"),
+                        **({"length": ex.get("length")} if has_length else {}),
+                    }
+                    for ex, pred in zip(examples, outputs)
+                ]
+            )
+            if df is None:
+                print(
+                    "WARN: pandas is not installed; skipping metrics. "
+                    "Install with: pip install pandas"
+                )
+                scorer = None
             else:
-                per_task_scores[task] = scorer(df)
+                if has_length and scorer_e is not None:
+                    per_task_scores[task] = scorer_e(df)
+                else:
+                    per_task_scores[task] = scorer(df)
 
     summary = {
         "model": cfg.model,

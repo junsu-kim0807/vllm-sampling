@@ -16,7 +16,7 @@ set -euo pipefail
 # Env overrides:
 #   MODEL=... OUT_DIR=... TASKS=all|comma,separated
 #   THRESH=0.99 OFFLOAD=0|1 ENABLE_STARKV=0|1
-#   BATCH_SIZE=4 MAX_MODEL_LEN=131072 GPU_MEM_UTIL=0.9
+#   BATCH_SIZE=4 MAX_MODEL_LEN=32768 GPU_MEM_UTIL=0.9
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
@@ -32,7 +32,11 @@ THRESH="${THRESH:-0.99}"
 OFFLOAD="${OFFLOAD:-0}"
 
 BATCH_SIZE="${BATCH_SIZE:-4}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
+# NOTE:
+# When StarKV is enabled with GPU super-tier (OFFLOAD=0), the super tier mirrors
+# the KV cache on GPU. This effectively doubles KV-cache memory usage.
+# LongBench-v1 defaults to ~32k contexts, so 32768 is a practical default.
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 

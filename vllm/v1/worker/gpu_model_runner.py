@@ -5067,10 +5067,32 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 super_buffers = self._create_starkv_host_buffers(kv_caches)
             else:
                 # NOTE: This doubles KV-cache memory on GPU.
-                super_buffers = {
-                    layer_name: torch.empty_like(tensor, device=tensor.device)
-                    for layer_name, tensor in kv_caches.items()
-                }
+                try:
+                    # Deduplicate buffers for shared KV cache layers: kv_caches may
+                    # contain multiple layer names pointing to the same tensor.
+                    seen: dict[int, torch.Tensor] = {}
+                    super_buffers = {}
+                    for layer_name, tensor in kv_caches.items():
+                        key = id(tensor)
+                        if key not in seen:
+                            seen[key] = torch.empty_like(tensor, device=tensor.device)
+                        super_buffers[layer_name] = seen[key]
+                except torch.OutOfMemoryError:
+                    # If GPU super-tier allocation fails, fall back to CPU pinned.
+                    # This keeps StarKV functional for evaluation runs.
+                    logger.warning(
+                        "StarKV: GPU super-tier allocation OOM. Falling back to CPU pinned "
+                        "super tier (equivalent to enabling --starkv-offload). "
+                        "To avoid this, reduce max_model_len / KV cache size or run with "
+                        "--starkv-offload explicitly."
+                    )
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    super_buffers = self._create_starkv_host_buffers(kv_caches)
+                    # We are now effectively in offload mode for super tier.
+                    starkv_offload = True
 
             self.starkv_super_store = StarKVTierStore(
                 kv_cache_config=kv_cache_config,
