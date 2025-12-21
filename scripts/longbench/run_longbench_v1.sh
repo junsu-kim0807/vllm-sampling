@@ -16,7 +16,7 @@ set -euo pipefail
 # Env overrides:
 #   MODEL=... OUT_DIR=... TASKS=all|comma,separated
 #   THRESH=0.99 OFFLOAD=0|1 ENABLE_STARKV=0|1
-#   BATCH_SIZE=4 MAX_MODEL_LEN=32768 GPU_MEM_UTIL=0.9
+#   BATCH_SIZE=1 MAX_MODEL_LEN=32768 GPU_MEM_UTIL=0.9
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
@@ -31,7 +31,7 @@ ENABLE_STARKV="${ENABLE_STARKV:-1}"
 THRESH="${THRESH:-0.99}"
 OFFLOAD="${OFFLOAD:-0}"
 
-BATCH_SIZE="${BATCH_SIZE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
 # NOTE:
 # When StarKV is enabled with GPU super-tier (OFFLOAD=0), the super tier mirrors
 # the KV cache on GPU. This effectively doubles KV-cache memory usage.
