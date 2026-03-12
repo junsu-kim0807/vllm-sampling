@@ -1,0 +1,11 @@
+{
+    "elapsed_time": 0.7034777910448611,
+    "num_requests": 1,
+    "total_num_tokens": 4160,
+    "requests_per_second": 1.4215089839790402,
+    "tokens_per_second": 5913.477373352807,
+    "starkv_stats": {
+        "total_reforward_requests": 0,
+        "total_reforward_tokens": 0
+    }
+}
