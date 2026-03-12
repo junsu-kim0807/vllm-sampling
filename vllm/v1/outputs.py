@@ -134,6 +134,9 @@ class ModelRunnerOutput:
     num_nans_in_logits: dict[str, int] | None = None
     starkv_feedback: list[StarKVLayerFeedback] | None = None
 
+    # req_id -> reforward plan metadata
+    starkv_feedback: dict[str, dict[str, int | float]] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

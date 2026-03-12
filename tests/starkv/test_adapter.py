@@ -5,13 +5,9 @@ import sys
 import types
 
 import pytest
-import torch
 
 from vllm.config.cache import CacheConfig
-from vllm.starkv.adapter import (
-    StarKVLayerSnapshot,
-    StarKVPressAdapter,
-)
+from vllm.starkv.adapter import StarkVPressAdapter
 
 
 @pytest.fixture
@@ -23,16 +19,6 @@ def fake_starkv_module(monkeypatch):
             self.compression_ratio = None
             self.score_fn = None
             self.confidence_threshold = None
-            self.last_payload = None
-
-        def score_prefill(self, payload):
-            self.last_payload = payload
-            request_ids = payload["request_ids"]
-            return {
-                "confidence_by_request": {rid: 0.6 for rid in request_ids},
-                "keep_tokens_by_request": {rid: [0] for rid in request_ids},
-                "debug": {"num_tokens": payload["num_tokens"]},
-            }
 
     module.SuperPress = FakeSuperPress
     monkeypatch.setitem(sys.modules, "starkv", module)
@@ -47,65 +33,73 @@ def test_adapter_initializes_with_fake_module(fake_starkv_module):
     cache_config.starkv_score_fn = "morphkv"
     cache_config.starkv_confidence_threshold = 0.8
 
-    adapter = StarKVPressAdapter(cache_config)
+    adapter = StarkVPressAdapter(cache_config)
     assert adapter.press is not None
-    assert adapter.is_available
     assert adapter.press.compression_ratio == 0.4
     assert adapter.press.score_fn == "morphkv"
     assert adapter.press.confidence_threshold == 0.8
 
 
-def test_adapter_handles_missing_dependency(monkeypatch):
+def test_adapter_uses_internal_fallback_without_dependency(monkeypatch):
+    """When external starkv is missing, adapter uses internal SuperPress."""
     monkeypatch.delitem(sys.modules, "starkv", raising=False)
     cache_config = CacheConfig()
     cache_config.enable_starkv_super_cache = True
 
-    adapter = StarKVPressAdapter(cache_config)
-    # External 'starkv' package is missing, but the adapter should fall back to
-    # vLLM's internal SuperPress implementation.
+    adapter = StarkVPressAdapter(cache_config)
     assert adapter.press is not None
-    assert adapter.is_available
+    assert hasattr(adapter.press, "score_prefill")
+    assert hasattr(adapter.press, "score_decode")
 
 
-def test_adapter_scores_snapshot_with_press(fake_starkv_module):
+def test_adapter_score_prefill_internal_fallback(monkeypatch):
+    monkeypatch.delitem(sys.modules, "starkv", raising=False)
+    from vllm.starkv.superpress import StarKVLayerSnapshot
+
     cache_config = CacheConfig()
     cache_config.enable_starkv_super_cache = True
-    adapter = StarKVPressAdapter(cache_config)
-    snapshot = StarKVLayerSnapshot(
-        layer_name="layer0",
-        kv_cache_group_id=0,
-        request_ids=["req0", "req1"],
-        num_tokens=4,
-        slot_mapping=torch.zeros((2, 2), dtype=torch.int64),
-        token_request_indices=[0, 0, 1, 1],
-        token_positions=[0, 1, 0, 1],
-    )
-    result = adapter.process_prefill_snapshot(snapshot)
-    assert result is not None
-    assert result.keep_tokens_by_request == {"req0": [0], "req1": [0]}
-    assert adapter.press.last_payload["layer_name"] == "layer0"
-
-
-def test_adapter_falls_back_when_press_lacks_score(fake_starkv_module):
-    cache_config = CacheConfig()
-    cache_config.enable_starkv_super_cache = True
-    adapter = StarKVPressAdapter(cache_config)
-    assert adapter.press is not None
-    press_cls = type(adapter.press)
-    if hasattr(press_cls, "score_prefill"):
-        delattr(press_cls, "score_prefill")
+    adapter = StarkVPressAdapter(cache_config)
 
     snapshot = StarKVLayerSnapshot(
         layer_name="layer0",
         kv_cache_group_id=0,
-        request_ids=["req0"],
-        num_tokens=2,
-        slot_mapping=torch.ones((1, 1), dtype=torch.int64),
-        token_request_indices=[0, 0],
-        token_positions=[0, 1],
+        request_ids=["req1", "req2"],
+        num_tokens=100,
     )
-    result = adapter.process_prefill_snapshot(snapshot)
-    assert result is not None
-    assert result.confidence_by_request["req0"] == 1.0
-    assert result.keep_tokens_by_request is None
+    result = adapter.score_prefill(snapshot)
+    assert "req1" in result.confidence_by_request
+    assert "req2" in result.confidence_by_request
+    assert result.keep_tokens_by_request is None or "req1" in result.keep_tokens_by_request
+
+
+def test_adapter_score_decode_low_confidence_triggers_plan(monkeypatch):
+    monkeypatch.delitem(sys.modules, "starkv", raising=False)
+    cache_config = CacheConfig()
+    cache_config.enable_starkv_super_cache = True
+    cache_config.starkv_confidence_threshold = 0.9
+    adapter = StarkVPressAdapter(cache_config)
+
+    result = adapter.score_decode(
+        confidence_by_request={"r1": 0.5, "r2": 0.95},
+        current_pos_by_request={"r1": 10, "r2": 10},
+        last_reforward_index_by_request={},
+        prompt_len_by_request={"r1": 2, "r2": 2},
+    )
+    assert len(result.plans) >= 1
+    plan_req_ids = [p["request_id"] for p in result.plans]
+    assert "r1" in plan_req_ids
+    assert "r2" not in plan_req_ids
+
+
+def test_adapter_tier_store_mirror_and_clear(monkeypatch):
+    monkeypatch.delitem(sys.modules, "starkv", raising=False)
+    cache_config = CacheConfig()
+    cache_config.enable_starkv_super_cache = True
+    adapter = StarkVPressAdapter(cache_config)
+
+    adapter.mirror_blocks("req1", [1, 2, 3])
+    adapter.mirror_blocks("req1", [4])
+    assert len(adapter.get_tier_store().get_mirrored_blocks("req1")) == 4
+    adapter.clear_request("req1")
+    assert adapter.get_tier_store().get_mirrored_blocks("req1") == []
 

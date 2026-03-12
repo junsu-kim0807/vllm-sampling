@@ -102,11 +102,6 @@ class Scheduler(SchedulerInterface):
             self.parallel_config.data_parallel_rank,
         )
 
-        self._starkv_stats = {
-            "total_reforward_requests": 0,
-            "total_reforward_tokens": 0,
-        }
-
         num_gpu_blocks = self.cache_config.num_gpu_blocks
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
@@ -167,21 +162,27 @@ class Scheduler(SchedulerInterface):
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
 
-        # Create the KV cache manager.
-        manager_cls = (
-            StarKVCacheManager
-            if kv_cache_config.enable_starkv_super_cache
-            else KVCacheManager
-        )
-        self.kv_cache_manager = manager_cls(
-            kv_cache_config=kv_cache_config,
-            max_model_len=self.max_model_len,
-            enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
-            log_stats=self.log_stats,
-            enable_kv_cache_events=self.enable_kv_cache_events,
-            dcp_world_size=self.dcp_world_size,
-        )
+        # Create the KV cache manager (StarKV wrapper when super cache enabled).
+        if self.cache_config.enable_starkv_super_cache:
+            self.kv_cache_manager = StarKVCacheManager(
+                kv_cache_config=kv_cache_config,
+                max_model_len=self.max_model_len,
+                enable_caching=self.cache_config.enable_prefix_caching,
+                use_eagle=self.use_eagle,
+                log_stats=self.log_stats,
+                enable_kv_cache_events=self.enable_kv_cache_events,
+                dcp_world_size=self.dcp_world_size,
+            )
+        else:
+            self.kv_cache_manager = KVCacheManager(
+                kv_cache_config=kv_cache_config,
+                max_model_len=self.max_model_len,
+                enable_caching=self.cache_config.enable_prefix_caching,
+                use_eagle=self.use_eagle,
+                log_stats=self.log_stats,
+                enable_kv_cache_events=self.enable_kv_cache_events,
+                dcp_world_size=self.dcp_world_size,
+            )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
     def schedule(self) -> SchedulerOutput:
@@ -314,37 +315,9 @@ class Scheduler(SchedulerInterface):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
-            consume_ref = getattr(
-                self.kv_cache_manager, "consume_reforward_flag", None
-            )
-            reforward_plan = None
-            if callable(consume_ref) and consume_ref(request.request_id):
-                if isinstance(self.kv_cache_manager, StarKVCacheManager):
-                    reforward_plan = self.kv_cache_manager.pop_reforward_plan(
-                        request.request_id
-                    )
-            if reforward_plan:
-                start_pos = max(
-                    int(reforward_plan.get("start_pos", request.num_computed_tokens)), 0
-                )
-                suffix_len = max(
-                    int(reforward_plan.get("suffix_len", num_new_tokens)), 1
-                )
-                request.starkv_reforward_count += 1
-                request.starkv_reforward_steps += suffix_len
-                self._record_starkv_reforward(suffix_len)
-                request.num_computed_tokens = start_pos
-                num_new_tokens = suffix_len
-                num_scheduled_tokens[request.request_id] = num_new_tokens
-                self._free_new_blocks(new_blocks)
-                req_to_new_blocks[request.request_id] = (
-                    self.kv_cache_manager.empty_kv_cache_blocks
-                )
-            else:
-                req_to_new_blocks[request.request_id] = new_blocks
-                num_scheduled_tokens[request.request_id] = num_new_tokens
+            req_to_new_blocks[request.request_id] = new_blocks
+            num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
-            req_index += 1
             req_index += 1
 
             # Speculative decode related.
@@ -745,7 +718,6 @@ class Scheduler(SchedulerInterface):
         resumed_req_token_ids: list[list[int] | None] = []
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
-        starkv_restore_handles: list[list[dict[str, Any]] | None] = []
 
         # Because resumed_reqs is usually empty, it is more efficient to do
         # in-place appending so that we don't need to allocate a new list.
@@ -780,13 +752,6 @@ class Scheduler(SchedulerInterface):
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
-            restore_handles = None
-            if isinstance(self.kv_cache_manager, StarKVCacheManager):
-                restore_handles = self.kv_cache_manager.pop_offloaded_handles(req_id)
-            starkv_restore_handles.append(restore_handles)
-
-        if starkv_restore_handles and not any(starkv_restore_handles):
-            starkv_restore_handles = None
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -796,17 +761,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
-            starkv_restore_handles=starkv_restore_handles,
         )
-
-    def _free_new_blocks(self, new_blocks: KVCacheBlocks) -> None:
-        try:
-            block_pool = self.kv_cache_manager.block_pool
-        except AttributeError:
-            return
-        for block_group in new_blocks.blocks:
-            if block_group:
-                block_pool.free_blocks(block_group)
 
     def _try_schedule_encoder_inputs(
         self,
@@ -958,11 +913,46 @@ class Scheduler(SchedulerInterface):
         )
         return structured_output_request_ids, bitmask
 
+    def _apply_starkv_reforward(
+        self, model_runner_output: ModelRunnerOutput
+    ) -> set[str]:
+        """Ingest StarKV feedback, consume reforward plans, rewind requests. Returns req_ids that were rewound."""
+        reforwarded: set[str] = set()
+        if not hasattr(self.kv_cache_manager, "ingest_feedback"):
+            return reforwarded
+        self.kv_cache_manager.ingest_feedback(model_runner_output)
+        plans = self.kv_cache_manager.take_reforward_plans()
+        for plan in plans:
+            req_id = plan.get("request_id")
+            if not req_id:
+                continue
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            start_pos = int(plan.get("start_pos", 0))
+            start_pos = max(0, min(start_pos, request.num_computed_tokens))
+            request.num_computed_tokens = start_pos
+            num_prompt = request.num_prompt_tokens
+            keep_output_len = max(0, start_pos - num_prompt)
+            while len(request._output_token_ids) > keep_output_len:
+                request._output_token_ids.pop()
+            prefix = (
+                list(request.prompt_token_ids)
+                if request.prompt_token_ids is not None
+                else [0] * num_prompt
+            )
+            request._all_token_ids.clear()
+            request._all_token_ids.extend(prefix + request._output_token_ids[:])
+            reforwarded.add(req_id)
+        return reforwarded
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        reforwarded_req_ids = self._apply_starkv_reforward(model_runner_output)
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -970,12 +960,6 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
-        starkv_feedback = model_runner_output.starkv_feedback
-        if (
-            starkv_feedback
-            and isinstance(self.kv_cache_manager, StarKVCacheManager)
-        ):
-            self.kv_cache_manager.ingest_layer_feedbacks(starkv_feedback)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
@@ -1017,6 +1001,8 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            if req_id in reforwarded_req_ids:
+                generated_token_ids = []
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -1309,6 +1295,9 @@ class Scheduler(SchedulerInterface):
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
+        starkv_stats = None
+        if hasattr(self.kv_cache_manager, "get_starkv_stats"):
+            starkv_stats = self.kv_cache_manager.get_starkv_stats().to_dict()
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
@@ -1317,6 +1306,7 @@ class Scheduler(SchedulerInterface):
             spec_decoding_stats=spec_decoding_stats,
             num_corrupted_reqs=sum(req.is_output_corrupted for req in self.running),
             kv_connector_stats=kv_connector_stats.data if kv_connector_stats else None,
+            starkv_stats=starkv_stats,
         )
 
     def make_spec_decoding_stats(
@@ -1339,19 +1329,6 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
-
-    def _record_starkv_reforward(self, suffix_len: int) -> None:
-        if suffix_len <= 0:
-            return
-        self._starkv_stats["total_reforward_requests"] += 1
-        self._starkv_stats["total_reforward_tokens"] += suffix_len
-
-    def reset_starkv_stats(self) -> None:
-        self._starkv_stats["total_reforward_requests"] = 0
-        self._starkv_stats["total_reforward_tokens"] = 0
-
-    def get_starkv_stats_snapshot(self) -> dict[str, int]:
-        return dict(self._starkv_stats)
 
     ########################################################################
     # KV Connector Related Methods

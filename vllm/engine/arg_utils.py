@@ -911,8 +911,7 @@ class EngineArgs:
             **cache_kwargs["starkv_max_reforward_steps"],
         )
         cache_group.add_argument(
-            "--starkv-offload",
-            **cache_kwargs["starkv_offload"],
+            "--starkv-offload", **cache_kwargs["starkv_offload"]
         )
 
         # Multimodal related configs

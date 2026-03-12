@@ -3,7 +3,6 @@
 
 import gc
 import itertools
-import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator
@@ -69,15 +68,6 @@ from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
-from vllm.starkv import (
-    StarKVLayerFeedback,
-    StarKVLayerSnapshot,
-    StarKVOffloadHandle,
-    StarKVOffloadStore,
-    StarKVPrefillResult,
-    StarKVPressAdapter,
-    StarKVTierStore,
-)
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils import (
     cdiv,
@@ -236,31 +226,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
         self.starkv_adapter = None
-        self._starkv_feedback: list[StarKVLayerFeedback] | None = None
-        self.starkv_offload_store: StarKVOffloadStore | None = None
-        self.starkv_super_store: StarKVTierStore | None = None
-        self._starkv_handle_registry: dict[int, StarKVOffloadHandle] = {}
-        self._starkv_handles_by_request: dict[str, list[int]] = {}
-        self._starkv_restored_this_step: set[tuple[str, int]] = set()
-        # StarKV reforward guard:
-        # When a request is reforwarded, the scheduler rewinds its num_computed_tokens.
-        # In the current placeholder plumbing, repeated low-confidence checks can
-        # immediately trigger another reforward and lead to stalls. We therefore
-        # skip confidence-triggered reforwarding for a request on the *first*
-        # step immediately after a reforward.
-        #
-        # We implement this purely on the worker side by tracking when a
-        # request's "start_pos" moves backwards and then suppressing low-confidence
-        # signals when we reach the end position of that reforward segment.
-        self._starkv_last_end_pos: dict[str, int] = {}
-        self._starkv_skip_confidence_at_pos: dict[str, int] = {}
-        # Track the end position of the last successful reforward segment per request.
-        # This mirrors the reference algorithm's `last_superkv_index` (but in
-        # absolute token positions that include the prompt).
-        self._starkv_last_reforward_index: dict[str, int] = {}
         if self.cache_config.enable_starkv_super_cache:
-            self.starkv_adapter = StarKVPressAdapter(self.cache_config)
-            self.starkv_adapter.log_placeholder_event()
+            from vllm.starkv import StarkVPressAdapter
+
+            self.starkv_adapter = StarkVPressAdapter(self.cache_config)
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 
@@ -656,7 +625,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
-            self._cleanup_starkv_handles(req_id)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -734,9 +702,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
-        starkv_restore_handles = getattr(
-            req_data, "starkv_restore_handles", None
-        )
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
@@ -748,10 +713,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             req_state.num_computed_tokens = num_computed_tokens
             req_index = self.input_batch.req_id_to_index.get(req_id)
-            restore_entries = None
-            if starkv_restore_handles is not None:
-                restore_entries = starkv_restore_handles[i]
-            self._restore_starkv_blocks(req_id, restore_entries)
 
             if not is_last_rank:
                 # When using PP, the scheduler sends the sampled tokens back,
@@ -1113,9 +1074,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
         max_num_scheduled_tokens = max(tokens)
-        prev_computed_tokens = self.input_batch.num_computed_tokens_cpu[
-            :num_reqs
-        ].copy()
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1443,18 +1401,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         for layer_name in kv_cache_group_spec.layer_names:
                             assert type(attn_metadata) is list
                             attn_metadata[ubid][layer_name] = attn_metadata_i
-                            self._notify_starkv_prefill(
-                                layer_name=layer_name,
-                                kv_cache_group_id=kv_cache_group_id,
-                                attn_metadata_i=attn_metadata_i,
-                                num_reqs=num_reqs,
-                                total_num_scheduled_tokens=total_num_scheduled_tokens,
-                                slot_mapping=slot_mapping,
-                                req_indices=req_indices,
-                                token_positions=positions_np,
-                                req_scheduled_tokens=num_scheduled_tokens,
-                                prev_computed_tokens=prev_computed_tokens,
-                            )
                 else:
                     assert isinstance(attn_metadata, dict)
                     attn_metadata_i = builder.build(
@@ -1465,18 +1411,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     use_cascade_attn |= getattr(attn_metadata_i, "use_cascade", False)
                     for layer_name in attn_group.layer_names:
                         attn_metadata[layer_name] = attn_metadata_i
-                        self._notify_starkv_prefill(
-                            layer_name=layer_name,
-                            kv_cache_group_id=kv_cache_group_id,
-                            attn_metadata_i=attn_metadata_i,
-                            num_reqs=num_reqs,
-                            total_num_scheduled_tokens=total_num_scheduled_tokens,
-                            slot_mapping=slot_mapping,
-                            req_indices=req_indices,
-                            token_positions=positions_np,
-                            req_scheduled_tokens=num_scheduled_tokens,
-                            prev_computed_tokens=prev_computed_tokens,
-                        )
 
         # disable cascade attention when DBO
         if ubatch_slices is not None:
@@ -1497,454 +1431,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_tokens_across_dp,
             use_cascade_attn,
         )
-
-    def _notify_starkv_prefill(
-        self,
-        layer_name: str,
-        kv_cache_group_id: int,
-        attn_metadata_i: AttentionMetadata,
-        num_reqs: int,
-        total_num_scheduled_tokens: int,
-        slot_mapping,
-        req_indices: np.ndarray,
-        token_positions: np.ndarray,
-        req_scheduled_tokens: np.ndarray,
-        prev_computed_tokens: np.ndarray,
-    ) -> None:
-        if self.starkv_adapter is None:
-            return
-        req_ids = [
-            str(req_id)
-            for req_id in self.input_batch.req_ids[:num_reqs]  # type: ignore[index]
-        ]
-        reforward_info: dict[str, dict[str, int]] = {}
-        skip_confidence_req_ids: set[str] = set()
-        for idx, req_id in enumerate(req_ids):
-            suffix_len = int(req_scheduled_tokens[idx])
-            prev_tokens = int(prev_computed_tokens[idx])
-            # Detect a reforward by observing a backwards jump in the scheduled
-            # start position vs what we previously computed up to.
-            last_end = self._starkv_last_end_pos.get(req_id, prev_tokens)
-            if prev_tokens < last_end:
-                # Reforward is happening: restore sub-tier KV blocks from the
-                # super tier so the replay uses the full (super) cache.
-                if self.starkv_super_store is not None:
-                    key = (req_id, kv_cache_group_id)
-                    if key not in self._starkv_restored_this_step:
-                        req_state = self.requests.get(req_id)
-                        if req_state is not None and kv_cache_group_id < len(req_state.block_ids):
-                            self.starkv_super_store.restore_blocks(
-                                kv_group_id=kv_cache_group_id,
-                                block_ids=list(req_state.block_ids[kv_cache_group_id]),
-                            )
-                        self._starkv_restored_this_step.add(key)
-                # After we finish recomputing [prev_tokens, prev_tokens+suffix_len),
-                # skip confidence-triggered reforwarding on the very next step
-                # which will start at end_pos.
-                self._starkv_skip_confidence_at_pos[req_id] = prev_tokens + suffix_len
-            # If this step starts exactly at the end_pos of the last reforward,
-            # suppress low-confidence signals (one step).
-            if prev_tokens == self._starkv_skip_confidence_at_pos.get(req_id):
-                skip_confidence_req_ids.add(req_id)
-            reforward_info[req_id] = {
-                "request_id": req_id,
-                "start_pos": prev_tokens,
-                "suffix_len": suffix_len,
-            }
-            # Update last seen end position for the request.
-            self._starkv_last_end_pos[req_id] = prev_tokens + max(suffix_len, 0)
-        slot_mapping_cpu = slot_mapping.detach().cpu().clone()
-        snapshot = StarKVLayerSnapshot(
-            layer_name=layer_name,
-            kv_cache_group_id=kv_cache_group_id,
-            request_ids=req_ids,
-            num_tokens=total_num_scheduled_tokens,
-            slot_mapping=slot_mapping_cpu,
-            token_request_indices=req_indices.tolist(),
-            token_positions=token_positions.tolist(),
-        )
-        result = self.starkv_adapter.process_prefill_snapshot(snapshot)
-        if result is None:
-            return
-        # If we are immediately after a reforward for some requests, do not let
-        # this step's confidence check trigger another reforward.
-        if skip_confidence_req_ids and result.low_confidence_requests:
-            result.low_confidence_requests = [
-                rid for rid in result.low_confidence_requests
-                if rid not in skip_confidence_req_ids
-            ]
-        self._attach_starkv_reforward_metadata(result, reforward_info)
-        self._apply_starkv_keep_plan(snapshot, result)
-        if self._starkv_feedback is not None:
-            self._starkv_feedback.append(
-                StarKVLayerFeedback(snapshot=snapshot, result=result)
-            )
-
-    def _attach_starkv_reforward_metadata(
-        self,
-        result: StarKVPrefillResult,
-        reforward_info: dict[str, dict[str, int]],
-    ) -> None:
-        low_conf = result.low_confidence_requests
-        if not low_conf:
-            return
-        entries: list[dict[str, int]] = []
-        for req_id in low_conf:
-            entry = reforward_info.get(req_id)
-            if not entry:
-                continue
-            if entry["suffix_len"] <= 0:
-                continue
-            entries.append(entry)
-        if not entries:
-            return
-        metadata = result.metadata.copy() if result.metadata else {}
-        existing = metadata.get("starkv_reforward_requests", [])
-        metadata["starkv_reforward_requests"] = existing + entries
-        result.metadata = metadata
-
-    def _apply_starkv_keep_plan(
-        self,
-        snapshot: StarKVLayerSnapshot,
-        result: StarKVPrefillResult,
-    ) -> None:
-        keep_tokens = result.keep_tokens_by_request
-        if not keep_tokens:
-            return
-
-        block_table = self.input_batch.block_table[snapshot.kv_cache_group_id]
-        kernel_block_size = block_table.block_size
-        blocks_per_kv_block = getattr(block_table, "blocks_per_kv_block", 1)
-        kv_block_size = kernel_block_size * blocks_per_kv_block
-
-        slot_tensor = snapshot.slot_mapping
-        if isinstance(slot_tensor, torch.Tensor):
-            slot_np = slot_tensor.cpu().numpy()
-        else:
-            slot_np = np.asarray(slot_tensor)
-
-        if slot_np.size == 0:
-            return
-
-        token_req_indices = np.asarray(snapshot.token_request_indices, dtype=np.int64)
-        token_positions = np.asarray(snapshot.token_positions, dtype=np.int64)
-        valid_mask = slot_np >= 0
-        kernel_block_ids = np.full_like(slot_np, -1, dtype=np.int64)
-        kernel_block_ids[valid_mask] = slot_np[valid_mask] // kernel_block_size
-        kv_block_ids = np.full_like(kernel_block_ids, -1, dtype=np.int64)
-        if blocks_per_kv_block > 1:
-            kv_block_ids[valid_mask] = kernel_block_ids[valid_mask] // blocks_per_kv_block
-        else:
-            kv_block_ids = kernel_block_ids
-
-        block_plan_entries: list[dict[str, Any]] = []
-        offload_handles: list[StarKVOffloadHandle] = []
-        for req_idx, req_id in enumerate(snapshot.request_ids):
-            keep_positions = keep_tokens.get(req_id)
-            if keep_positions is None:
-                continue
-            mask = token_req_indices == req_idx
-            candidate_blocks = set(
-                kv_block_ids[np.logical_and(mask, valid_mask)].tolist()
-            )
-            candidate_blocks.discard(-1)
-            if not candidate_blocks:
-                continue
-
-            keep_block_ids = {pos // kv_block_size for pos in keep_positions}
-            blocks_to_drop = candidate_blocks - keep_block_ids
-            if not blocks_to_drop:
-                continue
-
-            req_index = self.input_batch.req_id_to_index.get(req_id)
-            if req_index is None:
-                continue
-
-            if self._drop_blocks_for_request(
-                snapshot.kv_cache_group_id, req_id, req_index, blocks_to_drop
-            ):
-                handle: StarKVOffloadHandle | None = None
-                if self.starkv_offload_store is not None:
-                    handle = self.starkv_offload_store.offload_blocks(
-                        request_id=req_id,
-                        kv_group_id=snapshot.kv_cache_group_id,
-                        block_ids=sorted(blocks_to_drop),
-                    )
-                if handle:
-                    offload_handles.append(handle)
-                    self._starkv_handle_registry[handle.handle_id] = handle
-                    self._starkv_handles_by_request.setdefault(req_id, []).append(
-                        handle.handle_id
-                    )
-                block_plan_entries.append(
-                    {
-                        "request_id": req_id,
-                        "kv_group_id": snapshot.kv_cache_group_id,
-                        "dropped_blocks": sorted(blocks_to_drop),
-                    }
-                )
-
-        if block_plan_entries:
-            metadata = result.metadata.copy() if result.metadata else {}
-            plans = metadata.get("starkv_block_plan", [])
-            plans.extend(block_plan_entries)
-            metadata["starkv_block_plan"] = plans
-            if offload_handles:
-                metadata["starkv_offloaded_blocks"] = [
-                    {
-                        "request_id": handle.request_id,
-                        "kv_group_id": handle.kv_group_id,
-                        "block_ids": list(handle.block_ids),
-                        "handle_id": handle.handle_id,
-                    }
-                    for handle in offload_handles
-                ]
-            result.metadata = metadata
-
-    def _drop_blocks_for_request(
-        self,
-        kv_cache_group_id: int,
-        req_id: str,
-        req_index: int,
-        blocks_to_drop: set[int],
-    ) -> bool:
-        if not blocks_to_drop:
-            return False
-        req_state = self.requests.get(req_id)
-        if req_state is None:
-            return False
-        block_lists = [list(block_ids) for block_ids in req_state.block_ids]
-        group_blocks = block_lists[kv_cache_group_id]
-        new_group_blocks = [blk for blk in group_blocks if blk not in blocks_to_drop]
-        if len(new_group_blocks) == len(group_blocks):
-            return False
-        block_lists[kv_cache_group_id] = new_group_blocks
-        req_state.block_ids = tuple(block_lists)
-        self.input_batch.block_table.add_row(req_state.block_ids, req_index)
-        return True
-
-    def _restore_starkv_blocks(
-        self,
-        request_id: str,
-        handles_metadata: list[dict[str, Any]] | None,
-    ) -> None:
-        if (
-            not handles_metadata
-            or self.starkv_offload_store is None
-            or not self._starkv_handle_registry
-        ):
-            return
-        for entry in handles_metadata:
-            handle_id = entry.get("handle_id")
-            if handle_id is None:
-                continue
-            handle = self._starkv_handle_registry.pop(handle_id, None)
-            if handle is None:
-                continue
-            restored = self.starkv_offload_store.restore_blocks(handle)
-            if not restored:
-                continue
-            req_handles = self._starkv_handles_by_request.get(request_id)
-            if req_handles and handle_id in req_handles:
-                req_handles.remove(handle_id)
-            if req_handles == []:
-                self._starkv_handles_by_request.pop(request_id, None)
-
-    def _cleanup_starkv_handles(self, request_id: str) -> None:
-        handle_ids = self._starkv_handles_by_request.pop(request_id, None)
-        if not handle_ids:
-            return
-        for handle_id in handle_ids:
-            self._starkv_handle_registry.pop(handle_id, None)
-
-    def _maybe_trigger_starkv_reforward_from_logits(
-        self,
-        logits: torch.Tensor | None,
-        req_ids: list[str],
-        invalid_req_indices: list[int] | None,
-    ) -> None:
-        """Decode-stage confidence check: trigger reforward if top-1 softmax prob <= threshold.
-
-        This is a placeholder implementation to mimic the reference algorithm:
-        measure confidence as top-1 softmax probability of the output-token
-        distribution at each decode step; if below threshold, request is marked
-        for reforwarding.
-
-        Notes:
-        - We use the logits used for sampling in this step (one row per request).
-        - We compute top-1 prob as exp(max_logit - logsumexp(logits)).
-        - We enqueue a minimal reforward plan that rewinds 1 token and replays 1 token.
-        - We respect the existing \"skip confidence after reforward\" one-step guard.
-        """
-        if logits is None or self.starkv_adapter is None:
-            return
-        threshold = self.cache_config.starkv_confidence_threshold
-        if threshold is None:
-            return
-        # Threshold >= 1.0 can never trigger; threshold <= 0 triggers always.
-        if threshold >= 1.0:
-            return
-
-        if not isinstance(logits, torch.Tensor) or logits.numel() == 0:
-            return
-        if logits.dim() != 2:
-            return
-        if len(req_ids) != logits.shape[0]:
-            # Defensive: if shapes mismatch, skip rather than risk wrong mapping.
-            return
-
-        invalid_set: set[int] = set(invalid_req_indices or [])
-
-        # Compute top-1 softmax probability efficiently in float32.
-        logits_f = logits.float()
-        max_logit, _ = logits_f.max(dim=-1)  # [num_reqs]
-        lse = torch.logsumexp(logits_f, dim=-1)  # [num_reqs]
-        top1_prob = (max_logit - lse).exp()  # [num_reqs], in (0,1]
-
-        low_conf_reqs: list[str] = []
-        confidence_by_request: dict[str, float] = {}
-        plans: list[dict[str, int]] = []
-
-        for i, req_id in enumerate(req_ids):
-            if i in invalid_set:
-                continue
-            conf = float(top1_prob[i].item())
-            confidence_by_request[req_id] = conf
-            if conf > float(threshold):
-                continue
-            # Skip confidence-triggered reforward right after a reforward (one step).
-            state = self.requests.get(req_id)
-            current_pos = state.num_computed_tokens if state is not None else None
-            if current_pos is not None and current_pos == self._starkv_skip_confidence_at_pos.get(req_id):
-                # One-shot: consume the skip marker once we've used it.
-                self._starkv_skip_confidence_at_pos.pop(req_id, None)
-                logger.debug(
-                    "StarKV decode-confidence: skipping reforward check right after reforward "
-                    "(req_id=%s, pos=%s, conf=%.6f, threshold=%.6f)",
-                    req_id,
-                    current_pos,
-                    conf,
-                    float(threshold),
-                )
-                continue
-
-            low_conf_reqs.append(req_id)
-            # Reforward plan (reference behavior):
-            # Reforward all decoded tokens since the last reforward.
-            #
-            # Reference logic:
-            #   start = last_superkv_index
-            #   end = step_idx (= len(generated_ids))
-            #   suffix_tokens = generated_ids[start:end]
-            #
-            # In vLLM we model this as a scheduler reforward plan:
-            #   rewind to start_pos and replay suffix_len tokens.
-            #
-            # We store `last_reforward_index` as an absolute position
-            # (including prompt tokens), and initialize it to prompt_len so we
-            # never rewind into the prompt.
-            prompt_len = getattr(state, "num_prompt_tokens", 0) if state is not None else 0
-            start_pos = int(self._starkv_last_reforward_index.get(req_id, prompt_len))
-            start_pos = max(start_pos, int(prompt_len))
-            if current_pos is not None:
-                end_pos = max(int(current_pos), start_pos + 1)
-                suffix_len = max(end_pos - start_pos, 1)
-            else:
-                end_pos = start_pos + 1
-                suffix_len = 1
-            plans.append({"request_id": req_id, "start_pos": start_pos, "suffix_len": suffix_len})
-            # Update reference pointer: after we reforward [start_pos, end_pos),
-            # consider that segment as committed for future reforwarding.
-            self._starkv_last_reforward_index[req_id] = end_pos
-            # Also guard the very next step from immediately re-triggering.
-            self._starkv_skip_confidence_at_pos[req_id] = end_pos
-
-            # Debug log for visibility. If you want INFO-level logs, set:
-            #   STARKV_LOG_REFORWARD=1
-            if bool(int(os.getenv("STARKV_LOG_REFORWARD", "0"))):
-                logger.info(
-                    "StarKV decode-confidence reforward trigger: req_id=%s conf=%.6f thr=%.6f "
-                    "start_pos=%d end_pos=%d suffix_len=%d",
-                    req_id,
-                    conf,
-                    float(threshold),
-                    start_pos,
-                    end_pos,
-                    suffix_len,
-                )
-            else:
-                logger.debug(
-                    "StarKV decode-confidence reforward trigger: req_id=%s conf=%.6f thr=%.6f "
-                    "start_pos=%d end_pos=%d suffix_len=%d",
-                    req_id,
-                    conf,
-                    float(threshold),
-                    start_pos,
-                    end_pos,
-                    suffix_len,
-                )
-
-        if not low_conf_reqs or not plans:
-            return
-
-        # Attach reforward requests into scheduler-visible starkv_feedback.
-        # We intentionally keep snapshot payload minimal; the cache manager only
-        # needs low_confidence_requests + metadata plans.
-        result = StarKVPrefillResult(
-            low_confidence_requests=low_conf_reqs,
-            confidence_by_request=confidence_by_request,
-            keep_tokens_by_request=None,
-            metadata={"starkv_reforward_requests": plans},
-        )
-        snapshot = StarKVLayerSnapshot(
-            layer_name="__decode_confidence__",
-            kv_cache_group_id=0,
-            request_ids=req_ids,
-            num_tokens=0,
-            slot_mapping=[],
-            token_request_indices=[],
-            token_positions=[],
-        )
-        if self._starkv_feedback is not None:
-            self._starkv_feedback.append(StarKVLayerFeedback(snapshot=snapshot, result=result))
-
-    def _starkv_mirror_kv_blocks_after_step(self, scheduler_output: "SchedulerOutput") -> None:
-        """Mirror updated KV blocks from sub tier into super tier after a model step."""
-        if self.starkv_super_store is None:
-            return
-
-        # Mirror blocks for newly scheduled requests (prefill).
-        for new_req in scheduler_output.scheduled_new_reqs:
-            for kv_group_id, block_ids in enumerate(new_req.block_ids):
-                self.starkv_super_store.mirror_blocks(
-                    kv_group_id=kv_group_id,
-                    block_ids=list(block_ids),
-                )
-
-        # Mirror newly allocated blocks for cached requests (decode/prefill chunks).
-        cached = scheduler_output.scheduled_cached_reqs
-        for req_id, new_block_ids in zip(cached.req_ids, cached.new_block_ids):
-            if new_block_ids is None:
-                continue
-            for kv_group_id, block_ids in enumerate(new_block_ids):
-                self.starkv_super_store.mirror_blocks(
-                    kv_group_id=kv_group_id,
-                    block_ids=list(block_ids),
-                )
-
-        # Also mirror the tail block for each active request so that in-block writes
-        # (appending tokens within an already-allocated block) are captured.
-        for req_id in itertools.chain(cached.req_ids, (r.req_id for r in scheduler_output.scheduled_new_reqs)):
-            req_state = self.requests.get(req_id)
-            if req_state is None:
-                continue
-            for kv_group_id, group_blocks in enumerate(req_state.block_ids):
-                if not group_blocks:
-                    continue
-                self.starkv_super_store.mirror_blocks(
-                    kv_group_id=kv_group_id,
-                    block_ids=[int(group_blocks[-1])],
-                )
 
     def _compute_cascade_attn_prefix_len(
         self,
@@ -2592,7 +2078,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=pooler_output,
-            starkv_feedback=self._starkv_feedback,
         )
 
     def _get_num_input_tokens(self, num_scheduled_tokens: int) -> int:
@@ -2768,6 +2253,66 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         sampler_output.sampled_token_ids = output_token_ids
         self._update_states_after_model_execute(output_token_ids)
         return sampler_output
+
+    def _starkv_decode_feedback(
+        self,
+        logits: torch.Tensor,
+        scheduler_output: "SchedulerOutput",
+    ) -> dict[str, dict[str, int | float]] | None:
+        """Compute StarKV reforward feedback from decode-step logits."""
+        if self.starkv_adapter is None or self.is_pooling_model:
+            return None
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        if not req_ids:
+            return None
+        num_reqs = logits.size(0)
+        if num_reqs == 0:
+            return None
+        # Confidence = max(softmax(logits)) per request (last-token logits).
+        probs = torch.softmax(logits.float(), dim=-1)
+        confidence_vec = probs.max(dim=-1).values
+        if confidence_vec.device.type != "cpu":
+            confidence_vec = confidence_vec.cpu()
+        req_id_to_index = self.input_batch.req_id_to_index
+        num_computed_cpu = self.input_batch.num_computed_tokens_cpu
+        confidence_by_request: dict[str, float] = {}
+        current_pos_by_request: dict[str, int] = {}
+        prompt_len_by_request: dict[str, int] = {}
+        for req_id in req_ids:
+            idx = req_id_to_index.get(req_id)
+            if idx is None or idx >= num_reqs:
+                continue
+            confidence_by_request[req_id] = float(confidence_vec[idx].item())
+            cur = int(num_computed_cpu[idx]) + int(
+                scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            )
+            current_pos_by_request[req_id] = cur
+            state = self.requests.get(req_id)
+            prompt_len_by_request[req_id] = (
+                state.num_prompt_tokens if state else 0
+            )
+        if not confidence_by_request:
+            return None
+        result = self.starkv_adapter.score_decode(
+            confidence_by_request=confidence_by_request,
+            current_pos_by_request=current_pos_by_request,
+            last_reforward_index_by_request={},
+            prompt_len_by_request=prompt_len_by_request,
+        )
+        if not result.plans:
+            return None
+        return {p["request_id"]: p for p in result.plans}
+
+    def _starkv_mirror_blocks(self, req_ids: list[str]) -> None:
+        """Mirror sub-tier block IDs to super-tier store after step."""
+        if self.starkv_adapter is None or not req_ids:
+            return
+        for req_id in req_ids:
+            state = self.requests.get(req_id)
+            if state is None or not state.block_ids:
+                continue
+            block_ids = list(state.block_ids[0])
+            self.starkv_adapter.mirror_blocks(req_id, block_ids)
 
     def _bookkeeping_sync(
         self,
@@ -2948,11 +2493,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
 
-                if self.starkv_adapter is not None:
-                    self._starkv_feedback = []
-                else:
-                    self._starkv_feedback = None
-
                 if not scheduler_output.total_num_scheduled_tokens:
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
@@ -3111,6 +2651,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if scheduler_output.structured_output_request_ids:
                 apply_grammar_bitmask(scheduler_output, self.input_batch, logits)
 
+        starkv_feedback = None
+        if (
+            logits is not None
+            and not self.is_pooling_model
+            and self.starkv_adapter is not None
+        ):
+            req_ids_starkv = list(scheduler_output.num_scheduled_tokens.keys())
+            total_sched = scheduler_output.total_num_scheduled_tokens
+            if total_sched > len(req_ids_starkv) and req_ids_starkv:
+                from vllm.starkv.superpress import StarKVLayerSnapshot
+
+                snapshot = StarKVLayerSnapshot(
+                    layer_name="",
+                    kv_cache_group_id=0,
+                    request_ids=req_ids_starkv,
+                    num_tokens=total_sched,
+                )
+                self.starkv_adapter.score_prefill(snapshot)
+            starkv_feedback = self._starkv_decode_feedback(logits, scheduler_output)
+
         with record_function_or_nullcontext("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
@@ -3171,20 +2731,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_scheduled_tokens,
             )
 
-        # Reset per-step restore guards.
-        self._starkv_restored_this_step.clear()
-
-        # Decode-stage StarKV confidence check (top-1 softmax probability).
-        # This may enqueue reforward plans for the scheduler via starkv_feedback.
-        self._maybe_trigger_starkv_reforward_from_logits(
-            logits=logits,
-            req_ids=req_ids_output_copy,
-            invalid_req_indices=invalid_req_indices,
-        )
-
-        # Mirror updated KV blocks into the super tier after this step completes.
-        self._starkv_mirror_kv_blocks_after_step(scheduler_output)
-
         if (
             self.speculative_config
             and not use_padded_batch_for_eagle
@@ -3206,8 +2752,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pooler_output=[],
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
-            starkv_feedback=self._starkv_feedback,
+            starkv_feedback=starkv_feedback,
         )
+
+        if self.starkv_adapter is not None and req_ids_output_copy:
+            self._starkv_mirror_blocks(req_ids_output_copy)
 
         if not self.use_async_scheduling:
             return output
@@ -5052,87 +4601,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         return kv_caches
 
-    def _initialize_starkv_offload_store(
-        self,
-        kv_cache_config: KVCacheConfig,
-        kv_caches: dict[str, torch.Tensor],
-    ) -> None:
-        try:
-            starkv_offload = getattr(kv_cache_config, "starkv_offload", False)
-
-            # Super tier buffers:
-            # - If starkv_offload is enabled, super tier lives on CPU (pinned).
-            # - Otherwise, super tier lives on GPU (same device as sub tier).
-            if starkv_offload:
-                super_buffers = self._create_starkv_host_buffers(kv_caches)
-            else:
-                # NOTE: This doubles KV-cache memory on GPU.
-                try:
-                    # Deduplicate buffers for shared KV cache layers: kv_caches may
-                    # contain multiple layer names pointing to the same tensor.
-                    seen: dict[int, torch.Tensor] = {}
-                    super_buffers = {}
-                    for layer_name, tensor in kv_caches.items():
-                        key = id(tensor)
-                        if key not in seen:
-                            seen[key] = torch.empty_like(tensor, device=tensor.device)
-                        super_buffers[layer_name] = seen[key]
-                except torch.OutOfMemoryError:
-                    # If GPU super-tier allocation fails, fall back to CPU pinned.
-                    # This keeps StarKV functional for evaluation runs.
-                    logger.warning(
-                        "StarKV: GPU super-tier allocation OOM. Falling back to CPU pinned "
-                        "super tier (equivalent to enabling --starkv-offload). "
-                        "To avoid this, reduce max_model_len / KV cache size or run with "
-                        "--starkv-offload explicitly."
-                    )
-                    try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                    super_buffers = self._create_starkv_host_buffers(kv_caches)
-                    # We are now effectively in offload mode for super tier.
-                    starkv_offload = True
-
-            self.starkv_super_store = StarKVTierStore(
-                kv_cache_config=kv_cache_config,
-                super_buffers=super_buffers,
-                sub_kv_caches=kv_caches,
-            )
-
-            # Optional offload store: only used when starkv_offload=True.
-            if starkv_offload:
-                self.starkv_offload_store = StarKVOffloadStore(
-                    kv_cache_config=kv_cache_config,
-                    host_buffers=super_buffers,
-                    gpu_kv_caches=kv_caches,
-                )
-            else:
-                self.starkv_offload_store = None
-        except Exception:
-            logger.exception("Unable to initialize StarKV offload store.")
-            self.starkv_offload_store = None
-            self.starkv_super_store = None
-
-    def _create_starkv_host_buffers(
-        self, kv_caches: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        host_buffers: dict[str, torch.Tensor] = {}
-        for layer_name, tensor in kv_caches.items():
-            try:
-                host_buffers[layer_name] = torch.empty(
-                    tensor.shape,
-                    dtype=tensor.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
-            except RuntimeError:
-                logger.exception(
-                    "Failed to allocate StarKV host buffer for layer %s", layer_name
-                )
-                raise
-        return host_buffers
-
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig
     ) -> None:
@@ -5176,8 +4644,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
-        if self.cache_config.enable_starkv_super_cache:
-            self._initialize_starkv_offload_store(kv_cache_config, kv_caches)
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
