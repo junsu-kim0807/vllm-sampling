@@ -20,6 +20,13 @@ class SpecDecodingStats:
     Each scheduler step, statistics on spec decoding performance are
     aggregated across requests by the scheduler and returned to the
     frontend in EngineCoreOutputs->SchedulerStats.
+
+    Cost breakdown (for hierarchical verification):
+    - draft_time_sec, compression_time_sec, partial_verification_time_sec,
+      full_verification_time_sec: accumulated seconds per step.
+    - num_partial_accepted_tokens: tokens accepted at partial verification.
+    - full_acceptance_length: use 1 + num_accepted_tokens/num_drafts (existing).
+    - end-to-end TPO: use FinishedRequestStats.mean_time_per_output_token.
     """
 
     num_spec_tokens: int
@@ -27,6 +34,13 @@ class SpecDecodingStats:
     num_draft_tokens: int = 0
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
+
+    # Cost breakdown: hierarchical verification timing and partial acceptance.
+    draft_time_sec: float = 0.0
+    compression_time_sec: float = 0.0
+    partial_verification_time_sec: float = 0.0
+    num_partial_accepted_tokens: int = 0
+    full_verification_time_sec: float = 0.0
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
@@ -42,6 +56,25 @@ class SpecDecodingStats:
         assert num_accepted_tokens <= self.num_spec_tokens
         for i in range(num_accepted_tokens):
             self.num_accepted_tokens_per_pos[i] += 1
+
+    def observe_draft_with_cost_breakdown(
+        self,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+        *,
+        draft_time_sec: float = 0.0,
+        compression_time_sec: float = 0.0,
+        partial_verification_time_sec: float = 0.0,
+        num_partial_accepted_tokens: int = 0,
+        full_verification_time_sec: float = 0.0,
+    ) -> None:
+        """Same as observe_draft plus optional cost breakdown (e.g. hierarchical)."""
+        self.observe_draft(num_draft_tokens, num_accepted_tokens)
+        self.draft_time_sec += draft_time_sec
+        self.compression_time_sec += compression_time_sec
+        self.partial_verification_time_sec += partial_verification_time_sec
+        self.num_partial_accepted_tokens += num_partial_accepted_tokens
+        self.full_verification_time_sec += full_verification_time_sec
 
 
 class SpecDecodingLogging:
@@ -60,6 +93,11 @@ class SpecDecodingLogging:
         self.num_draft_tokens: list[int] = []
         self.num_accepted_tokens: list[int] = []
         self.accepted_tokens_per_pos_lists: list[list[int]] = []
+        self.draft_time_sec: list[float] = []
+        self.compression_time_sec: list[float] = []
+        self.partial_verification_time_sec: list[float] = []
+        self.num_partial_accepted_tokens: list[int] = []
+        self.full_verification_time_sec: list[float] = []
         self.last_log_time = time.monotonic()
 
     def observe(self, spec_decoding_stats: SpecDecodingStats):
@@ -68,6 +106,17 @@ class SpecDecodingLogging:
         self.num_accepted_tokens.append(spec_decoding_stats.num_accepted_tokens)
         self.accepted_tokens_per_pos_lists.append(
             spec_decoding_stats.num_accepted_tokens_per_pos
+        )
+        self.draft_time_sec.append(spec_decoding_stats.draft_time_sec)
+        self.compression_time_sec.append(spec_decoding_stats.compression_time_sec)
+        self.partial_verification_time_sec.append(
+            spec_decoding_stats.partial_verification_time_sec
+        )
+        self.num_partial_accepted_tokens.append(
+            spec_decoding_stats.num_partial_accepted_tokens
+        )
+        self.full_verification_time_sec.append(
+            spec_decoding_stats.full_verification_time_sec
         )
 
     def log(self, log_fn=logger.info):
@@ -97,6 +146,22 @@ class SpecDecodingLogging:
         acceptance_rates = np.sum(pos_matrix, axis=0) / num_drafts
         rates_str = ", ".join(f"{p:.3f}" for p in acceptance_rates)
 
+        # Cost breakdown (hierarchical verification)
+        total_draft_time = np.sum(self.draft_time_sec)
+        total_compression_time = np.sum(self.compression_time_sec)
+        total_partial_verification_time = np.sum(self.partial_verification_time_sec)
+        total_partial_accepted = np.sum(self.num_partial_accepted_tokens)
+        total_full_verification_time = np.sum(self.full_verification_time_sec)
+        has_cost_breakdown = (
+            total_draft_time > 0
+            or total_compression_time > 0
+            or total_partial_verification_time > 0
+            or total_full_verification_time > 0
+        )
+        partial_acceptance_length = (
+            1 + total_partial_accepted / num_drafts if num_drafts > 0 else 0.0
+        )
+
         log_fn(
             "SpecDecoding metrics: "
             "Mean acceptance length: %.2f, "
@@ -114,6 +179,19 @@ class SpecDecodingLogging:
             rates_str,
             draft_acceptance_rate,
         )
+        if has_cost_breakdown:
+            log_fn(
+                "SpecDecoding cost breakdown: "
+                "draft_time: %.4fs, compression_time: %.4fs, "
+                "partial_verification_time: %.4fs, partial_acceptance_length: %.2f, "
+                "full_verification_time: %.4fs, full_acceptance_length: %.2f",
+                total_draft_time,
+                total_compression_time,
+                total_partial_verification_time,
+                partial_acceptance_length,
+                total_full_verification_time,
+                mean_acceptance_length,
+            )
         self.reset()
 
 

@@ -51,7 +51,12 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+    SpecDecodeCostBreakdown,
+)
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -1338,12 +1343,17 @@ class Scheduler(SchedulerInterface):
                 # the scheduled spec tokens count and so is similarly adjusted.
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
+                cost_breakdown = getattr(
+                    model_runner_output, "spec_decode_cost_breakdown", None
+                )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted,
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
+                    cost_breakdown=cost_breakdown,
+                    req_index=req_index,
                 )
 
             stopped = False
@@ -1906,6 +1916,8 @@ class Scheduler(SchedulerInterface):
         num_accepted_tokens: int,
         num_invalid_spec_tokens: dict[str, int] | None,
         request_id: str,
+        cost_breakdown: SpecDecodeCostBreakdown | None = None,
+        req_index: int | None = None,
     ) -> SpecDecodingStats | None:
         if not self.log_stats or not num_draft_tokens:
             return None
@@ -1913,9 +1925,36 @@ class Scheduler(SchedulerInterface):
             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
         if num_invalid_spec_tokens:
             num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
-        spec_decoding_stats.observe_draft(
-            num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
-        )
+        if cost_breakdown is not None and req_index is not None:
+            num_partial = (
+                cost_breakdown.num_partial_accepted_per_req[req_index]
+                if req_index < len(cost_breakdown.num_partial_accepted_per_req)
+                else 0
+            )
+            # Add batch-level times only for the first request in this batch.
+            is_first_spec_req = spec_decoding_stats.num_drafts == 0
+            spec_decoding_stats.observe_draft_with_cost_breakdown(
+                num_draft_tokens=num_draft_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                draft_time_sec=cost_breakdown.draft_time_sec if is_first_spec_req else 0,
+                compression_time_sec=(
+                    cost_breakdown.compression_time_sec if is_first_spec_req else 0
+                ),
+                partial_verification_time_sec=(
+                    cost_breakdown.partial_verification_time_sec
+                    if is_first_spec_req
+                    else 0
+                ),
+                num_partial_accepted_tokens=num_partial,
+                full_verification_time_sec=(
+                    cost_breakdown.full_verification_time_sec if is_first_spec_req else 0
+                ),
+            )
+        else:
+            spec_decoding_stats.observe_draft(
+                num_draft_tokens=num_draft_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+            )
         return spec_decoding_stats
 
     def shutdown(self) -> None:

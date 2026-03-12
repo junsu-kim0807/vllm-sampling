@@ -206,6 +206,22 @@ class ECConnectorOutput:
     finished_recving: set[str] | None = None
 
 
+@dataclass
+class SpecDecodeCostBreakdown:
+    """Per-batch cost breakdown for hierarchical speculative verification.
+
+    Batch-level times are added once to SpecDecodingStats; per-request
+    num_partial_accepted_tokens are accumulated per request.
+    """
+
+    draft_time_sec: float = 0.0
+    compression_time_sec: float = 0.0
+    partial_verification_time_sec: float = 0.0
+    full_verification_time_sec: float = 0.0
+    # Per-request partial acceptance length (indexed by req_id_to_index).
+    num_partial_accepted_per_req: list[int] = field(default_factory=list)
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -246,6 +262,9 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # Hierarchical speculative verification: timing and partial acceptance per batch.
+    spec_decode_cost_breakdown: SpecDecodeCostBreakdown | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

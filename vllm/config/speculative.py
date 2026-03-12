@@ -5,6 +5,9 @@ import ast
 import copy
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
+# Compression method for hierarchical verification (partial KV cache).
+HierarchicalVerificationCompressMethod = Literal["random"]
+
 from pydantic import Field, SkipValidation, model_validator
 from typing_extensions import Self
 
@@ -169,6 +172,18 @@ class SpeculativeConfig:
     """Load config for the draft model. If not specified, will use the load
     config from the target model."""
 
+    # Hierarchical verification: partial (compressed) KV verification first,
+    # then full KV verification for partially verified tokens.
+    hierarchical_verification: bool = False
+    """If True, use partial (compressed) KV cache for initial verification
+    steps, then full KV cache to verify partially accepted tokens."""
+    compress_method: HierarchicalVerificationCompressMethod = "random"
+    """Method to compress KV cache for partial verification. Currently
+    only \"random\" is supported (random layer/token selection)."""
+    compression_ratio: float = Field(default=0.5, gt=0, le=1)
+    """Ratio of KV cache to use in partial verification (e.g. 0.5 = 50% of
+    layers or entries). Must be in (0, 1]."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -186,6 +201,11 @@ class SpeculativeConfig:
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = self.method in ("eagle3", "extract_hidden_states")
         factors.append(uses_aux_hidden_states)
+        # Hierarchical verification changes the verification path (partial then full).
+        factors.append(self.hierarchical_verification)
+        if self.hierarchical_verification:
+            factors.append(self.compress_method)
+            factors.append(self.compression_ratio)
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:

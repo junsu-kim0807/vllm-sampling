@@ -149,6 +149,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     PoolerOutput,
     SamplerOutput,
+    SpecDecodeCostBreakdown,
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
@@ -160,6 +161,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm.v1.spec_decode.kv_compression import build_compression_mask
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -371,6 +373,9 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    # Hierarchical verification: timing from execute_model (one forward for now).
+    partial_verification_time_sec: float = 0.0
+    full_verification_time_sec: float = 0.0
 
 
 class GPUModelRunner(
@@ -3619,6 +3624,8 @@ class GPUModelRunner(
         # When spec decode is enabled, delay clearing connector metadata
         # until after draft model runs in sample_tokens.
         clear_kv_metadata = self.speculative_config is None
+        partial_verification_time_sec = 0.0
+        full_verification_time_sec = 0.0
         with (
             set_forward_context(
                 attn_metadata,
@@ -3636,6 +3643,7 @@ class GPUModelRunner(
                 scheduler_output, clear_metadata=clear_kv_metadata
             ) as kv_connector_output,
         ):
+            t_forward_start = time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -3643,6 +3651,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            full_verification_time_sec = time.perf_counter() - t_forward_start
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3714,6 +3723,8 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            partial_verification_time_sec,
+            full_verification_time_sec,
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -3752,9 +3763,31 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            partial_verification_time_sec,
+            full_verification_time_sec,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        # Hierarchical verification: optional compression and timing (for cost breakdown).
+        hierarchical_draft_time_sec = 0.0
+        hierarchical_compression_time_sec = 0.0
+        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        spec_config = self.speculative_config
+        if (
+            use_spec_decode
+            and spec_config is not None
+            and getattr(spec_config, "hierarchical_verification", False)
+        ):
+            num_positions = hidden_states.shape[0]
+            t_comp = time.perf_counter()
+            build_compression_mask(
+                num_positions,
+                spec_config.compression_ratio,
+                spec_config.compress_method,
+                self.device,
+            )
+            hierarchical_compression_time_sec = time.perf_counter() - t_comp
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -3819,7 +3852,12 @@ class GPUModelRunner(
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
-                    propose_draft_token_ids(sampled_token_ids)
+                    if spec_config.hierarchical_verification:
+                        t0 = time.perf_counter()
+                        propose_draft_token_ids(sampled_token_ids)
+                        hierarchical_draft_time_sec = time.perf_counter() - t0
+                    else:
+                        propose_draft_token_ids(sampled_token_ids)
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
                     next_token_ids, valid_sampled_tokens_count = (
@@ -3864,7 +3902,12 @@ class GPUModelRunner(
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
-            propose_draft_token_ids(valid_sampled_token_ids)
+            if spec_config is not None and spec_config.hierarchical_verification:
+                t0 = time.perf_counter()
+                propose_draft_token_ids(valid_sampled_token_ids)
+                hierarchical_draft_time_sec = time.perf_counter() - t0
+            else:
+                propose_draft_token_ids(valid_sampled_token_ids)
 
         # Clear KV connector metadata after draft model runs (if spec decode).
         # This was deferred from target model forward to allow draft model
@@ -3887,6 +3930,23 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            # Hierarchical verification cost breakdown (partial verification
+            # with compressed KV not yet implemented; num_partial_accepted = 0).
+            spec_decode_cost_breakdown = None
+            if (
+                use_spec_decode
+                and spec_config is not None
+                and spec_config.hierarchical_verification
+            ):
+                num_reqs = len(req_ids_output_copy)
+                spec_decode_cost_breakdown = SpecDecodeCostBreakdown(
+                    draft_time_sec=hierarchical_draft_time_sec,
+                    compression_time_sec=hierarchical_compression_time_sec,
+                    partial_verification_time_sec=partial_verification_time_sec,
+                    full_verification_time_sec=full_verification_time_sec,
+                    num_partial_accepted_per_req=[0] * num_reqs,
+                )
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -3899,6 +3959,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                spec_decode_cost_breakdown=spec_decode_cost_breakdown,
             )
 
         if not self.use_async_scheduling:
