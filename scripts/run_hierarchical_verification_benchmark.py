@@ -175,6 +175,17 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Top-k for sampling (-1 for no top-k).",
     )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.8,
+        help=(
+            "Target fraction of GPU memory to use for KV cache, "
+            "passed through to LLM(gpu_memory_utilization=...). "
+            "Use a smaller value if you see 'Free memory ... is less than "
+            "desired GPU memory utilization' errors."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -320,6 +331,7 @@ def main() -> None:
             seed=0,
             # EngineArgs expects speculative_config as a dict-like structure.
             speculative_config=spec_cfg,
+            gpu_memory_utilization=args.gpu_memory_utilization,
             disable_log_stats=False,
         )
         print("=" * 80)
