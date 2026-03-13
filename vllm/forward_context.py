@@ -321,6 +321,8 @@ def set_forward_context(
     ubatch_slices: UBatchSlices | None = None,
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
+    compressed_kv_caches: list[torch.Tensor] | None = None,
+    compressed_kv_metadata: Any = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -370,6 +372,10 @@ def set_forward_context(
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
     )
+    if compressed_kv_caches is not None:
+        additional_kwargs = {**additional_kwargs, "compressed_kv_caches": compressed_kv_caches}
+    if compressed_kv_metadata is not None:
+        additional_kwargs = {**additional_kwargs, "compressed_kv_metadata": compressed_kv_metadata}
 
     forward_context = create_forward_context(
         attn_metadata,

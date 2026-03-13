@@ -59,6 +59,7 @@ from vllm.model_executor.layers.rotary_embedding import (
     XDRotaryEmbedding,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -137,6 +138,12 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+)
+from vllm.v1.spec_decode.kv_compression import (
+    CompressedKVMetadata,
+    build_compressed_kv_caches,
+    build_compressed_kv_metadata,
+    get_compression_indices_batch,
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -481,6 +488,8 @@ class GPUModelRunner(
         self.kv_caches: list[torch.Tensor] = []
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
+        # For hierarchical verification: step count (incremented on each spec-decode forward).
+        self._hierarchical_verification_step: int = 0
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
@@ -1779,6 +1788,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        compressed_kv_metadata: CompressedKVMetadata | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1852,6 +1862,23 @@ class GPUModelRunner(
             slot_mapping=slot_mapping_gid_0,
             causal=True,
         )
+        if compressed_kv_metadata is not None:
+            seq_lens_comp = torch.zeros(
+                num_reqs_padded, dtype=torch.int32, device=self.device
+            )
+            seq_lens_comp[:num_reqs] = torch.as_tensor(
+                compressed_kv_metadata.seq_lens, dtype=torch.int32, device=self.device
+            )
+            cm_base.seq_lens = seq_lens_comp
+            n_comp_blocks = compressed_kv_metadata.block_table.shape[1]
+            block_table_comp = torch.full(
+                (num_reqs_padded, n_comp_blocks), -1, dtype=torch.int32, device=self.device
+            )
+            block_table_comp[:num_reqs] = torch.as_tensor(
+                compressed_kv_metadata.block_table, dtype=torch.int32, device=self.device
+            )
+            cm_base.block_table_tensor = block_table_comp
+            cm_base.max_seq_len = int(compressed_kv_metadata.num_compressed_slots)
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -3334,6 +3361,40 @@ class GPUModelRunner(
                 pyt_hooks.register_hooks(self.model, self.model.__class__.__name__)
                 self.layerwise_nvtx_hooks_registered = True
 
+    def _get_ordered_kv_layer_names(self) -> list[str]:
+        """Return KV layer names in the same order as self.kv_caches (for swap)."""
+        num_attn_module = 1
+        index2name: dict[int, list[str]] = defaultdict(list)
+        for kv_cache_group in self.kv_cache_config.kv_cache_groups:
+            for layer_name in kv_cache_group.layer_names:
+                idx = extract_layer_index(layer_name, num_attn_module)
+                index2name[idx].append(layer_name)
+        return [
+            name
+            for idx in sorted(index2name)
+            for name in index2name[idx]
+        ]
+
+    def _swap_kv_caches_for_partial(
+        self, compressed_caches: list[torch.Tensor]
+    ) -> None:
+        """Temporarily bind compressed KV caches to attention layers (for partial verification)."""
+        names = self._get_ordered_kv_layer_names()
+        assert len(names) == len(compressed_caches), (
+            f"Layer count {len(names)} != compressed caches {len(compressed_caches)}"
+        )
+        for i, name in enumerate(names):
+            mod = self.model.get_submodule(name)
+            mod.kv_cache = [compressed_caches[i]]
+
+    def _restore_kv_caches(self) -> None:
+        """Restore full KV caches on attention layers after partial verification."""
+        names = self._get_ordered_kv_layer_names()
+        assert len(names) == len(self.kv_caches)
+        for i, name in enumerate(names):
+            mod = self.model.get_submodule(name)
+            mod.kv_cache = [self.kv_caches[i]]
+
     def _get_slot_mappings(
         self,
         num_tokens_padded: int,
@@ -3577,6 +3638,63 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
+            # Hierarchical verification: partial step uses compressed KV (same random
+            # token indices for all layers).
+            spec_config = self.speculative_config
+            is_partial_step = False
+            compressed_kv_caches: list[torch.Tensor] | None = None
+            compressed_kv_metadata: CompressedKVMetadata | None = None
+            if (
+                use_spec_decode
+                and spec_config is not None
+                and getattr(spec_config, "hierarchical_verification", False)
+                and len(self.kv_caches) > 0
+            ):
+                interval = getattr(
+                    spec_config, "full_verification_interval", 1
+                )
+                is_partial_step = (
+                    self._hierarchical_verification_step % interval != 0
+                )
+                if is_partial_step:
+                    seed = getattr(
+                        self.vllm_config.model_config,
+                        "seed",
+                        0,
+                    )
+                    compression_indices = get_compression_indices_batch(
+                        num_tokens_unpadded,
+                        spec_config.compression_ratio,
+                        spec_config.compress_method,
+                        self.device,
+                        seed=seed,
+                    )
+                    if compression_indices is not None and compression_indices.shape[0] > 0:
+                        block_size = (
+                            self.kv_cache_config.kv_cache_groups[0]
+                            .kv_cache_spec.block_size
+                        )
+                        slot_mapping_g0 = slot_mappings_by_group[0][
+                            :num_tokens_unpadded
+                        ]
+                        compressed_kv_caches = build_compressed_kv_caches(
+                            self.kv_caches,
+                            slot_mapping_g0,
+                            compression_indices,
+                            block_size,
+                        )
+                        query_start_loc_np = (
+                            self.query_start_loc.cpu().numpy()[: num_reqs + 1]
+                        )
+                        compressed_kv_metadata = build_compressed_kv_metadata(
+                            compression_indices,
+                            query_start_loc_np,
+                            num_reqs,
+                            block_size,
+                        )
+                    else:
+                        is_partial_step = False
+
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -3590,6 +3708,7 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    compressed_kv_metadata=compressed_kv_metadata,
                 )
             )
 
@@ -3637,21 +3756,36 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                compressed_kv_caches=compressed_kv_caches,
+                compressed_kv_metadata=compressed_kv_metadata,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output, clear_metadata=clear_kv_metadata
             ) as kv_connector_output,
         ):
-            t_forward_start = time.perf_counter()
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
-            full_verification_time_sec = time.perf_counter() - t_forward_start
+            if compressed_kv_caches is not None:
+                self._swap_kv_caches_for_partial(compressed_kv_caches)
+            try:
+                t_forward_start = time.perf_counter()
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+                full_verification_time_sec = time.perf_counter() - t_forward_start
+            finally:
+                if compressed_kv_caches is not None:
+                    self._restore_kv_caches()
+
+            if (
+                use_spec_decode
+                and spec_config is not None
+                and getattr(spec_config, "hierarchical_verification", False)
+            ):
+                self._hierarchical_verification_step += 1
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

@@ -183,6 +183,9 @@ class SpeculativeConfig:
     compression_ratio: float = Field(default=0.5, gt=0, le=1)
     """Ratio of KV cache to use in partial verification (e.g. 0.5 = 50% of
     layers or entries). Must be in (0, 1]."""
+    full_verification_interval: int = Field(default=1, ge=1)
+    """When hierarchical_verification is True, use full KV cache every this
+    many steps; otherwise use partial (compressed) KV cache. Must be >= 1."""
 
     def compute_hash(self) -> str:
         """
@@ -206,6 +209,7 @@ class SpeculativeConfig:
         if self.hierarchical_verification:
             factors.append(self.compress_method)
             factors.append(self.compression_ratio)
+            factors.append(self.full_verification_interval)
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
