@@ -3688,9 +3688,7 @@ class GPUModelRunner(
                                 compression_indices,
                                 block_size,
                             )
-                            query_start_loc_np = (
-                                self.query_start_loc.cpu().numpy()[: num_reqs + 1]
-                            )
+                            query_start_loc_np = self.query_start_loc.np[: num_reqs + 1]
                             compressed_kv_metadata = build_compressed_kv_metadata(
                                 compression_indices,
                                 query_start_loc_np,

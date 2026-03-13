@@ -87,9 +87,9 @@ def parse_args() -> argparse.Namespace:
         "--speculative-method",
         type=str,
         default="ngram",
-        choices=["ngram", "draft_model"],
+        choices=["ngram", "draft_model", "eagle3"],
         help="Speculative decoding method. "
-        "For draft_model, you must also provide --draft-model.",
+        "For draft_model or eagle3, you must also provide --draft-model.",
     )
     parser.add_argument(
         "--draft-model",
@@ -187,30 +187,58 @@ def build_speculative_config(
     expects a mapping (e.g. the result of parsing CLI / JSON), not a SpeculativeConfig
     instance. The engine will construct the SpeculativeConfig model internally.
     """
+    # Map high-level --speculative-method flag to SpeculativeConfig fields.
     if args.speculative_method == "ngram":
         method = "ngram"
         model_field = "[ngram]"
-        draft_load_config = None
-    else:
+        base_cfg: dict[str, Any] = {
+            "model": model_field,
+            "method": method,
+            "num_speculative_tokens": args.num_speculative_tokens,
+        }
+    elif args.speculative_method == "draft_model":
         method = "draft_model"
         if not args.draft_model:
             raise ValueError(
                 "speculative-method=draft_model requires --draft-model to be set."
             )
-        model_field = args.draft_model
-        draft_load_config = None
+        base_cfg = {
+            "model": args.draft_model,
+            "method": method,
+            "num_speculative_tokens": args.num_speculative_tokens,
+        }
+    elif args.speculative_method == "eagle3":
+        # For EAGLE3, the user must provide a speculator model via --draft-model.
+        # See docs/features/speculative_decoding/eagle.md for examples.
+        method = "eagle3"
+        if not args.draft_model:
+            raise ValueError(
+                "speculative-method=eagle3 requires --draft-model to be set "
+                "to the Eagle3 speculator model."
+            )
+        base_cfg = {
+            "model": args.draft_model,
+            "method": method,
+            "num_speculative_tokens": args.num_speculative_tokens,
+            # Common Eagle3 setups also specify draft_tensor_parallel_size,
+            # but we let the engine infer it from tensor_parallel_size here.
+        }
+    else:
+        raise ValueError(f"Unknown speculative-method: {args.speculative_method!r}")
 
-    return {
-        "model": model_field,
-        "method": method,
-        "num_speculative_tokens": args.num_speculative_tokens,
+    # If compression_ratio <= 0, treat this as a baseline config without
+    # hierarchical verification / compression (pure speculative decoding).
+    if compression_ratio <= 0.0:
+        return base_cfg
+
+    # Otherwise, enable hierarchical verification with the given compression_ratio.
+    hv_cfg = {
         "hierarchical_verification": True,
         "compress_method": "random",
         "compression_ratio": compression_ratio,
         "full_verification_interval": args.full_verification_interval,
-        # We currently don't expose draft_load_config via CLI in this script;
-        # let the engine fill it from the main model config if needed.
     }
+    return {**base_cfg, **hv_cfg}
 
 
 def run_once_for_ratio(
