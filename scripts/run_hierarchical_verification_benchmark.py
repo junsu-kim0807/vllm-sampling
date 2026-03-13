@@ -43,8 +43,6 @@ Example:
 import argparse
 import time
 from typing import Any, List
-
-from vllm.config import SpeculativeConfig
 from vllm.entrypoints.llm import LLM
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.rejection_sampler import RejectionSampler
@@ -183,7 +181,12 @@ def parse_args() -> argparse.Namespace:
 def build_speculative_config(
     args: argparse.Namespace, compression_ratio: float
 ) -> dict[str, Any]:
-    """Create a dict form of SpeculativeConfig for a given compression_ratio."""
+    """Create a dict-like speculative_config for a given compression_ratio.
+
+    We intentionally return a plain dict here because EngineArgs.create_speculative_config
+    expects a mapping (e.g. the result of parsing CLI / JSON), not a SpeculativeConfig
+    instance. The engine will construct the SpeculativeConfig model internally.
+    """
     if args.speculative_method == "ngram":
         method = "ngram"
         model_field = "[ngram]"
@@ -197,20 +200,17 @@ def build_speculative_config(
         model_field = args.draft_model
         draft_load_config = None
 
-    spec_cfg = SpeculativeConfig(
-        model=model_field,
-        method=method,
-        num_speculative_tokens=args.num_speculative_tokens,
-        hierarchical_verification=True,
-        compress_method="random",
-        compression_ratio=compression_ratio,
-        full_verification_interval=args.full_verification_interval,
-        draft_load_config=draft_load_config,
-    )
-    # vLLM currently uses Pydantic v1-style models; serialize to dict for EngineArgs.
-    if hasattr(spec_cfg, "dict"):
-        return spec_cfg.dict()
-    return dict(spec_cfg)
+    return {
+        "model": model_field,
+        "method": method,
+        "num_speculative_tokens": args.num_speculative_tokens,
+        "hierarchical_verification": True,
+        "compress_method": "random",
+        "compression_ratio": compression_ratio,
+        "full_verification_interval": args.full_verification_interval,
+        # We currently don't expose draft_load_config via CLI in this script;
+        # let the engine fill it from the main model config if needed.
+    }
 
 
 def run_once_for_ratio(
