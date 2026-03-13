@@ -42,7 +42,7 @@ Example:
 
 import argparse
 import time
-from typing import List
+from typing import Any, List
 
 from vllm.config import SpeculativeConfig
 from vllm.entrypoints.llm import LLM
@@ -182,8 +182,8 @@ def parse_args() -> argparse.Namespace:
 
 def build_speculative_config(
     args: argparse.Namespace, compression_ratio: float
-) -> SpeculativeConfig:
-    """Create SpeculativeConfig for a given compression_ratio."""
+) -> dict[str, Any]:
+    """Create a dict form of SpeculativeConfig for a given compression_ratio."""
     if args.speculative_method == "ngram":
         method = "ngram"
         model_field = "[ngram]"
@@ -197,7 +197,7 @@ def build_speculative_config(
         model_field = args.draft_model
         draft_load_config = None
 
-    return SpeculativeConfig(
+    spec_cfg = SpeculativeConfig(
         model=model_field,
         method=method,
         num_speculative_tokens=args.num_speculative_tokens,
@@ -207,6 +207,10 @@ def build_speculative_config(
         full_verification_interval=args.full_verification_interval,
         draft_load_config=draft_load_config,
     )
+    # vLLM currently uses Pydantic v1-style models; serialize to dict for EngineArgs.
+    if hasattr(spec_cfg, "dict"):
+        return spec_cfg.dict()
+    return dict(spec_cfg)
 
 
 def run_once_for_ratio(
@@ -284,6 +288,7 @@ def main() -> None:
             tensor_parallel_size=args.tensor_parallel_size,
             dtype=args.dtype,  # type: ignore[arg-type]
             seed=0,
+            # EngineArgs expects speculative_config as a dict-like structure.
             speculative_config=spec_cfg,
             disable_log_stats=False,
         )
