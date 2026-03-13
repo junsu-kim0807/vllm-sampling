@@ -381,6 +381,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    compression_time_sec: float = 0.0
     # Hierarchical verification: timing from execute_model (one forward for now).
     partial_verification_time_sec: float = 0.0
     full_verification_time_sec: float = 0.0
@@ -3682,6 +3683,7 @@ class GPUModelRunner(
                             slot_mapping_g0 = slot_mappings_by_group[0][
                                 :num_tokens_unpadded
                             ]
+                            t_comp = time.perf_counter()
                             compressed_kv_caches = build_compressed_kv_caches(
                                 self.kv_caches,
                                 slot_mapping_g0,
@@ -3695,6 +3697,7 @@ class GPUModelRunner(
                                 num_reqs,
                                 block_size,
                             )
+                            compression_time_sec = time.perf_counter() - t_comp
                         else:
                             is_partial_step = False
                     elif (
@@ -3706,6 +3709,7 @@ class GPUModelRunner(
                         blk = self.input_batch.block_table[0]
                         block_table_np = blk.block_table.np[:num_reqs, :]
                         num_blocks_per_row = blk.num_blocks_per_row[:num_reqs]
+                        t_comp = time.perf_counter()
                         compressed_block_table_np, compressed_blocks_per_row = (
                             build_block_level_compression_view(
                                 block_table_np,
@@ -3746,6 +3750,7 @@ class GPUModelRunner(
                             block_size=block_size,
                             num_compressed_slots=int(seq_lens_comp.sum().item()),
                         )
+                        compression_time_sec = time.perf_counter() - t_comp
                     else:
                         # Unknown compress_method for hierarchical verification.
                         is_partial_step = False
@@ -3798,6 +3803,7 @@ class GPUModelRunner(
         # When spec decode is enabled, delay clearing connector metadata
         # until after draft model runs in sample_tokens.
         clear_kv_metadata = self.speculative_config is None
+        compression_time_sec = 0.0
         partial_verification_time_sec = 0.0
         full_verification_time_sec = 0.0
         with (
@@ -3923,6 +3929,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            compression_time_sec,
             partial_verification_time_sec,
             full_verification_time_sec,
         )
@@ -3963,6 +3970,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            compression_time_sec,
             partial_verification_time_sec,
             full_verification_time_sec,
         ) = self.execute_model_state
@@ -3971,21 +3979,25 @@ class GPUModelRunner(
 
         # Hierarchical verification: optional compression and timing (for cost breakdown).
         hierarchical_draft_time_sec = 0.0
-        hierarchical_compression_time_sec = 0.0
+        hierarchical_compression_time_sec = compression_time_sec
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         spec_config = self.speculative_config
         if (
             use_spec_decode
             and spec_config is not None
             and getattr(spec_config, "hierarchical_verification", False)
+            and getattr(spec_config, "compress_method", "random") == "random"
         ):
+            # For token-level compression ("random"), we keep a lightweight
+            # timing of mask construction on CPU only. The actual KV compaction
+            # happens in execute_model; no GPU work is needed here.
             num_positions = hidden_states.shape[0]
             t_comp = time.perf_counter()
-            build_compression_mask(
+            _ = build_compression_mask(
                 num_positions,
                 spec_config.compression_ratio,
                 spec_config.compress_method,
-                self.device,
+                torch.device("cpu"),
             )
             hierarchical_compression_time_sec = time.perf_counter() - t_comp
 

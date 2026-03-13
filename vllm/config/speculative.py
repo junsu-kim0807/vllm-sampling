@@ -181,11 +181,11 @@ class SpeculativeConfig:
     """If True, use partial (compressed) KV cache for initial verification
     steps, then full KV cache to verify partially accepted tokens."""
     compress_method: HierarchicalVerificationCompressMethod = "random"
-    """Method to compress KV cache for partial verification. Currently
-    only \"random\" is supported (random layer/token selection)."""
-    compression_ratio: float = Field(default=0.5, gt=0, le=1)
-    """Ratio of KV cache to use in partial verification (e.g. 0.5 = 50% of
-    layers or entries). Must be in (0, 1]."""
+    """Method to compress KV cache for partial verification."""
+    compression_ratio: float = Field(default=0.5, ge=0, le=1)
+    """DROP ratio for KV cache in partial verification (e.g. 0.5 = drop 50% of
+    tokens/blocks, keep the remaining 50%). 0 disables compression; 1 drops as
+    much as possible while keeping at least one position."""
     full_verification_interval: int = Field(default=1, ge=1)
     """When hierarchical_verification is True, use full KV cache every this
     many steps; otherwise use partial (compressed) KV cache. Must be >= 1."""

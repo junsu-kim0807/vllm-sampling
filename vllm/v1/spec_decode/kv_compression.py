@@ -19,7 +19,7 @@ from vllm.utils.math_utils import cdiv
 
 def random_compression_mask(
     num_positions: int,
-    compression_ratio: float,
+    compression_keep_ratio: float,
     device: torch.device,
     dtype: torch.dtype = torch.bool,
     seed: int | None = None,
@@ -27,11 +27,11 @@ def random_compression_mask(
     """Build a boolean mask that keeps a random subset of KV positions.
 
     mask[i] is True if position i is kept (used in partial verification).
-    Exactly floor(num_positions * compression_ratio) positions are True.
+    Exactly floor(num_positions * compression_keep_ratio) positions are True.
 
     Args:
         num_positions: Total number of KV positions (e.g. sequence length).
-        compression_ratio: Fraction of positions to keep, in (0, 1].
+        compression_keep_ratio: Fraction of positions to keep, in (0, 1].
         device: Device for the output tensor.
         dtype: Output dtype (bool or uint8 for compatibility).
         seed: Optional RNG seed for reproducibility.
@@ -42,7 +42,7 @@ def random_compression_mask(
     """
     if num_positions <= 0:
         return torch.zeros(num_positions, dtype=dtype, device=device)
-    n_keep = max(1, int(num_positions * compression_ratio))
+    n_keep = max(1, int(num_positions * compression_keep_ratio))
     n_keep = min(n_keep, num_positions)
     rng = random.Random(seed)
     indices = set(rng.sample(range(num_positions), n_keep))
@@ -56,7 +56,7 @@ def random_compression_mask(
 
 def random_compression_indices(
     num_positions: int,
-    compression_ratio: float,
+    compression_keep_ratio: float,
     device: torch.device,
     seed: int | None = None,
 ) -> torch.Tensor:
@@ -64,7 +64,7 @@ def random_compression_indices(
 
     Args:
         num_positions: Total number of KV positions.
-        compression_ratio: Fraction to keep in (0, 1].
+        compression_keep_ratio: Fraction to keep in (0, 1].
         device: Device for the output tensor.
         seed: Optional RNG seed.
 
@@ -73,7 +73,7 @@ def random_compression_indices(
     """
     if num_positions <= 0:
         return torch.zeros(0, dtype=torch.int64, device=device)
-    n_keep = max(1, int(num_positions * compression_ratio))
+    n_keep = max(1, int(num_positions * compression_keep_ratio))
     n_keep = min(n_keep, num_positions)
     rng = random.Random(seed)
     indices = rng.sample(range(num_positions), n_keep)
@@ -89,13 +89,18 @@ def build_compression_mask(
 ) -> torch.Tensor | None:
     """Build a compression mask for partial verification.
 
-    Returns None if compression_ratio >= 1 (no compression).
+    Returns None if compression_ratio <= 0 (no compression).
     """
-    if compression_ratio >= 1.0 or num_positions <= 0:
+    # compression_ratio is interpreted as DROP ratio. 0 means keep all, 1 means
+    # drop as much as possible (subject to keeping at least 1 position).
+    if compression_ratio <= 0.0 or num_positions <= 0:
         return None
+    compression_keep_ratio = 1.0 - compression_ratio
+    if compression_keep_ratio <= 0.0:
+        compression_keep_ratio = 1.0 / max(1, num_positions)
     if compress_method == "random":
         return random_compression_mask(
-            num_positions, compression_ratio, device, seed=seed
+            num_positions, compression_keep_ratio, device, seed=seed
         )
     raise ValueError(f"Unknown compress_method: {compress_method!r}")
 
@@ -111,21 +116,25 @@ def get_compression_indices_batch(
 
     Args:
         num_tokens: Total number of tokens in the batch.
-        compression_ratio: Fraction to keep in (0, 1].
+        compression_ratio: DROP ratio in [0, 1]. 0 means keep all tokens,
+        1 means drop as many as possible (subject to keeping at least 1).
         compress_method: Compression method (e.g. "random").
         device: Device for the output tensor.
         seed: Optional RNG seed for reproducibility.
 
     Returns:
         Long tensor of shape (n_keep,) with batch indices in [0, num_tokens),
-        sorted in ascending order. None if no compression (ratio >= 1 or
+        sorted in ascending order. None if no compression (ratio <= 0 or
         num_tokens <= 0).
     """
-    if compression_ratio >= 1.0 or num_tokens <= 0:
+    if compression_ratio <= 0.0 or num_tokens <= 0:
         return None
+    compression_keep_ratio = 1.0 - compression_ratio
+    if compression_keep_ratio <= 0.0:
+        compression_keep_ratio = 1.0 / max(1, num_tokens)
     if compress_method == "random":
         return random_compression_indices(
-            num_tokens, compression_ratio, device, seed=seed
+            num_tokens, compression_keep_ratio, device, seed=seed
         )
     raise ValueError(f"Unknown compress_method: {compress_method!r}")
 
@@ -330,12 +339,14 @@ def build_block_level_compression_view(
     compressed_blocks_per_row: list[int] = []
     max_kept = 0
 
+    # Interpret compression_ratio as DROP ratio in [0, 1].
+    compression_keep_ratio = 1.0 - compression_ratio
     for r in range(num_reqs):
         nb = int(num_blocks_per_row[r])
-        if nb == 0 or compression_ratio >= 1.0:
+        if nb == 0 or compression_keep_ratio <= 0.0:
             kept: list[int] = block_table_np[r, :nb].tolist()
         else:
-            kept_ids = random_block_indices_for_req(nb, compression_ratio, rng)
+            kept_ids = random_block_indices_for_req(nb, compression_keep_ratio, rng)
             kept = block_table_np[r, kept_ids].tolist()
         compressed.append(kept)
         compressed_blocks_per_row.append(len(kept))

@@ -262,7 +262,9 @@ def run_once_for_ratio(
     t0 = time.perf_counter()
     outputs = llm.generate(prompts, sampling_params)
     elapsed = time.perf_counter() - t0
-
+    
+    llm.llm_engine.do_log_stats()
+    
     total_generated_tokens = 0
     for out in outputs:
         # Sum over all output sequences for robustness; usually 1.
@@ -324,6 +326,7 @@ def main() -> None:
         print(f"### compression_ratio = {r:.4f}")
         for bs in batch_sizes:
             run_once_for_ratio(args, llm, r, bs)
+            
 
 
 if __name__ == "__main__":
