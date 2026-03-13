@@ -141,6 +141,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.spec_decode.kv_compression import (
     CompressedKVMetadata,
+    build_block_level_compression_view,
     build_compressed_kv_caches,
     build_compressed_kv_metadata,
     get_compression_indices_batch,
@@ -3638,8 +3639,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            # Hierarchical verification: partial step uses compressed KV (same random
-            # token indices for all layers).
+            # Hierarchical verification: partial step uses compressed KV.
             spec_config = self.speculative_config
             is_partial_step = False
             compressed_kv_caches: list[torch.Tensor] | None = None
@@ -3650,9 +3650,7 @@ class GPUModelRunner(
                 and getattr(spec_config, "hierarchical_verification", False)
                 and len(self.kv_caches) > 0
             ):
-                interval = getattr(
-                    spec_config, "full_verification_interval", 1
-                )
+                interval = getattr(spec_config, "full_verification_interval", 1)
                 is_partial_step = (
                     self._hierarchical_verification_step % interval != 0
                 )
@@ -3662,37 +3660,96 @@ class GPUModelRunner(
                         "seed",
                         0,
                     )
-                    compression_indices = get_compression_indices_batch(
-                        num_tokens_unpadded,
-                        spec_config.compression_ratio,
-                        spec_config.compress_method,
-                        self.device,
-                        seed=seed,
-                    )
-                    if compression_indices is not None and compression_indices.shape[0] > 0:
+                    # Two compression modes:
+                    # - "random": token-level compaction (full -> compressed buffer).
+                    # - "block_random": block-level subsampling (no KV copy).
+                    if getattr(spec_config, "compress_method", "random") == "random":
+                        compression_indices = get_compression_indices_batch(
+                            num_tokens_unpadded,
+                            spec_config.compression_ratio,
+                            spec_config.compress_method,
+                            self.device,
+                            seed=seed,
+                        )
+                        if (
+                            compression_indices is not None
+                            and compression_indices.shape[0] > 0
+                        ):
+                            block_size = (
+                                self.kv_cache_config.kv_cache_groups[0]
+                                .kv_cache_spec.block_size
+                            )
+                            slot_mapping_g0 = slot_mappings_by_group[0][
+                                :num_tokens_unpadded
+                            ]
+                            compressed_kv_caches = build_compressed_kv_caches(
+                                self.kv_caches,
+                                slot_mapping_g0,
+                                compression_indices,
+                                block_size,
+                            )
+                            query_start_loc_np = (
+                                self.query_start_loc.cpu().numpy()[: num_reqs + 1]
+                            )
+                            compressed_kv_metadata = build_compressed_kv_metadata(
+                                compression_indices,
+                                query_start_loc_np,
+                                num_reqs,
+                                block_size,
+                            )
+                        else:
+                            is_partial_step = False
+                    elif (
+                        getattr(spec_config, "compress_method", "random")
+                        == "block_random"
+                    ):
+                        # Block-level compression: subsample blocks in block_table
+                        # without touching the underlying KV cache tensors.
+                        blk = self.input_batch.block_table[0]
+                        block_table_np = blk.block_table.np[:num_reqs, :]
+                        num_blocks_per_row = blk.num_blocks_per_row[:num_reqs]
+                        compressed_block_table_np, compressed_blocks_per_row = (
+                            build_block_level_compression_view(
+                                block_table_np,
+                                num_blocks_per_row,
+                                spec_config.compression_ratio,
+                                seed=seed,
+                            )
+                        )
+                        # Build compressed seq_lens (tokens) from blocks.
                         block_size = (
                             self.kv_cache_config.kv_cache_groups[0]
                             .kv_cache_spec.block_size
                         )
-                        slot_mapping_g0 = slot_mappings_by_group[0][
-                            :num_tokens_unpadded
-                        ]
-                        compressed_kv_caches = build_compressed_kv_caches(
-                            self.kv_caches,
-                            slot_mapping_g0,
-                            compression_indices,
-                            block_size,
+                        seq_lens_comp = torch.as_tensor(
+                            compressed_blocks_per_row * block_size,
+                            dtype=torch.int32,
+                            device=self.device,
                         )
-                        query_start_loc_np = (
-                            self.query_start_loc.cpu().numpy()[: num_reqs + 1]
+                        # Prepare a block_table tensor padded to num_reqs_padded.
+                        max_blocks_kept = compressed_block_table_np.shape[1]
+                        compressed_block_table = torch.full(
+                            (num_reqs_padded, max_blocks_kept),
+                            -1,
+                            dtype=torch.int32,
+                            device=self.device,
                         )
-                        compressed_kv_metadata = build_compressed_kv_metadata(
-                            compression_indices,
-                            query_start_loc_np,
-                            num_reqs,
-                            block_size,
+                        compressed_block_table[:num_reqs] = torch.as_tensor(
+                            compressed_block_table_np,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        # For block-level compression, we don't build a separate
+                        # compressed KV buffer, but we pass the overridden
+                        # block_table/seq_lens via CompressedKVMetadata-like object.
+                        compressed_kv_metadata = CompressedKVMetadata(
+                            seq_lens=seq_lens_comp.cpu().numpy(),
+                            block_table=compressed_block_table_np,
+                            block_size=block_size,
+                            num_compressed_slots=int(seq_lens_comp.sum().item()),
                         )
                     else:
+                        # Unknown compress_method for hierarchical verification.
                         is_partial_step = False
 
             attn_metadata, spec_decode_common_attn_metadata = (
@@ -3775,7 +3832,18 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
-                full_verification_time_sec = time.perf_counter() - t_forward_start
+                elapsed_forward = time.perf_counter() - t_forward_start
+                # Attribute forward time either to partial or full verification,
+                # depending on whether this step is using compressed KV.
+                if (
+                    use_spec_decode
+                    and spec_config is not None
+                    and getattr(spec_config, "hierarchical_verification", False)
+                    and is_partial_step
+                ):
+                    partial_verification_time_sec = elapsed_forward
+                else:
+                    full_verification_time_sec = elapsed_forward
             finally:
                 if compressed_kv_caches is not None:
                     self._restore_kv_caches()

@@ -289,3 +289,68 @@ def build_compressed_kv_metadata(
         block_size=block_size,
         num_compressed_slots=n_keep,
     )
+
+
+# ---------------- Block-level compression (no KV memory copy) ----------------
+
+def random_block_indices_for_req(
+    num_blocks: int,
+    compression_ratio: float,
+    rng: random.Random,
+) -> list[int]:
+    """Select a random subset of block indices for a single request."""
+    if num_blocks <= 0:
+        return []
+    n_keep = max(1, int(num_blocks * compression_ratio))
+    n_keep = min(n_keep, num_blocks)
+    return sorted(rng.sample(range(num_blocks), n_keep))
+
+
+def build_block_level_compression_view(
+    block_table_np: np.ndarray,
+    num_blocks_per_row: np.ndarray,
+    compression_ratio: float,
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a block-level compressed view (no KV copy).
+
+    Args:
+        block_table_np: [num_reqs, max_num_blocks] block ids.
+        num_blocks_per_row: [num_reqs] number of valid blocks per request.
+        compression_ratio: fraction of blocks to keep per request.
+        seed: RNG seed.
+
+    Returns:
+        compressed_block_table: [num_reqs, max_kept_blocks] with -1 padding.
+        compressed_blocks_per_row: [num_reqs] kept block counts per request.
+    """
+    rng = random.Random(seed)
+    num_reqs, _ = block_table_np.shape
+    compressed: list[list[int]] = []
+    compressed_blocks_per_row: list[int] = []
+    max_kept = 0
+
+    for r in range(num_reqs):
+        nb = int(num_blocks_per_row[r])
+        if nb == 0 or compression_ratio >= 1.0:
+            kept: list[int] = block_table_np[r, :nb].tolist()
+        else:
+            kept_ids = random_block_indices_for_req(nb, compression_ratio, rng)
+            kept = block_table_np[r, kept_ids].tolist()
+        compressed.append(kept)
+        compressed_blocks_per_row.append(len(kept))
+        max_kept = max(max_kept, len(kept))
+
+    if max_kept == 0:
+        return (
+            np.full((num_reqs, 0), -1, dtype=np.int32),
+            np.zeros(num_reqs, dtype=np.int32),
+        )
+
+    out = np.full((num_reqs, max_kept), -1, dtype=np.int32)
+    for r, kept in enumerate(compressed):
+        if kept:
+            out[r, : len(kept)] = np.asarray(kept, dtype=np.int32)
+
+    return out, np.asarray(compressed_blocks_per_row, dtype=np.int32)
+

@@ -6,7 +6,10 @@ import copy
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 # Compression method for hierarchical verification (partial KV cache).
-HierarchicalVerificationCompressMethod = Literal["random"]
+# - "random": token-level compression with compaction (full -> compressed buffer).
+# - "block_random": block-level compression without KV memory copy
+#   (only block_table/seq_lens subsampling).
+HierarchicalVerificationCompressMethod = Literal["random", "block_random"]
 
 from pydantic import Field, SkipValidation, model_validator
 from typing_extensions import Self

@@ -19,6 +19,7 @@ Prerequisites:
 - This script does not install dependencies (e.g., torch).
 
 Example:
+  # Sweep only compression ratios at a fixed batch size.
   python scripts/run_hierarchical_verification_benchmark.py \\
       --model facebook/opt-125m \\
       --speculative-method ngram \\
@@ -26,6 +27,16 @@ Example:
       --compression-ratios 1.0,0.75,0.5,0.25 \\
       --full-verification-interval 4 \\
       --num-prompts 4 \\
+      --max-new-tokens 64
+
+  # Additionally sweep over batch sizes (per compression ratio).
+  python scripts/run_hierarchical_verification_benchmark.py \\
+      --model facebook/opt-125m \\
+      --speculative-method ngram \\
+      --num-speculative-tokens 4 \\
+      --compression-ratios 1.0,0.5 \\
+      --batch-sizes 1,4,16,32 \\
+      --full-verification-interval 4 \\
       --max-new-tokens 64
 """
 
@@ -115,6 +126,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of prompts to generate per compression_ratio.",
     )
     parser.add_argument(
+        "--batch-sizes",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated list of batch sizes (number of prompts) "
+            "to benchmark per compression_ratio, e.g. '1,4,16,32'. "
+            "If not provided, uses --num-prompts as a single batch size."
+        ),
+    )
+    parser.add_argument(
         "--prompt",
         type=str,
         default="The quick brown fox jumps over the lazy dog.",
@@ -189,26 +210,16 @@ def build_speculative_config(
 
 
 def run_once_for_ratio(
-    args: argparse.Namespace, compression_ratio: float
+    args: argparse.Namespace,
+    llm: LLM,
+    compression_ratio: float,
+    batch_size: int,
 ) -> None:
-    """Run a short generation benchmark for a single compression_ratio."""
+    """Run a short generation benchmark for a single (compression_ratio, batch_size)."""
     global _REJECTION_SAMPLER_TIME_SEC
     _REJECTION_SAMPLER_TIME_SEC = 0.0
 
-    spec_cfg = build_speculative_config(args, compression_ratio)
-
-    # NOTE: disable_log_stats=False to allow SpecDecodingLogging to print full
-    # cost breakdown (draft/compression/partial/full) to logs.
-    llm = LLM(
-        model=args.model,
-        tensor_parallel_size=args.tensor_parallel_size,
-        dtype=args.dtype,  # type: ignore[arg-type]
-        seed=0,
-        speculative_config=spec_cfg,
-        disable_log_stats=False,
-    )
-
-    prompts: List[str] = [args.prompt for _ in range(args.num_prompts)]
+    prompts: List[str] = [args.prompt for _ in range(batch_size)]
     sampling_params = SamplingParams(
         max_tokens=args.max_new_tokens,
         temperature=args.temperature,
@@ -232,7 +243,7 @@ def run_once_for_ratio(
 
     print("=" * 80)
     print(f"compression_ratio = {compression_ratio:.4f}")
-    print(f"num_prompts       = {len(prompts)}")
+    print(f"batch_size        = {len(prompts)}")
     print(f"total_new_tokens  = {total_generated_tokens}")
     print(f"end_to_end_time_s = {elapsed:.4f}")
     print(f"end_to_end_TPO_s  = {tpo:.6f}  # seconds per generated token")
@@ -252,14 +263,34 @@ def main() -> None:
     _patch_rejection_sampler_timing()
 
     ratios = [float(x) for x in args.compression_ratios.split(",") if x.strip()]
+    if args.batch_sizes:
+        batch_sizes = [
+            int(x) for x in args.batch_sizes.split(",") if x.strip()
+        ]
+    else:
+        batch_sizes = [args.num_prompts]
 
     print(
         "Running hierarchical speculative verification benchmark with "
-        f"compression_ratios={ratios} ..."
+        f"compression_ratios={ratios}, batch_sizes={batch_sizes} ..."
     )
 
     for r in ratios:
-        run_once_for_ratio(args, r)
+        # Create a fresh SpeculativeConfig & LLM per compression_ratio so that
+        # we isolate effects of compression from other factors.
+        spec_cfg = build_speculative_config(args, r)
+        llm = LLM(
+            model=args.model,
+            tensor_parallel_size=args.tensor_parallel_size,
+            dtype=args.dtype,  # type: ignore[arg-type]
+            seed=0,
+            speculative_config=spec_cfg,
+            disable_log_stats=False,
+        )
+        print("=" * 80)
+        print(f"### compression_ratio = {r:.4f}")
+        for bs in batch_sizes:
+            run_once_for_ratio(args, llm, r, bs)
 
 
 if __name__ == "__main__":

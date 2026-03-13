@@ -14,6 +14,24 @@ vLLM supports a variety of methods of speculative decoding. Model-based methods 
 - [N-Gram](n_gram.md)
 - [Suffix Decoding](suffix.md)
 
+### Hierarchical speculative verification (experimental in this branch)
+
+In this branch, we add an **experimental hierarchical verification** mechanism
+for speculative decoding. It uses:
+
+- A **partial verification** step with a **compressed KV cache** (either
+  token-level or block-level compression), and
+- Periodic **full verification** steps with the full KV cache,
+  controlled by `SpeculativeConfig.full_verification_interval`.
+
+This can reduce the cost of verification for medium/long sequences, at the cost
+of a more complex scheduling and KV cache management strategy.
+
+For design details, configuration fields, instrumentation, and a benchmark
+script, see:
+
+- [Hierarchical Speculative Verification with Compressed KV](hierarchical_verification.md)
+
 ## Lossless guarantees of Speculative Decoding
 
 In vLLM, speculative decoding aims to enhance inference efficiency while maintaining accuracy. This section addresses the lossless guarantees of
