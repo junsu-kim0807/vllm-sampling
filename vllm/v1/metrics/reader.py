@@ -110,10 +110,11 @@ def get_metrics_snapshot() -> list[Metric]:
                     )
             else:
                 for s in samples:
-                    # Cumulative time counters: expose as float (Gauge) for deltas.
+                    # Cumulative time counters/gauges: expose as float for deltas.
                     if metric.name in (
                         "vllm:spec_decode_draft_time_seconds_total",
                         "vllm:spec_decode_verification_time_seconds_total",
+                        "vllm:spec_decode_draft_verification_match_time_seconds_total",
                     ):
                         collected.append(
                             Gauge(

@@ -325,8 +325,7 @@ SPEC_NUM_ACCEPTED = "vllm:spec_decode_num_accepted_tokens"
 SPEC_ACCEPTED_PER_POS = "vllm:spec_decode_num_accepted_tokens_per_pos"
 SPEC_DRAFT_TIME = "vllm:spec_decode_draft_time_seconds_total"
 SPEC_VERIFICATION_TIME = "vllm:spec_decode_verification_time_seconds_total"
-SPEC_DRAFT_VERIF_CHECKS = "vllm:spec_decode_draft_verification_checks_total"
-SPEC_DRAFT_VERIF_MISMATCHES = "vllm:spec_decode_draft_verification_mismatches_total"
+SPEC_DRAFT_VERIF_MATCH_TIME = "vllm:spec_decode_draft_verification_match_time_seconds_total"
 
 
 def chunked(prompts: list[str], batch_size: int):
@@ -490,18 +489,9 @@ def measure_dataset(
             result["avg_draft_time_s"] = None
             result["avg_verification_time_s"] = None
 
-        draft_verif_checks = metric_delta(after, before, SPEC_DRAFT_VERIF_CHECKS)
-        draft_verif_mismatches = metric_delta(after, before, SPEC_DRAFT_VERIF_MISMATCHES)
-        checks_val = int(draft_verif_checks) if draft_verif_checks is not None else None
-        mismatches_val = (
-            int(draft_verif_mismatches) if draft_verif_mismatches is not None else None
-        )
-        result["draft_verification_checks"] = checks_val
-        result["draft_verification_mismatches"] = mismatches_val
-        result["draft_verification_match_ok"] = (
-            (mismatches_val == 0 and checks_val is not None and checks_val > 0)
-            if (checks_val is not None and mismatches_val is not None)
-            else None
+        draft_verif_match_time = metric_delta(after, before, SPEC_DRAFT_VERIF_MATCH_TIME)
+        result["draft_verification_match_time_s"] = (
+            float(draft_verif_match_time) if draft_verif_match_time is not None else None
         )
 
     return result
@@ -673,21 +663,15 @@ if __name__ == "__main__":
                     row["verification_time_s"] = metrics.get("verification_time_s")
                     row["avg_draft_time_s"] = metrics.get("avg_draft_time_s")
                     row["avg_verification_time_s"] = metrics.get("avg_verification_time_s")
-                    row["draft_verification_checks"] = metrics.get("draft_verification_checks")
-                    row["draft_verification_mismatches"] = metrics.get(
-                        "draft_verification_mismatches"
-                    )
-                    row["draft_verification_match_ok"] = metrics.get(
-                        "draft_verification_match_ok"
+                    row["draft_verification_match_time_s"] = metrics.get(
+                        "draft_verification_match_time_s"
                     )
                 else:
                     row["draft_time_s"] = None
                     row["verification_time_s"] = None
                     row["avg_draft_time_s"] = None
                     row["avg_verification_time_s"] = None
-                    row["draft_verification_checks"] = None
-                    row["draft_verification_mismatches"] = None
-                    row["draft_verification_match_ok"] = None
+                    row["draft_verification_match_time_s"] = None
 
                 all_rows.append(row)
 
@@ -710,15 +694,9 @@ if __name__ == "__main__":
                             "[warning] draft/verification times are null. "
                             "Ensure --profile-time was passed and not --disable-log-stats."
                         )
-                    checks = row.get("draft_verification_checks")
-                    mismatches = row.get("draft_verification_mismatches")
-                    match_ok = row.get("draft_verification_match_ok")
-                    if checks is not None:
-                        print(
-                            f"         draft_verification_checks={checks} "
-                            f"draft_verification_mismatches={mismatches} "
-                            f"draft_verification_match_ok={match_ok}"
-                        )
+                    dvm = row.get("draft_verification_match_time_s")
+                    if dvm is not None:
+                        print(f"         draft_verification_match_time_s={dvm:.6f}")
 
         save_results(all_rows, args.results_csv, args.results_jsonl)
         free_llm(llm)

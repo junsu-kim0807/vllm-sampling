@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-import random
+import time
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -28,10 +28,9 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
 
-# Draft–verification match sampling: when VLLM_SPEC_VERIFY_DRAFT_MATCH=1 we
-# occasionally verify that accepted output tokens equal draft tokens.
-_SPEC_VERIFY_DRAFT_MATCH_STATS: dict[str, int] = {"checks": 0, "mismatches": 0}
-_SPEC_VERIFY_SAMPLE_RATE = 0.01
+# Draft–verification match: when VLLM_SPEC_VERIFY_DRAFT_MATCH=1 we run the
+# verification every step and accumulate total time (seconds).
+_SPEC_VERIFY_DRAFT_MATCH_TIME_SEC: float = 0.0
 
 
 class RejectionSampler(nn.Module):
@@ -157,14 +156,14 @@ class RejectionSampler(nn.Module):
         )
 
         if _should_verify_draft_match():
-            c, m = _verify_draft_match_sampled(
+            t0 = time.perf_counter()
+            _verify_draft_match_sampled(
                 output_token_ids,
                 metadata.draft_token_ids,
                 metadata.num_draft_tokens,
                 metadata.cu_num_draft_tokens,
             )
-            _SPEC_VERIFY_DRAFT_MATCH_STATS["checks"] += c
-            _SPEC_VERIFY_DRAFT_MATCH_STATS["mismatches"] += m
+            _SPEC_VERIFY_DRAFT_MATCH_TIME_SEC += time.perf_counter() - t0
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
@@ -365,9 +364,7 @@ class RejectionSampler(nn.Module):
 
 
 def _should_verify_draft_match() -> bool:
-    if os.environ.get("VLLM_SPEC_VERIFY_DRAFT_MATCH", "0") != "1":
-        return False
-    return random.random() < _SPEC_VERIFY_SAMPLE_RATE
+    return os.environ.get("VLLM_SPEC_VERIFY_DRAFT_MATCH", "0") == "1"
 
 
 def _verify_draft_match_sampled(
@@ -403,21 +400,12 @@ def _verify_draft_match_sampled(
     return checks, mismatches
 
 
-def get_spec_verify_draft_match_stats() -> tuple[int, int]:
-    """Return (total_checks, total_mismatches) for draft–verification match sampling."""
-    return (
-        _SPEC_VERIFY_DRAFT_MATCH_STATS["checks"],
-        _SPEC_VERIFY_DRAFT_MATCH_STATS["mismatches"],
-    )
-
-
-def get_spec_verify_draft_match_stats_and_reset() -> tuple[int, int]:
-    """Return (checks, mismatches) since last reset, then reset counters."""
-    c = _SPEC_VERIFY_DRAFT_MATCH_STATS["checks"]
-    m = _SPEC_VERIFY_DRAFT_MATCH_STATS["mismatches"]
-    _SPEC_VERIFY_DRAFT_MATCH_STATS["checks"] = 0
-    _SPEC_VERIFY_DRAFT_MATCH_STATS["mismatches"] = 0
-    return (c, m)
+def get_spec_verify_draft_match_time_sec_and_reset() -> float:
+    """Return total time (sec) spent in draft–verification match since last reset, then reset."""
+    global _SPEC_VERIFY_DRAFT_MATCH_TIME_SEC
+    t = _SPEC_VERIFY_DRAFT_MATCH_TIME_SEC
+    _SPEC_VERIFY_DRAFT_MATCH_TIME_SEC = 0.0
+    return t
 
 
 def rejection_sample(
