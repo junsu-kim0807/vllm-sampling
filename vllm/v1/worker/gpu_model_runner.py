@@ -3832,6 +3832,19 @@ class GPUModelRunner(
             if compressed_kv_caches is not None:
                 self._swap_kv_caches_for_partial(compressed_kv_caches)
             try:
+                # When reporting verification time (hierarchical or VLLM_SPEC_PROFILE_TIME),
+                # sync so we measure actual GPU execution time, not kernel launch time.
+                # Without sync, 4B/8B/30B all show similar small values (async launch only).
+                sync_for_verification_timing = (
+                    use_spec_decode
+                    and spec_config is not None
+                    and (
+                        getattr(spec_config, "hierarchical_verification", False)
+                        or os.environ.get("VLLM_SPEC_PROFILE_TIME", "0") == "1"
+                    )
+                )
+                if sync_for_verification_timing:
+                    torch.cuda.synchronize()
                 t_forward_start = time.perf_counter()
                 model_output = self._model_forward(
                     input_ids=input_ids,
@@ -3840,6 +3853,8 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                if sync_for_verification_timing:
+                    torch.cuda.synchronize()
                 elapsed_forward = time.perf_counter() - t_forward_start
                 # Attribute forward time either to partial or full verification,
                 # depending on whether this step is using compressed KV.
@@ -4077,8 +4092,10 @@ class GPUModelRunner(
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     if measure_draft_time:
+                        torch.cuda.synchronize()
                         t0 = time.perf_counter()
                         propose_draft_token_ids(sampled_token_ids)
+                        torch.cuda.synchronize()
                         hierarchical_draft_time_sec = time.perf_counter() - t0
                     else:
                         propose_draft_token_ids(sampled_token_ids)
@@ -4127,8 +4144,10 @@ class GPUModelRunner(
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             if measure_draft_time:
+                torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 propose_draft_token_ids(valid_sampled_token_ids)
+                torch.cuda.synchronize()
                 hierarchical_draft_time_sec = time.perf_counter() - t0
             else:
                 propose_draft_token_ids(valid_sampled_token_ids)
