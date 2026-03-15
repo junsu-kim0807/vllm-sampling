@@ -156,6 +156,7 @@ class RejectionSampler(nn.Module):
         )
 
         if _should_verify_draft_match():
+            global _SPEC_VERIFY_DRAFT_MATCH_TIME_SEC
             t0 = time.perf_counter()
             _verify_draft_match_sampled(
                 output_token_ids,
