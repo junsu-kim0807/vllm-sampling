@@ -110,9 +110,26 @@ def get_metrics_snapshot() -> list[Metric]:
                     )
             else:
                 for s in samples:
-                    collected.append(
-                        Counter(name=metric.name, labels=s.labels, value=int(s.value))
-                    )
+                    # Cumulative time counters: expose as float (Gauge) for deltas.
+                    if metric.name in (
+                        "vllm:spec_decode_draft_time_seconds_total",
+                        "vllm:spec_decode_verification_time_seconds_total",
+                    ):
+                        collected.append(
+                            Gauge(
+                                name=metric.name,
+                                labels=s.labels,
+                                value=float(s.value),
+                            )
+                        )
+                    else:
+                        collected.append(
+                            Counter(
+                                name=metric.name,
+                                labels=s.labels,
+                                value=int(s.value),
+                            )
+                        )
 
         elif metric.type == "histogram":
             #

@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -4044,6 +4045,14 @@ class GPUModelRunner(
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
+        profile_spec_time = os.environ.get("VLLM_SPEC_PROFILE_TIME", "0") == "1"
+        measure_draft_time = (
+            spec_config is not None
+            and (
+                getattr(spec_config, "hierarchical_verification", False)
+                or profile_spec_time
+            )
+        )
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
@@ -4064,7 +4073,7 @@ class GPUModelRunner(
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
-                    if spec_config.hierarchical_verification:
+                    if measure_draft_time:
                         t0 = time.perf_counter()
                         propose_draft_token_ids(sampled_token_ids)
                         hierarchical_draft_time_sec = time.perf_counter() - t0
@@ -4114,7 +4123,7 @@ class GPUModelRunner(
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
-            if spec_config is not None and spec_config.hierarchical_verification:
+            if measure_draft_time:
                 t0 = time.perf_counter()
                 propose_draft_token_ids(valid_sampled_token_ids)
                 hierarchical_draft_time_sec = time.perf_counter() - t0
@@ -4142,22 +4151,22 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
-            # Hierarchical verification cost breakdown (partial verification
-            # with compressed KV not yet implemented; num_partial_accepted = 0).
+            # Cost breakdown: when hierarchical_verification or VLLM_SPEC_PROFILE_TIME=1,
+            # report draft and verification times for metrics/logging.
             spec_decode_cost_breakdown = None
-            if (
-                use_spec_decode
-                and spec_config is not None
-                and spec_config.hierarchical_verification
-            ):
-                num_reqs = len(req_ids_output_copy)
-                spec_decode_cost_breakdown = SpecDecodeCostBreakdown(
-                    draft_time_sec=hierarchical_draft_time_sec,
-                    compression_time_sec=hierarchical_compression_time_sec,
-                    partial_verification_time_sec=partial_verification_time_sec,
-                    full_verification_time_sec=full_verification_time_sec,
-                    num_partial_accepted_per_req=[0] * num_reqs,
-                )
+            if use_spec_decode and spec_config is not None:
+                if (
+                    getattr(spec_config, "hierarchical_verification", False)
+                    or profile_spec_time
+                ):
+                    num_reqs = len(req_ids_output_copy)
+                    spec_decode_cost_breakdown = SpecDecodeCostBreakdown(
+                        draft_time_sec=hierarchical_draft_time_sec,
+                        compression_time_sec=hierarchical_compression_time_sec,
+                        partial_verification_time_sec=partial_verification_time_sec,
+                        full_verification_time_sec=full_verification_time_sec,
+                        num_partial_accepted_per_req=[0] * num_reqs,
+                    )
 
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,

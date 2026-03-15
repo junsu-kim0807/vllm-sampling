@@ -274,6 +274,25 @@ class SpecDecodingProm:
             for idx, lv in per_engine_labelvalues.items()
         }
 
+        # Cumulative draft and verification time (seconds). Populated when
+        # VLLM_SPEC_PROFILE_TIME=1 or hierarchical_verification is enabled.
+        counter_draft_time = self._counter_cls(
+            name="vllm:spec_decode_draft_time_seconds_total",
+            documentation="Total draft phase time in seconds.",
+            labelnames=labelnames,
+        )
+        self.counter_spec_decode_draft_time_seconds = make_per_engine(
+            counter_draft_time, per_engine_labelvalues
+        )
+        counter_verification_time = self._counter_cls(
+            name="vllm:spec_decode_verification_time_seconds_total",
+            documentation="Total verification phase time in seconds.",
+            labelnames=labelnames,
+        )
+        self.counter_spec_decode_verification_time_seconds = make_per_engine(
+            counter_verification_time, per_engine_labelvalues
+        )
+
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
             return
@@ -290,6 +309,19 @@ class SpecDecodingProm:
             self.counter_spec_decode_num_accepted_tokens_per_pos[engine_idx]
         ):
             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
+        # Cumulative times (only non-zero when cost breakdown is reported).
+        if spec_decoding_stats.draft_time_sec > 0:
+            self.counter_spec_decode_draft_time_seconds[engine_idx].inc(
+                spec_decoding_stats.draft_time_sec
+            )
+        verification_sec = (
+            spec_decoding_stats.partial_verification_time_sec
+            + spec_decoding_stats.full_verification_time_sec
+        )
+        if verification_sec > 0:
+            self.counter_spec_decode_verification_time_seconds[engine_idx].inc(
+                verification_sec
+            )
 
 
 def make_per_engine(
