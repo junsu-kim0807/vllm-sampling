@@ -9,6 +9,15 @@ measures draft and verification time, then reports:
   - average acceptance rate and position-wise acceptance rate
 
 Output: CSV and JSONL with one row per (target_model, dataset, batch_size).
+
+NOTE: draft_time_s / verification_time_s in the output are only filled when
+  (1) you pass --profile-time, and
+  (2) get_metrics() returns the spec_decode_draft_time_seconds_total and
+      spec_decode_verification_time_seconds_total counters (same process).
+If you see null for those fields but the vLLM log shows "SpecDecoding cost
+breakdown: draft_time: ...", the engine is measuring them; the script just
+could not read them (e.g. disable_log_stats=True or metrics from another
+process). Pass --profile-time and ensure disable_log_stats is False.
 """
 
 from __future__ import annotations
@@ -316,6 +325,8 @@ SPEC_NUM_ACCEPTED = "vllm:spec_decode_num_accepted_tokens"
 SPEC_ACCEPTED_PER_POS = "vllm:spec_decode_num_accepted_tokens_per_pos"
 SPEC_DRAFT_TIME = "vllm:spec_decode_draft_time_seconds_total"
 SPEC_VERIFICATION_TIME = "vllm:spec_decode_verification_time_seconds_total"
+SPEC_DRAFT_VERIF_CHECKS = "vllm:spec_decode_draft_verification_checks_total"
+SPEC_DRAFT_VERIF_MISMATCHES = "vllm:spec_decode_draft_verification_mismatches_total"
 
 
 def chunked(prompts: list[str], batch_size: int):
@@ -479,6 +490,20 @@ def measure_dataset(
             result["avg_draft_time_s"] = None
             result["avg_verification_time_s"] = None
 
+        draft_verif_checks = metric_delta(after, before, SPEC_DRAFT_VERIF_CHECKS)
+        draft_verif_mismatches = metric_delta(after, before, SPEC_DRAFT_VERIF_MISMATCHES)
+        checks_val = int(draft_verif_checks) if draft_verif_checks is not None else None
+        mismatches_val = (
+            int(draft_verif_mismatches) if draft_verif_mismatches is not None else None
+        )
+        result["draft_verification_checks"] = checks_val
+        result["draft_verification_mismatches"] = mismatches_val
+        result["draft_verification_match_ok"] = (
+            (mismatches_val == 0 and checks_val is not None and checks_val > 0)
+            if (checks_val is not None and mismatches_val is not None)
+            else None
+        )
+
     return result
 
 
@@ -529,9 +554,14 @@ if __name__ == "__main__":
 
     if args.profile_time:
         os.environ["VLLM_SPEC_PROFILE_TIME"] = "1"
-        print("[profile_time] VLLM_SPEC_PROFILE_TIME=1 (draft/verification timing enabled)")
+        os.environ["VLLM_SPEC_VERIFY_DRAFT_MATCH"] = "1"
+        print(
+            "[profile_time] VLLM_SPEC_PROFILE_TIME=1, VLLM_SPEC_VERIFY_DRAFT_MATCH=1 "
+            "(draft/verification timing and draft–verification match sampling enabled)"
+        )
     else:
         os.environ["VLLM_SPEC_PROFILE_TIME"] = "0"
+        os.environ["VLLM_SPEC_VERIFY_DRAFT_MATCH"] = "0"
 
     batch_sizes = [int(x) for x in parse_csv_list(args.batch_sizes)]
     target_models = parse_csv_list(args.target_models)
@@ -643,11 +673,21 @@ if __name__ == "__main__":
                     row["verification_time_s"] = metrics.get("verification_time_s")
                     row["avg_draft_time_s"] = metrics.get("avg_draft_time_s")
                     row["avg_verification_time_s"] = metrics.get("avg_verification_time_s")
+                    row["draft_verification_checks"] = metrics.get("draft_verification_checks")
+                    row["draft_verification_mismatches"] = metrics.get(
+                        "draft_verification_mismatches"
+                    )
+                    row["draft_verification_match_ok"] = metrics.get(
+                        "draft_verification_match_ok"
+                    )
                 else:
                     row["draft_time_s"] = None
                     row["verification_time_s"] = None
                     row["avg_draft_time_s"] = None
                     row["avg_verification_time_s"] = None
+                    row["draft_verification_checks"] = None
+                    row["draft_verification_mismatches"] = None
+                    row["draft_verification_match_ok"] = None
 
                 all_rows.append(row)
 
@@ -664,6 +704,20 @@ if __name__ == "__main__":
                         print(
                             f"         avg_draft_time_s={ad:.6f} "
                             f"avg_verification_time_s={av:.6f}"
+                        )
+                    elif row.get("draft_time_s") is None and row.get("verification_time_s") is None:
+                        print(
+                            "[warning] draft/verification times are null. "
+                            "Ensure --profile-time was passed and not --disable-log-stats."
+                        )
+                    checks = row.get("draft_verification_checks")
+                    mismatches = row.get("draft_verification_mismatches")
+                    match_ok = row.get("draft_verification_match_ok")
+                    if checks is not None:
+                        print(
+                            f"         draft_verification_checks={checks} "
+                            f"draft_verification_mismatches={mismatches} "
+                            f"draft_verification_match_ok={match_ok}"
                         )
 
         save_results(all_rows, args.results_csv, args.results_jsonl)

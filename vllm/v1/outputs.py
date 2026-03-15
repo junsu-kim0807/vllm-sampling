@@ -220,6 +220,9 @@ class SpecDecodeCostBreakdown:
     full_verification_time_sec: float = 0.0
     # Per-request partial acceptance length (indexed by req_id_to_index).
     num_partial_accepted_per_req: list[int] = field(default_factory=list)
+    # Draft–verification match sampling (when VLLM_SPEC_VERIFY_DRAFT_MATCH=1).
+    draft_verification_checks: int = 0
+    draft_verification_mismatches: int = 0
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.

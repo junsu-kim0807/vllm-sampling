@@ -165,7 +165,10 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import (
+    RejectionSampler,
+    get_spec_verify_draft_match_stats_and_reset,
+)
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -4160,12 +4163,17 @@ class GPUModelRunner(
                     or profile_spec_time
                 ):
                     num_reqs = len(req_ids_output_copy)
+                    draft_verif_checks, draft_verif_mismatches = (
+                        get_spec_verify_draft_match_stats_and_reset()
+                    )
                     spec_decode_cost_breakdown = SpecDecodeCostBreakdown(
                         draft_time_sec=hierarchical_draft_time_sec,
                         compression_time_sec=hierarchical_compression_time_sec,
                         partial_verification_time_sec=partial_verification_time_sec,
                         full_verification_time_sec=full_verification_time_sec,
                         num_partial_accepted_per_req=[0] * num_reqs,
+                        draft_verification_checks=draft_verif_checks,
+                        draft_verification_mismatches=draft_verif_mismatches,
                     )
 
             output = ModelRunnerOutput(

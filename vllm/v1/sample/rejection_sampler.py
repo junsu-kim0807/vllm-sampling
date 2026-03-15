@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import random
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -25,6 +27,11 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
+
+# Draft–verification match sampling: when VLLM_SPEC_VERIFY_DRAFT_MATCH=1 we
+# occasionally verify that accepted output tokens equal draft tokens.
+_SPEC_VERIFY_DRAFT_MATCH_STATS: dict[str, int] = {"checks": 0, "mismatches": 0}
+_SPEC_VERIFY_SAMPLE_RATE = 0.01
 
 
 class RejectionSampler(nn.Module):
@@ -148,6 +155,16 @@ class RejectionSampler(nn.Module):
             bonus_token_ids,
             sampling_metadata,
         )
+
+        if _should_verify_draft_match():
+            c, m = _verify_draft_match_sampled(
+                output_token_ids,
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.cu_num_draft_tokens,
+            )
+            _SPEC_VERIFY_DRAFT_MATCH_STATS["checks"] += c
+            _SPEC_VERIFY_DRAFT_MATCH_STATS["mismatches"] += m
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
@@ -345,6 +362,62 @@ class RejectionSampler(nn.Module):
             for i in range(len(spec) - 1):
                 result.append([*result[-1], spec[i]])
         return result
+
+
+def _should_verify_draft_match() -> bool:
+    if os.environ.get("VLLM_SPEC_VERIFY_DRAFT_MATCH", "0") != "1":
+        return False
+    return random.random() < _SPEC_VERIFY_SAMPLE_RATE
+
+
+def _verify_draft_match_sampled(
+    output_token_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: list[int],
+    cu_num_draft_tokens: torch.Tensor,
+) -> tuple[int, int]:
+    """Verify draft/verification output: no PLACEHOLDER in verified range; accepted
+    prefix of output must equal draft. Returns (checks, mismatches).
+    """
+    batch_size = len(num_draft_tokens)
+    cu = cu_num_draft_tokens.cpu().numpy()
+    out_cpu = output_token_ids.cpu().numpy()
+    draft_cpu = draft_token_ids.cpu().numpy()
+    placeholder_val = int(PLACEHOLDER_TOKEN_ID)
+    checks = 0
+    mismatches = 0
+    for r in range(batch_size):
+        start = int(cu[r - 1]) if r > 0 else 0
+        n = num_draft_tokens[r]
+        if n <= 0:
+            continue
+        checks += 1
+        draft_slice = draft_cpu[start : start + n]
+        out_row = out_cpu[r, :n]
+        for j in range(n):
+            if out_row[j] == placeholder_val:
+                mismatches += 1
+                break
+            if out_row[j] != draft_slice[j]:
+                break
+    return checks, mismatches
+
+
+def get_spec_verify_draft_match_stats() -> tuple[int, int]:
+    """Return (total_checks, total_mismatches) for draft–verification match sampling."""
+    return (
+        _SPEC_VERIFY_DRAFT_MATCH_STATS["checks"],
+        _SPEC_VERIFY_DRAFT_MATCH_STATS["mismatches"],
+    )
+
+
+def get_spec_verify_draft_match_stats_and_reset() -> tuple[int, int]:
+    """Return (checks, mismatches) since last reset, then reset counters."""
+    c = _SPEC_VERIFY_DRAFT_MATCH_STATS["checks"]
+    m = _SPEC_VERIFY_DRAFT_MATCH_STATS["mismatches"]
+    _SPEC_VERIFY_DRAFT_MATCH_STATS["checks"] = 0
+    _SPEC_VERIFY_DRAFT_MATCH_STATS["mismatches"] = 0
+    return (c, m)
 
 
 def rejection_sample(

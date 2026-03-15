@@ -41,6 +41,9 @@ class SpecDecodingStats:
     partial_verification_time_sec: float = 0.0
     num_partial_accepted_tokens: int = 0
     full_verification_time_sec: float = 0.0
+    # Draft–verification match sampling (VLLM_SPEC_VERIFY_DRAFT_MATCH=1).
+    draft_verification_checks: int = 0
+    draft_verification_mismatches: int = 0
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
@@ -67,6 +70,8 @@ class SpecDecodingStats:
         partial_verification_time_sec: float = 0.0,
         num_partial_accepted_tokens: int = 0,
         full_verification_time_sec: float = 0.0,
+        draft_verification_checks: int = 0,
+        draft_verification_mismatches: int = 0,
     ) -> None:
         """Same as observe_draft plus optional cost breakdown (e.g. hierarchical)."""
         self.observe_draft(num_draft_tokens, num_accepted_tokens)
@@ -75,6 +80,8 @@ class SpecDecodingStats:
         self.partial_verification_time_sec += partial_verification_time_sec
         self.num_partial_accepted_tokens += num_partial_accepted_tokens
         self.full_verification_time_sec += full_verification_time_sec
+        self.draft_verification_checks += draft_verification_checks
+        self.draft_verification_mismatches += draft_verification_mismatches
 
 
 class SpecDecodingLogging:
@@ -98,6 +105,8 @@ class SpecDecodingLogging:
         self.partial_verification_time_sec: list[float] = []
         self.num_partial_accepted_tokens: list[int] = []
         self.full_verification_time_sec: list[float] = []
+        self.draft_verification_checks_list: list[int] = []
+        self.draft_verification_mismatches_list: list[int] = []
         self.last_log_time = time.monotonic()
 
     def observe(self, spec_decoding_stats: SpecDecodingStats):
@@ -117,6 +126,12 @@ class SpecDecodingLogging:
         )
         self.full_verification_time_sec.append(
             spec_decoding_stats.full_verification_time_sec
+        )
+        self.draft_verification_checks_list.append(
+            getattr(spec_decoding_stats, "draft_verification_checks", 0)
+        )
+        self.draft_verification_mismatches_list.append(
+            getattr(spec_decoding_stats, "draft_verification_mismatches", 0)
         )
 
     def log(self, log_fn=logger.info):
@@ -292,6 +307,22 @@ class SpecDecodingProm:
         self.counter_spec_decode_verification_time_seconds = make_per_engine(
             counter_verification_time, per_engine_labelvalues
         )
+        counter_draft_verif_checks = self._counter_cls(
+            name="vllm:spec_decode_draft_verification_checks_total",
+            documentation="Number of draft–verification match checks (sampled).",
+            labelnames=labelnames,
+        )
+        self.counter_spec_decode_draft_verification_checks = make_per_engine(
+            counter_draft_verif_checks, per_engine_labelvalues
+        )
+        counter_draft_verif_mismatches = self._counter_cls(
+            name="vllm:spec_decode_draft_verification_mismatches_total",
+            documentation="Number of draft–verification mismatches (sampled).",
+            labelnames=labelnames,
+        )
+        self.counter_spec_decode_draft_verification_mismatches = make_per_engine(
+            counter_draft_verif_mismatches, per_engine_labelvalues
+        )
 
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
@@ -322,6 +353,12 @@ class SpecDecodingProm:
             self.counter_spec_decode_verification_time_seconds[engine_idx].inc(
                 verification_sec
             )
+        c = getattr(spec_decoding_stats, "draft_verification_checks", 0)
+        m = getattr(spec_decoding_stats, "draft_verification_mismatches", 0)
+        if c > 0:
+            self.counter_spec_decode_draft_verification_checks[engine_idx].inc(c)
+        if m > 0:
+            self.counter_spec_decode_draft_verification_mismatches[engine_idx].inc(m)
 
 
 def make_per_engine(
