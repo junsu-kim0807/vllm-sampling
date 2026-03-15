@@ -220,8 +220,8 @@ class SpecDecodeCostBreakdown:
     full_verification_time_sec: float = 0.0
     # Per-request partial acceptance length (indexed by req_id_to_index).
     num_partial_accepted_per_req: list[int] = field(default_factory=list)
-    # Draft–verification match: total time (sec) spent in match verification.
-    draft_verification_match_time_sec: float = 0.0
+    # Rejection sampling: total time (sec) spent in rejection sampler.
+    reject_sample_time_sec: float = 0.0
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.

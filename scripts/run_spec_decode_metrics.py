@@ -325,7 +325,7 @@ SPEC_NUM_ACCEPTED = "vllm:spec_decode_num_accepted_tokens"
 SPEC_ACCEPTED_PER_POS = "vllm:spec_decode_num_accepted_tokens_per_pos"
 SPEC_DRAFT_TIME = "vllm:spec_decode_draft_time_seconds_total"
 SPEC_VERIFICATION_TIME = "vllm:spec_decode_verification_time_seconds_total"
-SPEC_DRAFT_VERIF_MATCH_TIME = "vllm:spec_decode_draft_verification_match_time_seconds_total"
+SPEC_REJECT_SAMPLE_TIME = "vllm:spec_decode_reject_sample_time_seconds_total"
 
 
 def chunked(prompts: list[str], batch_size: int):
@@ -489,10 +489,16 @@ def measure_dataset(
             result["avg_draft_time_s"] = None
             result["avg_verification_time_s"] = None
 
-        draft_verif_match_time = metric_delta(after, before, SPEC_DRAFT_VERIF_MATCH_TIME)
-        result["draft_verification_match_time_s"] = (
-            float(draft_verif_match_time) if draft_verif_match_time is not None else None
+        reject_sample_time = metric_delta(after, before, SPEC_REJECT_SAMPLE_TIME)
+        result["reject_sample_time_s"] = (
+            float(reject_sample_time) if reject_sample_time is not None else None
         )
+        if num_drafts_val > 0 and result["reject_sample_time_s"] is not None:
+            result["avg_reject_sample_time_s"] = (
+                result["reject_sample_time_s"] / num_drafts_val
+            )
+        else:
+            result["avg_reject_sample_time_s"] = None
 
     return result
 
@@ -663,15 +669,17 @@ if __name__ == "__main__":
                     row["verification_time_s"] = metrics.get("verification_time_s")
                     row["avg_draft_time_s"] = metrics.get("avg_draft_time_s")
                     row["avg_verification_time_s"] = metrics.get("avg_verification_time_s")
-                    row["draft_verification_match_time_s"] = metrics.get(
-                        "draft_verification_match_time_s"
+                    row["reject_sample_time_s"] = metrics.get("reject_sample_time_s")
+                    row["avg_reject_sample_time_s"] = metrics.get(
+                        "avg_reject_sample_time_s"
                     )
                 else:
                     row["draft_time_s"] = None
                     row["verification_time_s"] = None
                     row["avg_draft_time_s"] = None
                     row["avg_verification_time_s"] = None
-                    row["draft_verification_match_time_s"] = None
+                    row["reject_sample_time_s"] = None
+                    row["avg_reject_sample_time_s"] = None
 
                 all_rows.append(row)
 
@@ -694,9 +702,14 @@ if __name__ == "__main__":
                             "[warning] draft/verification times are null. "
                             "Ensure --profile-time was passed and not --disable-log-stats."
                         )
-                    dvm = row.get("draft_verification_match_time_s")
-                    if dvm is not None:
-                        print(f"         draft_verification_match_time_s={dvm:.6f}")
+                    rs = row.get("reject_sample_time_s")
+                    ars = row.get("avg_reject_sample_time_s")
+                    if rs is not None:
+                        ars_str = f"{ars:.6f}" if ars is not None else "N/A"
+                        print(
+                            f"         reject_sample_time_s={rs:.6f} "
+                            f"avg_reject_sample_time_s={ars_str}"
+                        )
 
         save_results(all_rows, args.results_csv, args.results_jsonl)
         free_llm(llm)

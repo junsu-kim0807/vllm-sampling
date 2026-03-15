@@ -1949,8 +1949,8 @@ class Scheduler(SchedulerInterface):
                 full_verification_time_sec=(
                     cost_breakdown.full_verification_time_sec if is_first_spec_req else 0
                 ),
-                draft_verification_match_time_sec=(
-                    cost_breakdown.draft_verification_match_time_sec
+                reject_sample_time_sec=(
+                    cost_breakdown.reject_sample_time_sec
                     if is_first_spec_req
                     else 0.0
                 ),

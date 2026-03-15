@@ -41,8 +41,8 @@ class SpecDecodingStats:
     partial_verification_time_sec: float = 0.0
     num_partial_accepted_tokens: int = 0
     full_verification_time_sec: float = 0.0
-    # Draft–verification match: total time (sec) spent in match verification.
-    draft_verification_match_time_sec: float = 0.0
+    # Rejection sampling: total time (sec) spent in rejection sampler.
+    reject_sample_time_sec: float = 0.0
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
@@ -69,7 +69,7 @@ class SpecDecodingStats:
         partial_verification_time_sec: float = 0.0,
         num_partial_accepted_tokens: int = 0,
         full_verification_time_sec: float = 0.0,
-        draft_verification_match_time_sec: float = 0.0,
+        reject_sample_time_sec: float = 0.0,
     ) -> None:
         """Same as observe_draft plus optional cost breakdown (e.g. hierarchical)."""
         self.observe_draft(num_draft_tokens, num_accepted_tokens)
@@ -78,7 +78,7 @@ class SpecDecodingStats:
         self.partial_verification_time_sec += partial_verification_time_sec
         self.num_partial_accepted_tokens += num_partial_accepted_tokens
         self.full_verification_time_sec += full_verification_time_sec
-        self.draft_verification_match_time_sec += draft_verification_match_time_sec
+        self.reject_sample_time_sec += reject_sample_time_sec
 
 
 class SpecDecodingLogging:
@@ -102,7 +102,7 @@ class SpecDecodingLogging:
         self.partial_verification_time_sec: list[float] = []
         self.num_partial_accepted_tokens: list[int] = []
         self.full_verification_time_sec: list[float] = []
-        self.draft_verification_match_time_sec_list: list[float] = []
+        self.reject_sample_time_sec_list: list[float] = []
         self.last_log_time = time.monotonic()
 
     def observe(self, spec_decoding_stats: SpecDecodingStats):
@@ -123,8 +123,8 @@ class SpecDecodingLogging:
         self.full_verification_time_sec.append(
             spec_decoding_stats.full_verification_time_sec
         )
-        self.draft_verification_match_time_sec_list.append(
-            getattr(spec_decoding_stats, "draft_verification_match_time_sec", 0.0)
+        self.reject_sample_time_sec_list.append(
+            getattr(spec_decoding_stats, "reject_sample_time_sec", 0.0)
         )
 
     def log(self, log_fn=logger.info):
@@ -160,15 +160,15 @@ class SpecDecodingLogging:
         total_partial_verification_time = np.sum(self.partial_verification_time_sec)
         total_partial_accepted = np.sum(self.num_partial_accepted_tokens)
         total_full_verification_time = np.sum(self.full_verification_time_sec)
-        total_draft_verification_match_time = np.sum(
-            getattr(self, "draft_verification_match_time_sec_list", [])
+        total_reject_sample_time = np.sum(
+            getattr(self, "reject_sample_time_sec_list", [])
         )
         has_cost_breakdown = (
             total_draft_time > 0
             or total_compression_time > 0
             or total_partial_verification_time > 0
             or total_full_verification_time > 0
-            or total_draft_verification_match_time > 0
+            or total_reject_sample_time > 0
         )
         partial_acceptance_length = (
             1 + total_partial_accepted / num_drafts if num_drafts > 0 else 0.0
@@ -197,14 +197,14 @@ class SpecDecodingLogging:
                 "draft_time: %.4fs, compression_time: %.4fs, "
                 "partial_verification_time: %.4fs, partial_acceptance_length: %.2f, "
                 "full_verification_time: %.4fs, full_acceptance_length: %.2f, "
-                "draft_verification_match_time: %.4fs",
+                "reject_sample_time: %.4fs",
                 total_draft_time,
                 total_compression_time,
                 total_partial_verification_time,
                 partial_acceptance_length,
                 total_full_verification_time,
                 mean_acceptance_length,
-                total_draft_verification_match_time,
+                total_reject_sample_time,
             )
         self.reset()
 
@@ -310,17 +310,17 @@ class SpecDecodingProm:
         self.gauge_spec_decode_verification_time_seconds = make_per_engine(
             gauge_verification_time, per_engine_labelvalues
         )
-        # Draft–verification match: total time spent in match verification (seconds).
-        self._cumulative_draft_verification_match_time_sec: dict[int, float] = {
+        # Rejection sampling: total time spent in rejection sampler (seconds).
+        self._cumulative_reject_sample_time_sec: dict[int, float] = {
             i: 0.0 for i in per_engine_labelvalues
         }
-        gauge_draft_verif_time = prometheus_client.Gauge(
-            name="vllm:spec_decode_draft_verification_match_time_seconds_total",
-            documentation="Total time spent in draft–verification match check (seconds).",
+        gauge_reject_sample_time = prometheus_client.Gauge(
+            name="vllm:spec_decode_reject_sample_time_seconds_total",
+            documentation="Total time spent in rejection sampler (seconds).",
             labelnames=labelnames,
         )
-        self.gauge_spec_decode_draft_verification_match_time = make_per_engine(
-            gauge_draft_verif_time, per_engine_labelvalues
+        self.gauge_spec_decode_reject_sample_time = make_per_engine(
+            gauge_reject_sample_time, per_engine_labelvalues
         )
 
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
@@ -354,11 +354,11 @@ class SpecDecodingProm:
             self.gauge_spec_decode_verification_time_seconds[engine_idx].set(
                 self._cumulative_verification_time_sec[engine_idx]
             )
-        match_time = getattr(spec_decoding_stats, "draft_verification_match_time_sec", 0.0)
-        if match_time > 0:
-            self._cumulative_draft_verification_match_time_sec[engine_idx] += match_time
-            self.gauge_spec_decode_draft_verification_match_time[engine_idx].set(
-                self._cumulative_draft_verification_match_time_sec[engine_idx]
+        reject_time = getattr(spec_decoding_stats, "reject_sample_time_sec", 0.0)
+        if reject_time > 0:
+            self._cumulative_reject_sample_time_sec[engine_idx] += reject_time
+            self.gauge_spec_decode_reject_sample_time[engine_idx].set(
+                self._cumulative_reject_sample_time_sec[engine_idx]
             )
 
 

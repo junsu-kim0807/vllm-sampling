@@ -4163,7 +4163,7 @@ class GPUModelRunner(
                     or profile_spec_time
                 ):
                     num_reqs = len(req_ids_output_copy)
-                    draft_verif_match_time_sec = (
+                    reject_sample_time_sec = (
                         get_spec_verify_draft_match_time_sec_and_reset()
                     )
                     spec_decode_cost_breakdown = SpecDecodeCostBreakdown(
@@ -4172,7 +4172,7 @@ class GPUModelRunner(
                         partial_verification_time_sec=partial_verification_time_sec,
                         full_verification_time_sec=full_verification_time_sec,
                         num_partial_accepted_per_req=[0] * num_reqs,
-                        draft_verification_match_time_sec=draft_verif_match_time_sec,
+                        reject_sample_time_sec=reject_sample_time_sec,
                     )
 
             output = ModelRunnerOutput(

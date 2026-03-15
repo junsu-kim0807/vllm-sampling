@@ -114,7 +114,7 @@ def get_metrics_snapshot() -> list[Metric]:
                     if metric.name in (
                         "vllm:spec_decode_draft_time_seconds_total",
                         "vllm:spec_decode_verification_time_seconds_total",
-                        "vllm:spec_decode_draft_verification_match_time_seconds_total",
+                        "vllm:spec_decode_reject_sample_time_seconds_total",
                     ):
                         collected.append(
                             Gauge(
