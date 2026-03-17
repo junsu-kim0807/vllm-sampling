@@ -1,0 +1,16 @@
+# pair_id	draft_model	target_model	tp_size	gpu_count	time_limit	note
+llama32_1b_to_llama32_3b	meta-llama/Llama-3.2-1B-Instruct	meta-llama/Llama-3.2-3B-Instruct	1	1	06:00:00	Llama small->small
+llama32_1b_to_llama31_8b	meta-llama/Llama-3.2-1B-Instruct	meta-llama/Meta-Llama-3.1-8B-Instruct	1	1	06:00:00	Llama 1B draft -> 8B target
+llama32_1b_to_llama31_70b	meta-llama/Llama-3.2-1B-Instruct	meta-llama/Llama-3.1-70B-Instruct	2	2	10:00:00	Llama 1B draft -> 70B target
+llama32_3b_to_llama31_8b	meta-llama/Llama-3.2-3B-Instruct	meta-llama/Meta-Llama-3.1-8B-Instruct	1	1	06:00:00	Llama 3B draft -> 8B target
+llama32_3b_to_llama31_70b	meta-llama/Llama-3.2-3B-Instruct	meta-llama/Llama-3.1-70B-Instruct	2	2	10:00:00	Llama 3B draft -> 70B target
+
+qwen06_to_qwen3coder_awq	Qwen/Qwen3-0.6B	cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit	1	1	06:00:00	Qwen 0.6B draft -> AWQ target
+qwen06_to_qwen3coder_fp8	Qwen/Qwen3-0.6B	Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8	1	1	06:00:00	Qwen 0.6B draft -> FP8 target
+qwen06_to_qwen3coder_full	Qwen/Qwen3-0.6B	Qwen/Qwen3-Coder-30B-A3B-Instruct	2	2	10:00:00	Qwen 0.6B draft -> full target
+qwen3coder_awq_to_fp8	cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit	Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8	1	1	06:00:00	AWQ draft -> FP8 target
+qwen3coder_awq_to_full	cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit	Qwen/Qwen3-Coder-30B-A3B-Instruct	2	2	10:00:00	AWQ draft -> full target
+
+
+qwen4_to_qwen8	Qwen/Qwen3-4B	Qwen/Qwen3-8B	1	1	06:00:00	Replacement for requested Qwen3-9B
+qwen4_to_qwen30a3b	Qwen/Qwen3-4B	Qwen/Qwen3-30B-A3B	2	2	10:00:00	Qwen 4B draft -> 30B-A3B target

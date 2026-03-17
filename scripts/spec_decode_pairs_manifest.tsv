@@ -1,0 +1,8 @@
+# pair_id	draft_model	target_model	tp_size	gpu_count	time_limit	note
+llama32_1b_to_llama32_3b	meta-llama/Llama-3.2-1B-Instruct	meta-llama/Llama-3.2-3B-Instruct	1	1	06:00:00	Llama small->small
+llama32_1b_to_llama31_8b	meta-llama/Llama-3.2-1B-Instruct	meta-llama/Meta-Llama-3.1-8B-Instruct	1	1	06:00:00	Llama 1B draft -> 8B target
+llama32_1b_to_llama31_70b	meta-llama/Llama-3.2-1B-Instruct	meta-llama/Llama-3.1-70B-Instruct	2	2	10:00:00	Llama 1B draft -> 70B target
+llama32_3b_to_llama31_8b	meta-llama/Llama-3.2-3B-Instruct	meta-llama/Meta-Llama-3.1-8B-Instruct	1	1	06:00:00	Llama 3B draft -> 8B target
+llama32_3b_to_llama31_70b	meta-llama/Llama-3.2-3B-Instruct	meta-llama/Llama-3.1-70B-Instruct	2	2	10:00:00	Llama 3B draft -> 70B target
+
+    

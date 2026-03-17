@@ -1,14 +1,18 @@
 #!/bin/bash
-# Submit three spec_decode_metrics jobs in parallel:
-#   - 0.6B+4B:  3h, 1 GPU  -> spec_decode_metrics_4b.csv / .jsonl
-#   - 0.6B+8B:  6h, 1 GPU  -> spec_decode_metrics_8b.csv / .jsonl
-#   - 0.6B+30B: 10h, 2 GPU -> spec_decode_metrics_30b.csv / .jsonl
-# Usage: from repo root, run: bash scripts/submit_spec_decode_metrics.sh
+# Usage:
+#   bash scripts/submit_spec_decode_metrics.sh
+#
+# Optional:
+#   MANIFEST=scripts/spec_decode_pairs_manifest.tsv bash scripts/submit_spec_decode_metrics.sh
+#   PAIR_FILTER='llama32_' bash scripts/submit_spec_decode_metrics.sh
 
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
-SLURM_SCRIPT="${REPO_DIR}/scripts/slurm_run_spec_decode_metrics.slurm"
+SLURM_SCRIPT="${SLURM_SCRIPT:-${REPO_DIR}/scripts/slurm_run_spec_decode_metrics.slurm}"
+MANIFEST="${MANIFEST:-${REPO_DIR}/scripts/spec_decode_pairs_manifest.tsv}"
+PAIR_FILTER="${PAIR_FILTER:-}"
+
 mkdir -p "${REPO_DIR}/logs"
 
 if [[ ! -f "${SLURM_SCRIPT}" ]]; then
@@ -16,38 +20,42 @@ if [[ ! -f "${SLURM_SCRIPT}" ]]; then
   exit 1
 fi
 
-echo "Submitting 3 jobs (0.6B+4B, 0.6B+8B, 0.6B+30B) from ${REPO_DIR}"
+if [[ ! -f "${MANIFEST}" ]]; then
+  echo "Manifest not found: ${MANIFEST}"
+  exit 1
+fi
 
-JOB_4B=$(sbatch \
-  --job-name=spec_metrics_4b \
-  --time=3:00:00 \
-  --gres=gpu:h100:1 \
-  --export=ALL,TARGET_CFG=4b \
-  "${SLURM_SCRIPT}" \
-  | awk '{print $4}')
-echo "  Submitted 0.6B+4B  (3h, 1 GPU): job ${JOB_4B}"
+echo "Submitting speculative decoding jobs from ${MANIFEST}"
+echo "Results root: ${REPO_DIR}/results/profile"
+if [[ -n "${PAIR_FILTER}" ]]; then
+  echo "PAIR_FILTER: ${PAIR_FILTER}"
+fi
+echo
 
-JOB_8B=$(sbatch \
-  --job-name=spec_metrics_8b \
-  --time=6:00:00 \
-  --gres=gpu:h100:1 \
-  --export=ALL,TARGET_CFG=8b \
-  "${SLURM_SCRIPT}" \
-  | awk '{print $4}')
-echo "  Submitted 0.6B+8B  (6h, 1 GPU): job ${JOB_8B}"
+submitted=0
+while IFS=$'\t' read -r pair_id draft_model target_model tp_size gpu_count time_limit note; do
+  [[ -z "${pair_id}" ]] && continue
+  [[ "${pair_id}" =~ ^# ]] && continue
+  if [[ -n "${PAIR_FILTER}" && "${pair_id}" != *"${PAIR_FILTER}"* ]]; then
+    continue
+  fi
 
-JOB_30B=$(sbatch \
-  --job-name=spec_metrics_30b \
-  --time=10:00:00 \
-  --gres=gpu:h100:2 \
-  --export=ALL,TARGET_CFG=30b \
-  "${SLURM_SCRIPT}" \
-  | awk '{print $4}')
-echo "  Submitted 0.6B+30B (10h, 2 GPU): job ${JOB_30B}"
+  job_name="spec_${pair_id}"
+  export_str="ALL,PAIR_ID=${pair_id},DRAFT_MODEL=${draft_model},TARGET_MODEL=${target_model},TP_SIZE=${tp_size},RESULTS_ROOT=${REPO_DIR}/results/profile"
 
-echo ""
-echo "Results will be written under ${REPO_DIR}:"
-echo "  spec_decode_metrics_4b.csv / spec_decode_metrics_4b.jsonl"
-echo "  spec_decode_metrics_8b.csv / spec_decode_metrics_8b.jsonl"
-echo "  spec_decode_metrics_30b.csv / spec_decode_metrics_30b.jsonl"
+  job_id=$(sbatch \
+    --job-name="${job_name}" \
+    --time="${time_limit}" \
+    --gres="gpu:h100:${gpu_count}" \
+    --export="${export_str}" \
+    "${SLURM_SCRIPT}" \
+    | awk '{print $4}')
+
+  printf 'Submitted %-32s job=%s  gpus=%s  time=%s\n' "${pair_id}" "${job_id}" "${gpu_count}" "${time_limit}"
+  ((submitted+=1))
+done < "${MANIFEST}"
+
+echo
+echo "Total submitted jobs: ${submitted}"
 echo "Logs: ${REPO_DIR}/logs/spec_decode_metrics_*_<jobid>.out"
+echo "Results: ${REPO_DIR}/results/profile"

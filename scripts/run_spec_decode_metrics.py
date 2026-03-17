@@ -3,21 +3,17 @@
 """
 Run vanilla speculative decoding (draft_model) on AIME 2025 and CodeElo.
 
-When --profile_time is set, sets VLLM_SPEC_PROFILE_TIME=1 so that vLLM
-measures draft and verification time, then reports:
-  - average draft time, average verification time
-  - average acceptance rate and position-wise acceptance rate
+This version keeps the original CLI behavior, but also saves per-pair results under:
 
-Output: CSV and JSONL with one row per (target_model, dataset, batch_size).
+    <results_root>/<sanitized_draft>__TO__<sanitized_target>/
 
-NOTE: draft_time_s / verification_time_s in the output are only filled when
-  (1) you pass --profile-time, and
-  (2) get_metrics() returns the spec_decode_draft_time_seconds_total and
-      spec_decode_verification_time_seconds_total counters (same process).
-If you see null for those fields but the vLLM log shows "SpecDecoding cost
-breakdown: draft_time: ...", the engine is measuring them; the script just
-could not read them (e.g. disable_log_stats=True or metrics from another
-process). Pass --profile-time and ensure disable_log_stats is False.
+Each pair directory contains:
+  - metrics.csv
+  - metrics.jsonl
+  - pair_info.json
+
+If multiple targets are provided, an aggregate CSV/JSONL is also written under
+results_root using --results-csv / --results-jsonl.
 """
 
 from __future__ import annotations
@@ -28,6 +24,7 @@ import gc
 import json
 import os
 import random
+import re
 import time
 from typing import Any
 
@@ -37,30 +34,21 @@ from vllm.v1.metrics.reader import Counter, Gauge, Vector
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Run speculative decoding (draft Qwen3-0.6B, target 4B/8B/30B-A3B) "
-            "on AIME 2025 and CodeElo. With --profile_time, report average "
-            "draft/verification time and acceptance rates."
+            "Run speculative decoding on AIME 2025 and CodeElo. "
+            "With --profile-time, report average draft/verification time."
         )
     )
     p.add_argument("--draft-model", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument(
         "--target-models",
         type=str,
-        default=(
-            "Qwen/Qwen3-4B,"
-            "Qwen/Qwen3-8B,"
-            "Qwen/Qwen3-30B-A3B"
-        ),
+        default="Qwen/Qwen3-8B,Qwen/Qwen3-30B-A3B",
         help="Comma-separated target model list.",
     )
     p.add_argument(
         "--tp-map",
         type=str,
-        default=(
-            "Qwen/Qwen3-4B=1,"
-            "Qwen/Qwen3-8B=1,"
-            "Qwen/Qwen3-30B-A3B=2"
-        ),
+        default="Qwen/Qwen3-8B=1,Qwen/Qwen3-30B-A3B=2",
         help="Comma-separated target_model=tp map.",
     )
     p.add_argument(
@@ -109,27 +97,21 @@ def parse_args() -> argparse.Namespace:
         default=1024,
         help="Max new tokens for CodeElo.",
     )
-    p.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-    )
+    p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--top-k", type=int, default=-1)
-    p.add_argument(
-        "--warmup-iters",
-        type=int,
-        default=2,
-    )
-    p.add_argument(
-        "--warmup-max-tokens",
-        type=int,
-        default=32,
-    )
+    p.add_argument("--warmup-iters", type=int, default=2)
+    p.add_argument("--warmup-max-tokens", type=int, default=32)
     p.add_argument(
         "--profile-time",
         action="store_true",
         help="Set VLLM_SPEC_PROFILE_TIME=1 and report average draft/verification time.",
+    )
+    p.add_argument(
+        "--results-root",
+        type=str,
+        default="results/profile",
+        help="Root directory for aggregate and per-pair outputs.",
     )
     p.add_argument(
         "--results-csv",
@@ -287,7 +269,6 @@ def snapshot_metrics(llm) -> dict[str, Any]:
         if isinstance(metric, Counter):
             out[name] = out.get(name, 0) + metric.value
         elif isinstance(metric, Gauge):
-            # Sum gauges with same name (e.g. multi-engine time counters)
             out[name] = out.get(name, 0.0) + float(metric.value)
         elif isinstance(metric, Vector):
             if name not in out:
@@ -384,7 +365,10 @@ def run_warmup(
         top_k=top_k,
         max_tokens=warmup_max_tokens,
     )
-    print(f"[warmup] iters={warmup_iters}, batch_size={batch_size}, max_tokens={warmup_max_tokens}")
+    print(
+        f"[warmup] iters={warmup_iters}, batch_size={batch_size}, "
+        f"max_tokens={warmup_max_tokens}"
+    )
     for idx in range(warmup_iters):
         maybe_cuda_sync()
         _ = llm.generate(warm, sampling_params=sampling_params)
@@ -518,6 +502,12 @@ def free_llm(llm: Any) -> None:
         pass
 
 
+def ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def save_results(
     all_rows: list[dict[str, Any]],
     results_csv: str,
@@ -525,6 +515,10 @@ def save_results(
 ) -> None:
     if not all_rows:
         return
+
+    ensure_parent_dir(results_csv)
+    ensure_parent_dir(results_jsonl)
+
     fieldnames = list(all_rows[0].keys())
     with open(results_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -542,6 +536,46 @@ def save_results(
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     print(f"[save] CSV: {results_csv}, JSONL: {results_jsonl}")
+
+
+def sanitize_model_name(model_name: str) -> str:
+    cleaned = model_name.strip().replace("/", "__")
+    cleaned = re.sub(r"[^A-Za-z0-9._+@=,]+", "_", cleaned)
+    cleaned = cleaned.strip("._")
+    return cleaned
+
+
+def get_pair_output_dir(results_root: str, draft_model: str, target_model: str) -> str:
+    pair_name = f"{sanitize_model_name(draft_model)}__TO__{sanitize_model_name(target_model)}"
+    return os.path.join(results_root, pair_name)
+
+
+def write_pair_info(
+    pair_dir: str,
+    args: argparse.Namespace,
+    target_model: str,
+    tensor_parallel_size: int,
+    dataset_keys: list[str],
+    batch_sizes: list[int],
+) -> None:
+    os.makedirs(pair_dir, exist_ok=True)
+    payload = {
+        "draft_model": args.draft_model,
+        "target_model": target_model,
+        "tensor_parallel_size": tensor_parallel_size,
+        "datasets": dataset_keys,
+        "batch_sizes": batch_sizes,
+        "num_speculative_tokens": args.num_spec_tokens,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_model_len": args.max_model_len,
+        "dtype": args.dtype,
+        "seed": args.seed,
+        "profile_time": args.profile_time,
+    }
+    path = os.path.join(pair_dir, "pair_info.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"[save] pair metadata: {path}")
 
 
 if __name__ == "__main__":
@@ -568,11 +602,13 @@ if __name__ == "__main__":
     print("[args] target_models =", target_models)
     print("[args] tp_map =", tp_map)
     print("[args] profile_time =", args.profile_time)
+    print("[args] results_root =", args.results_root)
 
     missing_tp = [m for m in target_models if m not in tp_map]
     if missing_tp:
         raise ValueError(f"Missing --tp-map for: {missing_tp}")
 
+    os.makedirs(args.results_root, exist_ok=True)
     dataset_prompts = {key: get_dataset_prompts(key, args) for key in dataset_keys}
 
     from vllm import LLM
@@ -609,6 +645,7 @@ if __name__ == "__main__":
             max_num_seqs=max_num_seqs,
         )
         tokenizer = llm.get_tokenizer()
+        target_rows: list[dict[str, Any]] = []
 
         for dataset_key in dataset_keys:
             prompts = dataset_prompts[dataset_key]
@@ -681,6 +718,7 @@ if __name__ == "__main__":
                     row["reject_sample_time_s"] = None
                     row["avg_reject_sample_time_s"] = None
 
+                target_rows.append(row)
                 all_rows.append(row)
 
                 print(
@@ -711,8 +749,32 @@ if __name__ == "__main__":
                             f"avg_reject_sample_time_s={ars_str}"
                         )
 
-        save_results(all_rows, args.results_csv, args.results_jsonl)
+        pair_dir = get_pair_output_dir(args.results_root, args.draft_model, target_model)
+        pair_csv = os.path.join(pair_dir, "metrics.csv")
+        pair_jsonl = os.path.join(pair_dir, "metrics.jsonl")
+        save_results(target_rows, pair_csv, pair_jsonl)
+        write_pair_info(
+            pair_dir=pair_dir,
+            args=args,
+            target_model=target_model,
+            tensor_parallel_size=tp,
+            dataset_keys=dataset_keys,
+            batch_sizes=batch_sizes,
+        )
         free_llm(llm)
 
+    aggregate_csv = (
+        args.results_csv
+        if os.path.isabs(args.results_csv)
+        else os.path.join(args.results_root, args.results_csv)
+    )
+    aggregate_jsonl = (
+        args.results_jsonl
+        if os.path.isabs(args.results_jsonl)
+        else os.path.join(args.results_root, args.results_jsonl)
+    )
+    save_results(all_rows, aggregate_csv, aggregate_jsonl)
+
     print("=" * 80)
-    print(f"Results: {args.results_csv}, {args.results_jsonl}")
+    print(f"Aggregate results: {aggregate_csv}, {aggregate_jsonl}")
+    print(f"Per-pair results root: {args.results_root}")
