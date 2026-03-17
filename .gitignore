@@ -5,6 +5,9 @@
 results/
 logs/
 
+# Scrpts
+scripts/slurm_run_spec_decode_metrics.slurm
+
 # vllm-flash-attn built from source
 vllm/vllm_flash_attn/*
 !vllm/vllm_flash_attn/__init__.py
