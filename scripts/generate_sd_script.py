@@ -115,6 +115,55 @@ PAIRS: list[PairConfig] = [
         gpu_count=2,
         note="DeepSeek Coder 6.7B draft -> 33B target",
     ),
+    # Qwen3 speculative decoding pairs
+    PairConfig(
+        pair_id="qwen3_0p6b_to_qwen3_4b",
+        draft_model="Qwen/Qwen3-0.6B",
+        target_model="Qwen/Qwen3-4B",
+        tp_size=1,
+        gpu_count=1,
+        note="Qwen3 0.6B draft -> 4B target",
+    ),
+    PairConfig(
+        pair_id="qwen3_0p6b_to_qwen3_8b",
+        draft_model="Qwen/Qwen3-0.6B",
+        target_model="Qwen/Qwen3-8B",
+        tp_size=1,
+        gpu_count=1,
+        note="Qwen3 0.6B draft -> 8B target",
+    ),
+    PairConfig(
+        pair_id="qwen3_0p6b_to_qwen3_30b_a3b",
+        draft_model="Qwen/Qwen3-0.6B",
+        target_model="Qwen/Qwen3-30B-A3B",
+        tp_size=2,
+        gpu_count=2,
+        note="Qwen3 0.6B draft -> 30B-A3B target",
+    ),
+    PairConfig(
+        pair_id="qwen3_4b_to_qwen3_8b",
+        draft_model="Qwen/Qwen3-4B",
+        target_model="Qwen/Qwen3-8B",
+        tp_size=1,
+        gpu_count=1,
+        note="Qwen3 4B draft -> 8B target",
+    ),
+    PairConfig(
+        pair_id="qwen3_4b_to_qwen3_30b_a3b",
+        draft_model="Qwen/Qwen3-4B",
+        target_model="Qwen/Qwen3-30B-A3B",
+        tp_size=2,
+        gpu_count=2,
+        note="Qwen3 4B draft -> 30B-A3B target",
+    ),
+    PairConfig(
+        pair_id="qwen3_8b_to_qwen3_30b_a3b",
+        draft_model="Qwen/Qwen3-8B",
+        target_model="Qwen/Qwen3-30B-A3B",
+        tp_size=2,
+        gpu_count=2,
+        note="Qwen3 8B draft -> 30B-A3B target",
+    ),
 ]
 
 DATASETS: list[DatasetConfig] = [

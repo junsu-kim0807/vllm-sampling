@@ -11,7 +11,7 @@ Each pair directory contains:
   - metrics.csv
   - metrics.jsonl
   - pair_info.json
-  - responses.jsonl (unless --no-responses): one JSON object per prompt (prompt, response, metadata).
+  - responses.jsonl (unless --no-responses): one JSON object per prompt (prompt_index, response, num_output_tokens).
 
 If multiple targets are provided, an aggregate CSV/JSONL is also written under
 results_root using --results-csv / --results-jsonl.
@@ -153,7 +153,7 @@ def parse_args() -> argparse.Namespace:
         "--responses-jsonl",
         type=str,
         default=None,
-        help="Per-line JSON: prompt, response, draft_model, target_model, dataset, batch_size. Default: <pair_dir>/responses.jsonl.",
+        help="Per-line JSON with only: prompt_index, response, num_output_tokens. Default: <pair_dir>/responses.jsonl.",
     )
     p.add_argument(
         "--no-responses",
@@ -390,15 +390,51 @@ def get_dataset_prompts(dataset_key: str, args: argparse.Namespace) -> list[str]
         )
         return prompts
 
+    def _build_longbench_prompt_from_example(ex: dict[str, Any]) -> str:
+        # LongBench JSON schemas vary slightly across forks/packaging.
+        # We prefer instruction-like fields first, then fall back to the
+        # main source text fields.
+        candidate_keys = [
+            "input",
+            "prompt",
+            "question",
+            "query",
+            "instruction",
+            "context",
+            "article",
+            "document",
+            "passage",
+            "text",
+            "source",
+        ]
+        for k in candidate_keys:
+            if k in ex and ex[k] is not None:
+                s = str(ex[k]).strip()
+                if s:
+                    return s
+        return ""
+
     if dataset_key in ("gov_report", "longbench_gov_report"):
         cfg = "gov_report"
         max_samples = args.max_samples_gov_report
         rows = _load_longbench(cfg, max_samples)
-        prompts = [
-            extract_first_present(ex, ["input", "prompt"], default="").strip()
-            for ex in rows
-        ]
+        if not rows:
+            raise RuntimeError(
+                f"LongBench {cfg}: loaded 0 rows. "
+                f"Check LONGBENCH_DATA_DIR or the downloaded data.zip."
+            )
+        prompts = [_build_longbench_prompt_from_example(ex) for ex in rows]
         prompts = [p for p in prompts if p]
+        if not prompts:
+            first = rows[0]
+            keys = list(first.keys())
+            raise RuntimeError(
+                f"LongBench {cfg}: all prompt fields were empty after extraction. "
+                f"First-row keys={keys}. "
+                f"Candidate prompt keys are input/prompt/question/query/instruction/context/article/document/passsage/text/source. "
+                f"Set LONGBENCH_DATA_DIR to the extracted LongBench directory and re-run "
+                f"(or adjust _build_longbench_prompt_from_example for this schema)."
+            )
         print(
             f"[dataset] {dataset_key}: repo={LONGBENCH_REPO}/{cfg}, "
             f"split=test, samples={len(prompts)}"
@@ -409,11 +445,23 @@ def get_dataset_prompts(dataset_key: str, args: argparse.Namespace) -> list[str]
         cfg = "qmsum"
         max_samples = args.max_samples_qmsum
         rows = _load_longbench(cfg, max_samples)
-        prompts = [
-            extract_first_present(ex, ["input", "prompt"], default="").strip()
-            for ex in rows
-        ]
+        if not rows:
+            raise RuntimeError(
+                f"LongBench {cfg}: loaded 0 rows. "
+                f"Check LONGBENCH_DATA_DIR or the downloaded data.zip."
+            )
+        prompts = [_build_longbench_prompt_from_example(ex) for ex in rows]
         prompts = [p for p in prompts if p]
+        if not prompts:
+            first = rows[0]
+            keys = list(first.keys())
+            raise RuntimeError(
+                f"LongBench {cfg}: all prompt fields were empty after extraction. "
+                f"First-row keys={keys}. "
+                f"Candidate prompt keys are input/prompt/question/query/instruction/context/article/document/passsage/text/source. "
+                f"Set LONGBENCH_DATA_DIR to the extracted LongBench directory and re-run "
+                f"(or adjust _build_longbench_prompt_from_example for this schema)."
+            )
         print(
             f"[dataset] {dataset_key}: repo={LONGBENCH_REPO}/{cfg}, "
             f"split=test, samples={len(prompts)}"
@@ -620,22 +668,12 @@ def measure_dataset(
         maybe_cuda_sync()
         total_output_tokens += sum(len(o.outputs[0].token_ids) for o in outputs)
         if collect_responses:
-            src_n = num_prompts_source if num_prompts_source is not None else len(prompts)
-            for local_i, (prompt_text, req_out) in enumerate(
-                zip(prompt_batch, outputs, strict=True)
-            ):
+            for local_i, req_out in enumerate(outputs):
                 comp = req_out.outputs[0]
                 gidx = prompt_offset + local_i
                 response_records.append(
                     {
-                        "draft_model": draft_model,
-                        "target_model": target_model,
-                        "dataset": dataset,
-                        "batch_size": batch_size,
                         "prompt_index": gidx,
-                        "source_row_index": gidx % src_n if src_n else gidx,
-                        "num_prompts_dataset": src_n,
-                        "prompt": prompt_text,
                         "response": comp.text,
                         "num_output_tokens": len(comp.token_ids),
                     }
