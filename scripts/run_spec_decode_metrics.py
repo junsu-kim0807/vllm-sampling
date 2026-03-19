@@ -565,7 +565,8 @@ def chunked(prompts: list[str], batch_size: int):
 def expand_prompts_for_batch(
     prompts: list[str], batch_size: int
 ) -> tuple[list[str], int]:
-    """If len(prompts) < batch_size, tile prompts until len == 2 * batch_size.
+    """If dataset prompt count is smaller than 2 * batch_size, tile prompts
+    until len == 2 * batch_size.
 
     Returns (prompts_to_run, num_prompts_dataset) where num_prompts_dataset is
     the original row count before tiling.
@@ -573,7 +574,7 @@ def expand_prompts_for_batch(
     n = len(prompts)
     if n == 0 or batch_size < 1:
         return list(prompts), n
-    if n >= batch_size:
+    if n >= 2 * batch_size:
         return list(prompts), n
     target = 2 * batch_size
     tiled = [prompts[i % n] for i in range(target)]
