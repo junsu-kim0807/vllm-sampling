@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         type=str,
         default="aime25,codeelo",
-        help="Comma-separated dataset keys. Supported: aime25, codeelo",
+        help="Comma-separated keys: aime25, codeelo, gov_report, qmsum (LongBench).",
     )
     p.add_argument(
         "--batch-sizes",
@@ -96,6 +96,30 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1024,
         help="Max new tokens for CodeElo.",
+    )
+    p.add_argument(
+        "--gov-report-max-new-tokens",
+        type=int,
+        default=512,
+        help="Max new tokens for LongBench gov_report (summarization).",
+    )
+    p.add_argument(
+        "--qmsum-max-new-tokens",
+        type=int,
+        default=512,
+        help="Max new tokens for LongBench qmsum (summarization).",
+    )
+    p.add_argument(
+        "--max-samples-gov-report",
+        type=int,
+        default=None,
+        help="Optional cap for LongBench gov_report.",
+    )
+    p.add_argument(
+        "--max-samples-qmsum",
+        type=int,
+        default=None,
+        help="Optional cap for LongBench qmsum.",
     )
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
@@ -143,6 +167,7 @@ def parse_tp_map(raw: str) -> dict[str, int]:
 
 AIME25_REPO = "opencompass/AIME2025"
 CODEELO_REPO = "Qwen/CodeElo"
+LONGBENCH_REPO = "THUDM/LongBench"
 
 
 def load_dataset_split(repo: str):
@@ -243,6 +268,44 @@ def get_dataset_prompts(dataset_key: str, args: argparse.Namespace) -> list[str]
         )
         return prompts
 
+    if dataset_key in ("gov_report", "longbench_gov_report"):
+        from datasets import load_dataset
+
+        cfg = "gov_report"
+        ds = load_dataset(LONGBENCH_REPO, cfg, split="test")
+        rows = list(ds)
+        if args.max_samples_gov_report is not None:
+            rows = rows[: args.max_samples_gov_report]
+        prompts = [
+            extract_first_present(ex, ["input", "prompt"], default="").strip()
+            for ex in rows
+        ]
+        prompts = [p for p in prompts if p]
+        print(
+            f"[dataset] {dataset_key}: repo={LONGBENCH_REPO}/{cfg}, "
+            f"split=test, samples={len(prompts)}"
+        )
+        return prompts
+
+    if dataset_key in ("qmsum", "longbench_qmsum"):
+        from datasets import load_dataset
+
+        cfg = "qmsum"
+        ds = load_dataset(LONGBENCH_REPO, cfg, split="test")
+        rows = list(ds)
+        if args.max_samples_qmsum is not None:
+            rows = rows[: args.max_samples_qmsum]
+        prompts = [
+            extract_first_present(ex, ["input", "prompt"], default="").strip()
+            for ex in rows
+        ]
+        prompts = [p for p in prompts if p]
+        print(
+            f"[dataset] {dataset_key}: repo={LONGBENCH_REPO}/{cfg}, "
+            f"split=test, samples={len(prompts)}"
+        )
+        return prompts
+
     raise ValueError(f"Unsupported dataset key: {dataset_key}")
 
 
@@ -251,6 +314,10 @@ def get_dataset_max_new_tokens(dataset_key: str, args: argparse.Namespace) -> in
         return args.aime_max_new_tokens
     if dataset_key == "codeelo":
         return args.codeelo_max_new_tokens
+    if dataset_key in ("gov_report", "longbench_gov_report"):
+        return args.gov_report_max_new_tokens
+    if dataset_key in ("qmsum", "longbench_qmsum"):
+        return args.qmsum_max_new_tokens
     raise ValueError(dataset_key)
 
 
