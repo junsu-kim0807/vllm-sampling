@@ -137,6 +137,12 @@ def pair_slug(draft_model: str, target_model: str) -> str:
     return f"{sanitize_for_path(draft_model)}__TO__{sanitize_for_path(target_model)}"
 
 
+def batch_tag(batch_sizes: str) -> str:
+    """e.g. '1,4,8' -> 'b1_4_8' for use in result directory names."""
+    parts = [p.strip() for p in batch_sizes.split(",") if p.strip()]
+    return "b" + "_".join(parts)
+
+
 def shquote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
@@ -238,7 +244,8 @@ def build_python_command(
     test: bool,
     test_samples: int,
 ) -> str:
-    root_for_dataset = RESULTS_ROOT / dataset.name
+    tag = batch_tag(batch_sizes)
+    root_for_dataset = RESULTS_ROOT / dataset.name / tag
     slug = pair_slug(pair.draft_model, pair.target_model)
 
     parts: list[str] = [
@@ -314,13 +321,14 @@ def render_job_script(
     test_samples: int,
 ) -> str:
     slug = pair_slug(pair.draft_model, pair.target_model)
+    tag = batch_tag(batch_sizes)
     suffix = "_test" if test else ""
     job_name = f"spec_{pair.pair_id}_{dataset.name}{suffix}"
 
     pair_subdir = Path("test") / pair.pair_id if test else Path(pair.pair_id)
     job_dir = JOBS_ROOT / pair_subdir
     log_dir = LOGS_ROOT / pair_subdir
-    result_dataset_root = RESULTS_ROOT / dataset.name
+    result_dataset_root = RESULTS_ROOT / dataset.name / tag
     pair_result_dir = result_dataset_root / slug
 
     aggregate_csv = result_dataset_root / f"aggregate__{slug}.csv"

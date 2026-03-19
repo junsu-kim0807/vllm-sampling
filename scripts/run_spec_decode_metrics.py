@@ -11,6 +11,7 @@ Each pair directory contains:
   - metrics.csv
   - metrics.jsonl
   - pair_info.json
+  - responses.jsonl (unless --no-responses): one JSON object per prompt (prompt, response, metadata).
 
 If multiple targets are provided, an aggregate CSV/JSONL is also written under
 results_root using --results-csv / --results-jsonl.
@@ -147,6 +148,17 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="spec_decode_metrics_results.jsonl",
     )
+    p.add_argument(
+        "--responses-jsonl",
+        type=str,
+        default=None,
+        help="Per-line JSON: prompt, response, draft_model, target_model, dataset, batch_size. Default: <pair_dir>/responses.jsonl.",
+    )
+    p.add_argument(
+        "--no-responses",
+        action="store_true",
+        help="Do not write responses JSONL.",
+    )
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
@@ -243,6 +255,58 @@ def build_codeelo_prompt(example: dict[str, Any]) -> str:
     )
 
 
+def _load_longbench(cfg: str, max_samples: int | None) -> list[dict[str, Any]]:
+    """Load a LongBench subset (e.g. gov_report, qmsum). Tries load_dataset with
+    trust_remote_code; if script-based loading is disabled, falls back to
+    loading test.jsonl from the Hub.
+    """
+    from datasets import load_dataset
+
+    try:
+        ds = load_dataset(
+            LONGBENCH_REPO, cfg, split="test", trust_remote_code=True
+        )
+        rows = list(ds)
+    except RuntimeError as e:
+        if "no longer supported" in str(e) or "Dataset scripts" in str(e):
+            try:
+                from huggingface_hub import hf_hub_download
+            except ImportError:
+                raise RuntimeError(
+                    "LongBench script loading is disabled and huggingface_hub "
+                    "is required for fallback. Install: pip install huggingface_hub"
+                ) from e
+            for candidate in (f"data/{cfg}/test.jsonl", f"{cfg}/test.jsonl"):
+                try:
+                    path = hf_hub_download(
+                        repo_id=LONGBENCH_REPO,
+                        filename=candidate,
+                        repo_type="dataset",
+                    )
+                    break
+                except Exception:
+                    continue
+            else:
+                raise RuntimeError(
+                    f"Could not download LongBench {cfg} test.jsonl from Hub. "
+                    "Try: pip install 'datasets<4.0' or download data from "
+                    "https://huggingface.co/datasets/THUDM/LongBench"
+                ) from e
+            rows = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rows.append(json.loads(line))
+        else:
+            raise
+
+    if max_samples is not None:
+        rows = rows[:max_samples]
+    return rows
+
+
 def get_dataset_prompts(dataset_key: str, args: argparse.Namespace) -> list[str]:
     if dataset_key == "aime25":
         ds, split = load_dataset_split(AIME25_REPO)
@@ -269,13 +333,9 @@ def get_dataset_prompts(dataset_key: str, args: argparse.Namespace) -> list[str]
         return prompts
 
     if dataset_key in ("gov_report", "longbench_gov_report"):
-        from datasets import load_dataset
-
         cfg = "gov_report"
-        ds = load_dataset(LONGBENCH_REPO, cfg, split="test")
-        rows = list(ds)
-        if args.max_samples_gov_report is not None:
-            rows = rows[: args.max_samples_gov_report]
+        max_samples = args.max_samples_gov_report
+        rows = _load_longbench(cfg, max_samples)
         prompts = [
             extract_first_present(ex, ["input", "prompt"], default="").strip()
             for ex in rows
@@ -288,13 +348,9 @@ def get_dataset_prompts(dataset_key: str, args: argparse.Namespace) -> list[str]
         return prompts
 
     if dataset_key in ("qmsum", "longbench_qmsum"):
-        from datasets import load_dataset
-
         cfg = "qmsum"
-        ds = load_dataset(LONGBENCH_REPO, cfg, split="test")
-        rows = list(ds)
-        if args.max_samples_qmsum is not None:
-            rows = rows[: args.max_samples_qmsum]
+        max_samples = args.max_samples_qmsum
+        rows = _load_longbench(cfg, max_samples)
         prompts = [
             extract_first_present(ex, ["input", "prompt"], default="").strip()
             for ex in rows
@@ -381,6 +437,24 @@ def chunked(prompts: list[str], batch_size: int):
         yield prompts[i : i + batch_size]
 
 
+def expand_prompts_for_batch(
+    prompts: list[str], batch_size: int
+) -> tuple[list[str], int]:
+    """If len(prompts) < batch_size, tile prompts until len == 2 * batch_size.
+
+    Returns (prompts_to_run, num_prompts_dataset) where num_prompts_dataset is
+    the original row count before tiling.
+    """
+    n = len(prompts)
+    if n == 0 or batch_size < 1:
+        return list(prompts), n
+    if n >= batch_size:
+        return list(prompts), n
+    target = 2 * batch_size
+    tiled = [prompts[i % n] for i in range(target)]
+    return tiled, n
+
+
 def apply_chat_template(tokenizer, prompts: list[str]) -> list[str]:
     out: list[str] = []
     for prompt in prompts:
@@ -454,6 +528,12 @@ def measure_dataset(
     top_k: int,
     profile_time: bool,
     verbose: bool = False,
+    *,
+    draft_model: str = "",
+    target_model: str = "",
+    dataset: str = "",
+    collect_responses: bool = False,
+    num_prompts_source: int | None = None,
 ) -> dict[str, Any]:
     from vllm import SamplingParams
 
@@ -470,6 +550,8 @@ def measure_dataset(
 
     before = snapshot_metrics(llm)
     total_output_tokens = 0
+    response_records: list[dict[str, Any]] = []
+    prompt_offset = 0
 
     maybe_cuda_sync()
     t0 = time.perf_counter()
@@ -479,6 +561,28 @@ def measure_dataset(
         outputs = llm.generate(prompt_batch, sampling_params=sampling_params)
         maybe_cuda_sync()
         total_output_tokens += sum(len(o.outputs[0].token_ids) for o in outputs)
+        if collect_responses:
+            src_n = num_prompts_source if num_prompts_source is not None else len(prompts)
+            for local_i, (prompt_text, req_out) in enumerate(
+                zip(prompt_batch, outputs, strict=True)
+            ):
+                comp = req_out.outputs[0]
+                gidx = prompt_offset + local_i
+                response_records.append(
+                    {
+                        "draft_model": draft_model,
+                        "target_model": target_model,
+                        "dataset": dataset,
+                        "batch_size": batch_size,
+                        "prompt_index": gidx,
+                        "source_row_index": gidx % src_n if src_n else gidx,
+                        "num_prompts_dataset": src_n,
+                        "prompt": prompt_text,
+                        "response": comp.text,
+                        "num_output_tokens": len(comp.token_ids),
+                    }
+                )
+            prompt_offset += len(prompt_batch)
         if verbose:
             print(f"[measure] batch={batch_idx}/{len(batches)} size={len(prompt_batch)}")
 
@@ -551,6 +655,8 @@ def measure_dataset(
         else:
             result["avg_reject_sample_time_s"] = None
 
+    if collect_responses:
+        result["response_records"] = response_records
     return result
 
 
@@ -603,6 +709,16 @@ def save_results(
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     print(f"[save] CSV: {results_csv}, JSONL: {results_jsonl}")
+
+
+def save_responses_jsonl(records: list[dict[str, Any]], path: str) -> None:
+    if not records or not path:
+        return
+    ensure_parent_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"[save] responses JSONL: {path} ({len(records)} lines)")
 
 
 def sanitize_model_name(model_name: str) -> str:
@@ -671,6 +787,15 @@ if __name__ == "__main__":
     print("[args] profile_time =", args.profile_time)
     print("[args] results_root =", args.results_root)
 
+    if args.no_responses:
+        responses_jsonl_path = None
+    elif args.responses_jsonl:
+        responses_jsonl_path = args.responses_jsonl
+    else:
+        responses_jsonl_path = "responses.jsonl"
+    if responses_jsonl_path and not args.no_responses:
+        print("[args] responses_jsonl = (per-pair)", responses_jsonl_path)
+
     missing_tp = [m for m in target_models if m not in tp_map]
     if missing_tp:
         raise ValueError(f"Missing --tp-map for: {missing_tp}")
@@ -713,23 +838,30 @@ if __name__ == "__main__":
         )
         tokenizer = llm.get_tokenizer()
         target_rows: list[dict[str, Any]] = []
+        pair_response_records: list[dict[str, Any]] = []
 
         for dataset_key in dataset_keys:
             prompts = dataset_prompts[dataset_key]
             max_new_tokens = get_dataset_max_new_tokens(dataset_key, args)
 
             for batch_size in batch_sizes:
+                prompts_run, n_dataset = expand_prompts_for_batch(prompts, batch_size)
+                if len(prompts_run) > n_dataset:
+                    print(
+                        f"[dataset] tiled {n_dataset} -> {len(prompts_run)} prompts "
+                        f"(batch_size={batch_size}, need >= 2*batch for small sets)"
+                    )
                 print("-" * 80)
                 print(
                     f"[run] dataset={dataset_key} target={target_model} "
-                    f"batch_size={batch_size} num_prompts={len(prompts)} "
-                    f"max_new_tokens={max_new_tokens}"
+                    f"batch_size={batch_size} num_prompts_dataset={n_dataset} "
+                    f"num_prompts_eval={len(prompts_run)} max_new_tokens={max_new_tokens}"
                 )
 
                 run_warmup(
                     llm=llm,
                     tokenizer=tokenizer,
-                    prompts=prompts,
+                    prompts=prompts_run,
                     batch_size=batch_size,
                     warmup_iters=args.warmup_iters,
                     warmup_max_tokens=args.warmup_max_tokens,
@@ -741,7 +873,7 @@ if __name__ == "__main__":
                 metrics = measure_dataset(
                     llm=llm,
                     tokenizer=tokenizer,
-                    prompts=prompts,
+                    prompts=prompts_run,
                     batch_size=batch_size,
                     max_new_tokens=max_new_tokens,
                     temperature=args.temperature,
@@ -749,7 +881,14 @@ if __name__ == "__main__":
                     top_k=args.top_k,
                     profile_time=args.profile_time,
                     verbose=args.verbose,
+                    draft_model=args.draft_model,
+                    target_model=target_model,
+                    dataset=dataset_key,
+                    collect_responses=bool(responses_jsonl_path and not args.no_responses),
+                    num_prompts_source=n_dataset,
                 )
+                if responses_jsonl_path and metrics.get("response_records"):
+                    pair_response_records.extend(metrics["response_records"])
 
                 row = {
                     "draft_model": args.draft_model,
@@ -758,6 +897,7 @@ if __name__ == "__main__":
                     "dataset": dataset_key,
                     "batch_size": batch_size,
                     "num_speculative_tokens": args.num_spec_tokens,
+                    "num_prompts_dataset": n_dataset,
                     "num_prompts": metrics["num_prompts"],
                     "wall_time_s": metrics["wall_time_s"],
                     "total_output_tokens": metrics["total_output_tokens"],
@@ -828,6 +968,11 @@ if __name__ == "__main__":
             dataset_keys=dataset_keys,
             batch_sizes=batch_sizes,
         )
+        if responses_jsonl_path and pair_response_records:
+            save_responses_jsonl(
+                pair_response_records,
+                os.path.join(pair_dir, responses_jsonl_path),
+            )
         free_llm(llm)
 
     aggregate_csv = (
@@ -845,3 +990,5 @@ if __name__ == "__main__":
     print("=" * 80)
     print(f"Aggregate results: {aggregate_csv}, {aggregate_jsonl}")
     print(f"Per-pair results root: {args.results_root}")
+    if responses_jsonl_path:
+        print("(Per-pair responses: <pair_dir>/responses.jsonl)")
