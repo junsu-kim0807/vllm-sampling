@@ -7,6 +7,8 @@ logs/
 
 # Scrpts
 scripts/slurm_run_spec_decode_metrics.slurm
+scripts/jobs/
+scripts/logs/
 
 # vllm-flash-attn built from source
 vllm/vllm_flash_attn/*
