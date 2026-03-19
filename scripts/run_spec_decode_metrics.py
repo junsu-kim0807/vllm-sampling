@@ -27,6 +27,7 @@ import os
 import random
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 from vllm.v1.metrics.reader import Counter, Gauge, Vector
@@ -258,12 +259,46 @@ def build_codeelo_prompt(example: dict[str, Any]) -> str:
 def _load_longbench(cfg: str, max_samples: int | None) -> list[dict[str, Any]]:
     """Load a LongBench subset (e.g. gov_report, qmsum).
 
-    Newer `datasets` versions may disable loading datasets that rely on
-    remote Python scripts. We first try `load_dataset` normally; if that
-    fails due to script-based loading being disabled, we fall back to
-    downloading `data.zip` from the Hub and reading the matching
-    `<task>/test.jsonl` entry from the zip.
+    - If LONGBENCH_DATA_DIR is set, load from that directory (after running
+      scripts/download_longbench.py).
+    - Else try load_dataset; if that fails (dataset scripts disabled), fall
+      back to data.zip and find any file whose path contains the subset name
+      and ends with test.jsonl / test.json or <cfg>.jsonl / <cfg>.json.
     """
+    # 1) Prefer local dir from download_longbench.py
+    data_dir = os.environ.get("LONGBENCH_DATA_DIR")
+    if data_dir:
+        data_path = Path(data_dir)
+        if data_path.is_dir():
+            # Look for data/<cfg>.jsonl, data/<cfg>/test.jsonl; or LongBench/data/... when zip has that root
+            candidates = [
+                data_path / "data" / f"{cfg}.jsonl",
+                data_path / "data" / f"{cfg}.json",
+                data_path / "data" / cfg / "test.jsonl",
+                data_path / "data" / cfg / "test.json",
+                data_path / "LongBench" / "data" / f"{cfg}.jsonl",
+                data_path / "LongBench" / "data" / f"{cfg}.json",
+                data_path / cfg / "test.jsonl",
+                data_path / cfg / "test.json",
+            ]
+            for path in candidates:
+                if path.is_file():
+                    rows = []
+                    with open(path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            rows.append(json.loads(line))
+                    if max_samples is not None:
+                        rows = rows[:max_samples]
+                    return rows
+            raise FileNotFoundError(
+                f"LONGBENCH_DATA_DIR={data_dir} set but no file found for {cfg}. "
+                f"Tried: {[str(c) for c in candidates]}. "
+                "Run: python scripts/download_longbench.py --out-dir <dir>"
+            )
+
     from datasets import load_dataset
 
     try:
@@ -276,8 +311,9 @@ def _load_longbench(cfg: str, max_samples: int | None) -> list[dict[str, Any]]:
                 from huggingface_hub import hf_hub_download
             except ImportError as ie:
                 raise RuntimeError(
-                    "LongBench script loading is disabled and huggingface_hub is "
-                    "required for fallback. Install: pip install huggingface_hub"
+                    "LongBench script loading is disabled. Either set LONGBENCH_DATA_DIR "
+                    "to a dir created by scripts/download_longbench.py, or install "
+                    "huggingface_hub for fallback: pip install huggingface_hub"
                 ) from ie
 
             zip_path = hf_hub_download(
@@ -288,39 +324,31 @@ def _load_longbench(cfg: str, max_samples: int | None) -> list[dict[str, Any]]:
 
             import zipfile
 
-            rows: list[dict[str, Any]] = []
+            rows = []
             with zipfile.ZipFile(zip_path, "r") as zf:
                 namelist = zf.namelist()
-                candidates = [
-                    f"data/{cfg}/test.jsonl",
-                    f"data/{cfg}/test.json",
-                    f"{cfg}/test.jsonl",
-                    f"{cfg}/test.json",
-                ]
-                picked: str | None = None
-                for c in candidates:
-                    if c in namelist:
-                        picked = c
-                        break
+                # Match any member that looks like this subset's test data
+                def _matches(name: str) -> bool:
+                    if cfg not in name:
+                        return False
+                    lower = name.lower()
+                    if lower.endswith(".jsonl") or lower.endswith(".json"):
+                        # data/gov_report.jsonl, data/gov_report/test.jsonl, data/test_gov_report.jsonl, etc.
+                        return "test" in lower or name.endswith(f"{cfg}.jsonl") or name.endswith(f"{cfg}.json")
+                    return False
 
-                # If exact path guesses don't match, fall back to pattern match.
+                picked = next((n for n in namelist if _matches(n)), None)
                 if picked is None:
-                    for suffix in ("test.jsonl", "test.json"):
-                        matches = [
-                            n
-                            for n in namelist
-                            if n.endswith(suffix) and f"/{cfg}/" in n
-                        ]
-                        if matches:
-                            # Prefer shortest path to reduce ambiguity.
-                            picked = sorted(matches, key=len)[0]
-                            break
-
+                    # Fallback: any path containing cfg and ending in .jsonl
+                    picked = next(
+                        (n for n in namelist if cfg in n and n.endswith(".jsonl")),
+                        None,
+                    )
                 if picked is None:
                     raise RuntimeError(
-                        f"Could not locate LongBench {cfg} test split inside data.zip. "
-                        f"Tried: {candidates}. "
-                        "You may need to download data manually or adjust path patterns."
+                        f"Could not locate LongBench {cfg} inside data.zip. "
+                        "Run: python scripts/download_longbench.py --out-dir DIR "
+                        "then set LONGBENCH_DATA_DIR=DIR"
                     )
 
                 with zf.open(picked, "r") as f:
