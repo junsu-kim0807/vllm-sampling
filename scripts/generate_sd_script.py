@@ -565,15 +565,19 @@ def main() -> None:
                 f"Known: {[d.name for d in DATASETS]}"
             )
 
-        batch_sizes_list = [1, 4, 16, 64, 256]
+        batch_sizes_list = [1, 4, 16, 64, 256, 512, 1024]
 
         def time_limit_for_batch(bs: int) -> str:
-            if bs in (1, 4):
-                return "02:00:00"
-            if bs == 16:
+            if bs == 1:
+                return "05:00:00"
+            if bs == 4:
                 return "04:00:00"
-            if bs in (64, 256):
-                return "10:00:00"
+            if bs == 16:
+                return "03:00:00"
+            if bs == 64:
+                return "02:00:00"
+            if bs in (256, 512, 1024):
+                return "00:30:00"
             raise ValueError(f"Unsupported batch size: {bs}")
 
         # --- model selection ---
@@ -584,11 +588,11 @@ def main() -> None:
         # You may need to adjust these two env overrides to match your HF setup.
         eagle_llama33_speculator = os.environ.get(
             "EAGLE3_LLAMA33_70B_SPECULATOR",
-            "meta-llama/Llama-3.3-70B-Instruct-speculator.eagle3",
+            "RedHatAI/Llama-3.3-70B-Instruct-speculator.eagle3",
         )
         eagle_qwen30b_a3b_speculator = os.environ.get(
             "EAGLE3_QWEN30B_A3B_SPECULATOR",
-            "Qwen/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3",
+            "RedHatAI/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3",
         )
 
         # AR pseudo-pairs
@@ -605,6 +609,14 @@ def main() -> None:
                 pair_id="ar_qwen30b_a3b",
                 draft_model=qwen30b_a3b,
                 target_model=qwen30b_a3b,
+                tp_size=2,
+                gpu_count=2,
+                note="AR only (no speculative decoding)",
+            ),
+            PairConfig(
+                pair_id="ar_deepseekcoder_33b",
+                draft_model="deepseek-ai/deepseek-coder-33b-instruct",
+                target_model="deepseek-ai/deepseek-coder-33b-instruct",
                 tp_size=2,
                 gpu_count=2,
                 note="AR only (no speculative decoding)",
@@ -648,6 +660,44 @@ def main() -> None:
                 )
             else:
                 speculative_pairs.append(pair)
+
+        # Additional Qwen speculative experiments requested by user.
+        speculative_pairs.extend(
+            [
+                PairConfig(
+                    pair_id="qwen25_0p5b_to_qwen3_4b_instruct_2507",
+                    draft_model="Qwen/Qwen2.5-0.5B-Instruct",
+                    target_model="Qwen/Qwen3-4B-Instruct-2507",
+                    tp_size=1,
+                    gpu_count=1,
+                    note="Qwen2.5 0.5B draft -> Qwen3 4B Instruct 2507",
+                ),
+                PairConfig(
+                    pair_id="qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507",
+                    draft_model="Qwen/Qwen2.5-0.5B-Instruct",
+                    target_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+                    tp_size=2,
+                    gpu_count=2,
+                    note="Qwen2.5 0.5B draft -> Qwen3 30B-A3B Instruct 2507",
+                ),
+                PairConfig(
+                    pair_id="qwen3_0p6b_to_qwen3_4b_instruct_2507",
+                    draft_model="Qwen/Qwen3-0.6B",
+                    target_model="Qwen/Qwen3-4B-Instruct-2507",
+                    tp_size=1,
+                    gpu_count=1,
+                    note="Qwen3 0.6B draft -> Qwen3 4B Instruct 2507",
+                ),
+                PairConfig(
+                    pair_id="qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507",
+                    draft_model="Qwen/Qwen3-0.6B",
+                    target_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+                    tp_size=2,
+                    gpu_count=2,
+                    note="Qwen3 0.6B draft -> Qwen3 30B-A3B Instruct 2507",
+                ),
+            ]
+        )
 
         # --- common tuning (prod defaults from existing generator) ---
         test = False
@@ -732,7 +782,7 @@ def main() -> None:
                         bs=bs,
                         method="eagle3",
                         eagle_model=eagle_model,
-                        eagle_draft_tp=pair.tp_size,
+                        eagle_draft_tp=1,
                         time_limit_override=tl,
                     )
 
