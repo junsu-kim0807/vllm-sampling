@@ -42,6 +42,25 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--draft-model", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument(
+        "--method",
+        type=str,
+        default="speculative",
+        choices=["speculative", "ar", "eagle3"],
+        help="Evaluation method: 'ar' (no speculative decoding), 'speculative' (draft_model), 'eagle3' (EAGLE3 drafter).",
+    )
+    p.add_argument(
+        "--eagle-model",
+        type=str,
+        default=None,
+        help="When --method=eagle3: the speculative draft model repo id.",
+    )
+    p.add_argument(
+        "--eagle-draft-tp",
+        type=int,
+        default=None,
+        help="When --method=eagle3: draft_tensor_parallel_size override (default: same as target TP).",
+    )
+    p.add_argument(
         "--target-models",
         type=str,
         default="Qwen/Qwen3-8B,Qwen/Qwen3-30B-A3B",
@@ -906,13 +925,27 @@ if __name__ == "__main__":
 
     for target_model in target_models:
         tp = tp_map[target_model]
-        speculative_config = {
-            "method": "draft_model",
-            "model": args.draft_model,
-            "num_speculative_tokens": args.num_spec_tokens,
-            "max_model_len": args.max_model_len,
-            "enforce_eager": args.enforce_eager,
-        }
+        if args.method == "ar":
+            speculative_config = None
+        elif args.method == "eagle3":
+            if not args.eagle_model:
+                raise SystemExit("--method=eagle3 requires --eagle-model")
+            draft_tp = args.eagle_draft_tp if args.eagle_draft_tp else tp
+            speculative_config = {
+                "method": "eagle3",
+                "model": args.eagle_model,
+                "draft_tensor_parallel_size": draft_tp,
+                "num_speculative_tokens": args.num_spec_tokens,
+            }
+        else:
+            # Speculative decoding with a draft model.
+            speculative_config = {
+                "method": "draft_model",
+                "model": args.draft_model,
+                "num_speculative_tokens": args.num_spec_tokens,
+                "max_model_len": args.max_model_len,
+                "enforce_eager": args.enforce_eager,
+            }
 
         print("=" * 80)
         print(f"[model-pair] draft={args.draft_model} | target={target_model} | tp={tp}")

@@ -4,6 +4,10 @@
 
   python scripts/generate_sd_script.py [--pairs ...] [--datasets ...]
   python scripts/generate_sd_script.py --test [--test-pairs ...] [--test-samples 5]
+  python scripts/generate_sd_script.py --batch --datasets gov_report qmsum
+
+With --batch, it generates AR/speculative decoding/eagle3 jobs for batch sizes
+1/4/16/64/256 with fixed Slurm time limits and writes a submit shell.
 
 LongBench-v1: gov_report, qmsum (THUDM/LongBench). Set HF_TOKEN before submit.
 """
@@ -11,6 +15,7 @@ LongBench-v1: gov_report, qmsum (THUDM/LongBench). Set HF_TOKEN before submit.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import stat
 from dataclasses import dataclass
@@ -292,6 +297,9 @@ def build_python_command(
     *,
     test: bool,
     test_samples: int,
+    method: str = "speculative",
+    eagle_model: str | None = None,
+    eagle_draft_tp: int | None = None,
 ) -> str:
     tag = batch_tag(batch_sizes)
     root_for_dataset = RESULTS_ROOT / dataset.name / tag
@@ -317,7 +325,14 @@ def build_python_command(
         "--profile-time",
         "--trust-remote-code",
         "--enable-chunked-prefill",
+        f"--method {method}",
     ]
+
+    if method == "eagle3":
+        if not eagle_model:
+            raise SystemExit("--method=eagle3 requires --eagle-model from generator")
+        parts.append(f"--eagle-model {shquote(eagle_model)}")
+        parts.append(f"--eagle-draft-tp {eagle_draft_tp if eagle_draft_tp is not None else pair.tp_size}")
 
     if dataset.name == "aime25":
         parts.append(f"--aime-max-new-tokens {dataset.max_new_tokens}")
@@ -368,11 +383,15 @@ def render_job_script(
     *,
     test: bool,
     test_samples: int,
+    method: str = "speculative",
+    eagle_model: str | None = None,
+    eagle_draft_tp: int | None = None,
+    time_limit_override: str | None = None,
 ) -> str:
     slug = pair_slug(pair.draft_model, pair.target_model)
     tag = batch_tag(batch_sizes)
     suffix = "_test" if test else ""
-    job_name = f"spec_{pair.pair_id}_{dataset.name}{suffix}"
+    job_name = f"spec_{pair.pair_id}_{dataset.name}{suffix}_{tag}"
 
     pair_subdir = Path("test") / pair.pair_id if test else Path(pair.pair_id)
     job_dir = JOBS_ROOT / pair_subdir
@@ -383,7 +402,11 @@ def render_job_script(
     aggregate_csv = result_dataset_root / f"aggregate__{slug}.csv"
     aggregate_jsonl = result_dataset_root / f"aggregate__{slug}.jsonl"
 
-    time_limit = time_limit_for_dataset(pair, dataset, test=test)
+    time_limit = (
+        time_limit_override
+        if time_limit_override is not None
+        else time_limit_for_dataset(pair, dataset, test=test)
+    )
 
     header = job_header(
         job_name=job_name,
@@ -406,6 +429,9 @@ def render_job_script(
         verbose=verbose,
         test=test,
         test_samples=test_samples,
+        method=method,
+        eagle_model=eagle_model,
+        eagle_draft_tp=eagle_draft_tp,
     )
 
     body = f"""
@@ -471,6 +497,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datasets", nargs="*", default=[], help="Subset of dataset names")
     parser.add_argument("--pairs", nargs="*", default=[], help="Subset of pair_id values")
     parser.add_argument("--batch-sizes", default="1")
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help=(
+            "Generate AR/speculative decoding/eagle3 jobs for batch sizes "
+            "(1,4,16,64,256) with fixed time limits."
+        ),
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--dtype", default="auto")
@@ -518,6 +552,201 @@ def main() -> None:
     ensure_dirs()
 
     datasets = filter_by_attr(DATASETS, set(args.datasets), "name")
+
+    if args.batch:
+        if args.test:
+            raise SystemExit("Use either --batch or --test (not both).")
+        if not datasets:
+            raise SystemExit(
+                "With --batch: please pass at least one --datasets value. "
+                f"Known: {[d.name for d in DATASETS]}"
+            )
+
+        batch_sizes_list = [1, 4, 16, 64, 256]
+
+        def time_limit_for_batch(bs: int) -> str:
+            if bs in (1, 4):
+                return "02:00:00"
+            if bs == 16:
+                return "04:00:00"
+            if bs in (64, 256):
+                return "10:00:00"
+            raise ValueError(f"Unsupported batch size: {bs}")
+
+        # --- model selection ---
+        llama33_70b = "meta-llama/Llama-3.3-70B-Instruct"
+        llama31_70b_old = "meta-llama/Meta-Llama-3.1-70B-Instruct"
+        qwen30b_a3b = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+        # You may need to adjust these two env overrides to match your HF setup.
+        eagle_llama33_speculator = os.environ.get(
+            "EAGLE3_LLAMA33_70B_SPECULATOR",
+            "meta-llama/Llama-3.3-70B-Instruct-speculator.eagle3",
+        )
+        eagle_qwen30b_a3b_speculator = os.environ.get(
+            "EAGLE3_QWEN30B_A3B_SPECULATOR",
+            "Qwen/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3",
+        )
+
+        # AR pseudo-pairs
+        ar_pairs: list[PairConfig] = [
+            PairConfig(
+                pair_id="ar_llama33_70b",
+                draft_model=llama33_70b,
+                target_model=llama33_70b,
+                tp_size=4,
+                gpu_count=4,
+                note="AR only (no speculative decoding)",
+            ),
+            PairConfig(
+                pair_id="ar_qwen30b_a3b",
+                draft_model=qwen30b_a3b,
+                target_model=qwen30b_a3b,
+                tp_size=2,
+                gpu_count=2,
+                note="AR only (no speculative decoding)",
+            ),
+        ]
+
+        # EAGLE3 pseudo-pairs
+        eagle_pairs: list[PairConfig] = [
+            PairConfig(
+                pair_id="eagle3_llama33_70b",
+                draft_model=llama33_70b,
+                target_model=llama33_70b,
+                tp_size=4,
+                gpu_count=4,
+                note="EAGLE3 (eagle3 method)",
+            ),
+            PairConfig(
+                pair_id="eagle3_qwen30b_a3b",
+                draft_model=qwen30b_a3b,
+                target_model=qwen30b_a3b,
+                tp_size=2,
+                gpu_count=2,
+                note="EAGLE3 (eagle3 method)",
+            ),
+        ]
+
+        # Speculative decoding pairs, but swap 70B target to Llama 3.3.
+        speculative_pairs: list[PairConfig] = []
+        for pair in PAIRS:
+            if pair.target_model == llama31_70b_old:
+                new_pair_id = pair.pair_id.replace("llama31_70b", "llama33_70b")
+                speculative_pairs.append(
+                    PairConfig(
+                        pair_id=new_pair_id,
+                        draft_model=pair.draft_model,
+                        target_model=llama33_70b,
+                        tp_size=4,
+                        gpu_count=4,
+                        note=pair.note,
+                    )
+                )
+            else:
+                speculative_pairs.append(pair)
+
+        # --- common tuning (prod defaults from existing generator) ---
+        test = False
+        test_samples = 5
+        warmup_iters = args.warmup_iters
+        warmup_max_tokens = args.warmup_max_tokens
+        num_spec = 7
+        max_model_len = args.max_model_len
+
+        written_scripts: list[Path] = []
+        num_written = 0
+
+        def _write_one(
+            *,
+            pair: PairConfig,
+            dataset: DatasetConfig,
+            bs: int,
+            method: str,
+            eagle_model: str | None,
+            eagle_draft_tp: int | None = None,
+            time_limit_override: str,
+        ) -> None:
+            batch_sizes_str = str(bs)
+            script_path = JOBS_ROOT / pair.pair_id / f"{dataset.name}_b{bs}.slurm"
+            script_text = render_job_script(
+                pair=pair,
+                dataset=dataset,
+                batch_sizes=batch_sizes_str,
+                gpu_mem_util=args.gpu_memory_utilization,
+                max_model_len=max_model_len,
+                dtype=args.dtype,
+                seed=args.seed,
+                warmup_iters=warmup_iters,
+                warmup_max_tokens=warmup_max_tokens,
+                num_spec_tokens=num_spec,
+                verbose=args.verbose,
+                test=test,
+                test_samples=test_samples,
+                method=method,
+                eagle_model=eagle_model,
+                eagle_draft_tp=eagle_draft_tp,
+                time_limit_override=time_limit_override,
+            )
+            write_job_script(script_path, script_text)
+            written_scripts.append(script_path)
+
+        for bs in batch_sizes_list:
+            tl = time_limit_for_batch(bs)
+            for dataset in datasets:
+                # AR
+                for pair in ar_pairs:
+                    _write_one(
+                        pair=pair,
+                        dataset=dataset,
+                        bs=bs,
+                        method="ar",
+                        eagle_model=None,
+                        time_limit_override=tl,
+                    )
+
+                # Speculative decoding (draft_model)
+                for pair in speculative_pairs:
+                    _write_one(
+                        pair=pair,
+                        dataset=dataset,
+                        bs=bs,
+                        method="speculative",
+                        eagle_model=None,
+                        time_limit_override=tl,
+                    )
+
+                # Eagle3
+                for pair in eagle_pairs:
+                    eagle_model = (
+                        eagle_llama33_speculator
+                        if pair.target_model == llama33_70b
+                        else eagle_qwen30b_a3b_speculator
+                    )
+                    _write_one(
+                        pair=pair,
+                        dataset=dataset,
+                        bs=bs,
+                        method="eagle3",
+                        eagle_model=eagle_model,
+                        eagle_draft_tp=pair.tp_size,
+                        time_limit_override=tl,
+                    )
+
+        num_written = len(written_scripts)
+        print(f"[batch] Generated {num_written} job scripts.")
+
+        submit_path = REPO_ROOT / "scripts" / "submit_spec_decode_batch_scaling.sh"
+        with open(submit_path, "w", encoding="utf-8") as f:
+            f.write("#!/usr/bin/env bash\n")
+            f.write("set -euo pipefail\n\n")
+            f.write(f'REPO_DIR="{REPO_ROOT}"\n\n')
+            for sp in written_scripts:
+                f.write(f'echo "sbatch {sp}"\n')
+                f.write(f"sbatch {sp}\n")
+        submit_path.chmod(submit_path.stat().st_mode | stat.S_IXUSR)
+        print(f"[batch] Submit script: {submit_path}")
+        return
 
     if args.test:
         pair_ids = set(args.test_pairs) if args.test_pairs else set(DEFAULT_TEST_PAIR_IDS)
