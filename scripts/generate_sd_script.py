@@ -302,7 +302,8 @@ def build_python_command(
     eagle_draft_tp: int | None = None,
 ) -> str:
     tag = batch_tag(batch_sizes)
-    root_for_dataset = RESULTS_ROOT / dataset.name / tag
+    # results/spec_decode/<method>/<tag>/<dataset>/
+    root_for_dataset = RESULTS_ROOT / method / tag / dataset.name
     slug = pair_slug(pair.draft_model, pair.target_model)
 
     parts: list[str] = [
@@ -396,7 +397,9 @@ def render_job_script(
     pair_subdir = Path("test") / pair.pair_id if test else Path(pair.pair_id)
     job_dir = JOBS_ROOT / pair_subdir
     log_dir = LOGS_ROOT / pair_subdir
-    result_dataset_root = RESULTS_ROOT / dataset.name / tag
+    # Keep job script and run_spec_decode_metrics aligned:
+    # results/spec_decode/<method>/<tag>/<dataset>/
+    result_dataset_root = RESULTS_ROOT / method / tag / dataset.name
     pair_result_dir = result_dataset_root / slug
 
     aggregate_csv = result_dataset_root / f"aggregate__{slug}.csv"
