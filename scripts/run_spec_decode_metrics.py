@@ -256,49 +256,79 @@ def build_codeelo_prompt(example: dict[str, Any]) -> str:
 
 
 def _load_longbench(cfg: str, max_samples: int | None) -> list[dict[str, Any]]:
-    """Load a LongBench subset (e.g. gov_report, qmsum). Tries load_dataset with
-    trust_remote_code; if script-based loading is disabled, falls back to
-    loading test.jsonl from the Hub.
+    """Load a LongBench subset (e.g. gov_report, qmsum).
+
+    Newer `datasets` versions may disable loading datasets that rely on
+    remote Python scripts. We first try `load_dataset` normally; if that
+    fails due to script-based loading being disabled, we fall back to
+    downloading `data.zip` from the Hub and reading the matching
+    `<task>/test.jsonl` entry from the zip.
     """
     from datasets import load_dataset
 
     try:
-        ds = load_dataset(
-            LONGBENCH_REPO, cfg, split="test", trust_remote_code=True
-        )
+        ds = load_dataset(LONGBENCH_REPO, cfg, split="test")
         rows = list(ds)
     except RuntimeError as e:
-        if "no longer supported" in str(e) or "Dataset scripts" in str(e):
+        msg = str(e)
+        if "no longer supported" in msg or "Dataset scripts" in msg:
             try:
                 from huggingface_hub import hf_hub_download
-            except ImportError:
+            except ImportError as ie:
                 raise RuntimeError(
-                    "LongBench script loading is disabled and huggingface_hub "
-                    "is required for fallback. Install: pip install huggingface_hub"
-                ) from e
-            for candidate in (f"data/{cfg}/test.jsonl", f"{cfg}/test.jsonl"):
-                try:
-                    path = hf_hub_download(
-                        repo_id=LONGBENCH_REPO,
-                        filename=candidate,
-                        repo_type="dataset",
+                    "LongBench script loading is disabled and huggingface_hub is "
+                    "required for fallback. Install: pip install huggingface_hub"
+                ) from ie
+
+            zip_path = hf_hub_download(
+                repo_id=LONGBENCH_REPO,
+                filename="data.zip",
+                repo_type="dataset",
+            )
+
+            import zipfile
+
+            rows: list[dict[str, Any]] = []
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                namelist = zf.namelist()
+                candidates = [
+                    f"data/{cfg}/test.jsonl",
+                    f"data/{cfg}/test.json",
+                    f"{cfg}/test.jsonl",
+                    f"{cfg}/test.json",
+                ]
+                picked: str | None = None
+                for c in candidates:
+                    if c in namelist:
+                        picked = c
+                        break
+
+                # If exact path guesses don't match, fall back to pattern match.
+                if picked is None:
+                    for suffix in ("test.jsonl", "test.json"):
+                        matches = [
+                            n
+                            for n in namelist
+                            if n.endswith(suffix) and f"/{cfg}/" in n
+                        ]
+                        if matches:
+                            # Prefer shortest path to reduce ambiguity.
+                            picked = sorted(matches, key=len)[0]
+                            break
+
+                if picked is None:
+                    raise RuntimeError(
+                        f"Could not locate LongBench {cfg} test split inside data.zip. "
+                        f"Tried: {candidates}. "
+                        "You may need to download data manually or adjust path patterns."
                     )
-                    break
-                except Exception:
-                    continue
-            else:
-                raise RuntimeError(
-                    f"Could not download LongBench {cfg} test.jsonl from Hub. "
-                    "Try: pip install 'datasets<4.0' or download data from "
-                    "https://huggingface.co/datasets/THUDM/LongBench"
-                ) from e
-            rows = []
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    rows.append(json.loads(line))
+
+                with zf.open(picked, "r") as f:
+                    for raw in f:
+                        line = raw.decode("utf-8").strip()
+                        if not line:
+                            continue
+                        rows.append(json.loads(line))
         else:
             raise
 
