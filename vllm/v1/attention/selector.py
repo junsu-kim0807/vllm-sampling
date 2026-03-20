@@ -161,7 +161,7 @@ def _cached_get_attn_backend(
                 bs,
             )
         else:
-            from vllm.v1.attention.magicdec_streaming_attention import (
+            from vllm.v1.attention.magicdec_streaming_attention_opt import (
                 create_magicdec_streaming_attention_backend,
             )
 
