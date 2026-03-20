@@ -249,126 +249,126 @@ def build_chain_pairs(
 
 
 PAIRS: list[PairConfig] = [
-    make_pair_config(
-        "llama32_1b",
-        "llama32_3b",
-        pair_id="llama32_1b_to_llama32_3b",
-        tp_size=1,
-        gpu_count=1,
-        note="Llama small->small",
-    ),
-    make_pair_config(
-        "llama32_1b",
-        "llama31_8b",
-        pair_id="llama32_1b_to_llama31_8b",
-        tp_size=1,
-        gpu_count=1,
-        note="Llama 1B draft -> 8B target",
-    ),
-    make_pair_config(
-        "llama32_1b",
-        "llama33_70b",
-        pair_id="llama32_1b_to_llama33_70b",
-        tp_size=4,
-        gpu_count=4,
-        note="Llama 1B draft -> 70B target",
-    ),
-    make_pair_config(
-        "llama32_3b",
-        "llama31_8b",
-        pair_id="llama32_3b_to_llama31_8b",
-        tp_size=1,
-        gpu_count=1,
-        note="Llama 3B draft -> 8B target",
-    ),
-    make_pair_config(
-        "llama32_3b",
-        "llama33_70b",
-        pair_id="llama32_3b_to_llama33_70b",
-        tp_size=4,
-        gpu_count=4,
-        note="Llama 3B draft -> 70B target",
-    ),
-    make_pair_config(
-        "llama31_8b",
-        "llama33_70b",
-        pair_id="llama31_8b_to_llama31_70b",
-        tp_size=4,
-        gpu_count=4,
-        note="Llama 8B draft -> 70B target",
-    ),
-    make_pair_config(
-        "deepseekcoder_1p3b",
-        "deepseekcoder_6p7b",
-        pair_id="deepseekcoder_1p3b_to_6p7b",
-        tp_size=1,
-        gpu_count=1,
-        note="DeepSeek Coder 1.3B draft -> 6.7B target",
-    ),
-    make_pair_config(
-        "deepseekcoder_1p3b",
-        "deepseekcoder_33b",
-        pair_id="deepseekcoder_1p3b_to_33b",
-        tp_size=4,
-        gpu_count=4,
-        note="DeepSeek Coder 1.3B draft -> 33B target",
-    ),
-    make_pair_config(
-        "deepseekcoder_6p7b",
-        "deepseekcoder_33b",
-        pair_id="deepseekcoder_6p7b_to_33b",
-        tp_size=4,
-        gpu_count=4,
-        note="DeepSeek Coder 6.7B draft -> 33B target",
-    ),
-    make_pair_config(
-        "qwen3_0p6b",
-        "qwen3_4b",
-        pair_id="qwen3_0p6b_to_qwen3_4b",
-        tp_size=1,
-        gpu_count=1,
-        note="Qwen3 0.6B draft -> 4B target",
-    ),
-    make_pair_config(
-        "qwen3_0p6b",
-        "qwen3_8b",
-        pair_id="qwen3_0p6b_to_qwen3_8b",
-        tp_size=1,
-        gpu_count=1,
-        note="Qwen3 0.6B draft -> 8B target",
-    ),
-    make_pair_config(
-        "qwen3_0p6b",
-        "qwen3_30b_a3b",
-        pair_id="qwen3_0p6b_to_qwen3_30b_a3b",
-        tp_size=4,
-        gpu_count=4,
-        note="Qwen3 0.6B draft -> 30B-A3B target",
-    ),
-    make_pair_config(
-        "qwen3_4b",
-        "qwen3_8b",
-        pair_id="qwen3_4b_to_qwen3_8b",
-        tp_size=1,
-        gpu_count=1,
-        note="Qwen3 4B draft -> 8B target",
-    ),
-    make_pair_config(
-        "qwen3_4b",
-        "qwen3_30b_a3b",
-        pair_id="qwen3_4b_to_qwen3_30b_a3b",
-        tp_size=4,
-        gpu_count=4,
-        note="Qwen3 4B draft -> 30B-A3B target",
-    ),
-    make_pair_config(
-        "qwen3_8b",
-        "qwen3_30b_a3b",
-        pair_id="qwen3_8b_to_qwen3_30b_a3b",
-        tp_size=4,
-        gpu_count=4,
-        note="Qwen3 8B draft -> 30B-A3B target",
-    ),
+    # make_pair_config(
+    #     "llama32_1b",
+    #     "llama32_3b",
+    #     pair_id="llama32_1b_to_llama32_3b",
+    #     tp_size=1,
+    #     gpu_count=1,
+    #     note="Llama small->small",
+    # ),
+    # make_pair_config(
+    #     "llama32_1b",
+    #     "llama31_8b",
+    #     pair_id="llama32_1b_to_llama31_8b",
+    #     tp_size=1,
+    #     gpu_count=1,
+    #     note="Llama 1B draft -> 8B target",
+    # ),
+    # make_pair_config(
+    #     "llama32_1b",
+    #     "llama33_70b",
+    #     pair_id="llama32_1b_to_llama33_70b",
+    #     tp_size=4,
+    #     gpu_count=4,
+    #     note="Llama 1B draft -> 70B target",
+    # ),
+    # make_pair_config(
+    #     "llama32_3b",
+    #     "llama31_8b",
+    #     pair_id="llama32_3b_to_llama31_8b",
+    #     tp_size=1,
+    #     gpu_count=1,
+    #     note="Llama 3B draft -> 8B target",
+    # ),
+    # make_pair_config(
+    #     "llama32_3b",
+    #     "llama33_70b",
+    #     pair_id="llama32_3b_to_llama33_70b",
+    #     tp_size=4,
+    #     gpu_count=4,
+    #     note="Llama 3B draft -> 70B target",
+    # ),
+    # make_pair_config(
+    #     "llama31_8b",
+    #     "llama33_70b",
+    #     pair_id="llama31_8b_to_llama31_70b",
+    #     tp_size=4,
+    #     gpu_count=4,
+    #     note="Llama 8B draft -> 70B target",
+    # ),
+    # make_pair_config(
+    #     "deepseekcoder_1p3b",
+    #     "deepseekcoder_6p7b",
+    #     pair_id="deepseekcoder_1p3b_to_6p7b",
+    #     tp_size=1,
+    #     gpu_count=1,
+    #     note="DeepSeek Coder 1.3B draft -> 6.7B target",
+    # ),
+    # make_pair_config(
+    #     "deepseekcoder_1p3b",
+    #     "deepseekcoder_33b",
+    #     pair_id="deepseekcoder_1p3b_to_33b",
+    #     tp_size=4,
+    #     gpu_count=4,
+    #     note="DeepSeek Coder 1.3B draft -> 33B target",
+    # ),
+    # make_pair_config(
+    #     "deepseekcoder_6p7b",
+    #     "deepseekcoder_33b",
+    #     pair_id="deepseekcoder_6p7b_to_33b",
+    #     tp_size=4,
+    #     gpu_count=4,
+    #     note="DeepSeek Coder 6.7B draft -> 33B target",
+    # ),
+    # make_pair_config(
+    #     "qwen3_0p6b",
+    #     "qwen3_4b",
+    #     pair_id="qwen3_0p6b_to_qwen3_4b",
+    #     tp_size=1,
+    #     gpu_count=1,
+    #     note="Qwen3 0.6B draft -> 4B target",
+    # ),
+    # make_pair_config(
+    #     "qwen3_0p6b",
+    #     "qwen3_8b",
+    #     pair_id="qwen3_0p6b_to_qwen3_8b",
+    #     tp_size=1,
+    #     gpu_count=1,
+    #     note="Qwen3 0.6B draft -> 8B target",
+    # ),
+    # make_pair_config(
+    #     "qwen3_0p6b",
+    #     "qwen3_30b_a3b",
+    #     pair_id="qwen3_0p6b_to_qwen3_30b_a3b",
+    #     tp_size=4,
+    #     gpu_count=4,
+    #     note="Qwen3 0.6B draft -> 30B-A3B target",
+    # ),
+    # make_pair_config(
+    #     "qwen3_4b",
+    #     "qwen3_8b",
+    #     pair_id="qwen3_4b_to_qwen3_8b",
+    #     tp_size=1,
+    #     gpu_count=1,
+    #     note="Qwen3 4B draft -> 8B target",
+    # ),
+    # make_pair_config(
+    #     "qwen3_4b",
+    #     "qwen3_30b_a3b",
+    #     pair_id="qwen3_4b_to_qwen3_30b_a3b",
+    #     tp_size=4,
+    #     gpu_count=4,
+    #     note="Qwen3 4B draft -> 30B-A3B target",
+    # ),
+    # make_pair_config(
+    #     "qwen3_8b",
+    #     "qwen3_30b_a3b",
+    #     pair_id="qwen3_8b_to_qwen3_30b_a3b",
+    #     tp_size=4,
+    #     gpu_count=4,
+    #     note="Qwen3 8B draft -> 30B-A3B target",
+    # ),
 ]
 
 DATASETS: list[DatasetConfig] = [
@@ -943,14 +943,14 @@ def main() -> None:
         )
 
         ar_pairs: list[PairConfig] = [
-            PairConfig(
-                pair_id="ar_llama33_70b",
-                draft_model=llama33_70b,
-                target_model=llama33_70b,
-                tp_size=4,
-                gpu_count=4,
-                note="AR only (no speculative decoding)",
-            ),
+            # PairConfig(
+            #     pair_id="ar_llama33_70b",
+            #     draft_model=llama33_70b,
+            #     target_model=llama33_70b,
+            #     tp_size=4,
+            #     gpu_count=4,
+            #     note="AR only (no speculative decoding)",
+            # ),
             PairConfig(
                 pair_id="ar_qwen30b_a3b",
                 draft_model=qwen30b_a3b,
@@ -959,25 +959,25 @@ def main() -> None:
                 gpu_count=4,
                 note="AR only (no speculative decoding)",
             ),
-            PairConfig(
-                pair_id="ar_deepseekcoder_33b",
-                draft_model="deepseek-ai/deepseek-coder-33b-instruct",
-                target_model="deepseek-ai/deepseek-coder-33b-instruct",
-                tp_size=4,
-                gpu_count=4,
-                note="AR only (no speculative decoding)",
-            ),
+            # PairConfig(
+            #     pair_id="ar_deepseekcoder_33b",
+            #     draft_model="deepseek-ai/deepseek-coder-33b-instruct",
+            #     target_model="deepseek-ai/deepseek-coder-33b-instruct",
+            #     tp_size=4,
+            #     gpu_count=4,
+            #     note="AR only (no speculative decoding)",
+            # ),
         ]
 
         eagle_pairs: list[PairConfig] = [
-            PairConfig(
-                pair_id="eagle3_llama33_70b",
-                draft_model=llama33_70b,
-                target_model=llama33_70b,
-                tp_size=4,
-                gpu_count=4,
-                note="EAGLE3 (eagle3 method)",
-            ),
+            # PairConfig(
+            #     pair_id="eagle3_llama33_70b",
+            #     draft_model=llama33_70b,
+            #     target_model=llama33_70b,
+            #     tp_size=4,
+            #     gpu_count=4,
+            #     note="EAGLE3 (eagle3 method)",
+            # ),
             PairConfig(
                 pair_id="eagle3_qwen30b_a3b",
                 draft_model=qwen30b_a3b,
@@ -1005,39 +1005,75 @@ def main() -> None:
                 speculative_pairs.append(pair)
 
         speculative_pairs.extend(
-            [
-                PairConfig(
-                    pair_id="qwen25_0p5b_to_qwen3_4b_instruct_2507",
-                    draft_model="Qwen/Qwen2.5-0.5B-Instruct",
-                    target_model="Qwen/Qwen3-4B-Instruct-2507",
-                    tp_size=1,
-                    gpu_count=1,
-                    note="Qwen2.5 0.5B draft -> Qwen3 4B Instruct 2507",
+            [   
+                make_pair_config(
+                    "qwen25_0p5b_instruct",
+                    "qwen3_30b_a3b",
+                    pair_id="qwen25_0p5b_to_qwen3_30b_a3b",
+                    tp_size=4,
+                    gpu_count=4,
+                    note="Qwen2.5 0.5B draft -> 30B-A3B target",
                 ),
-                PairConfig(
-                    pair_id="qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507",
-                    draft_model="Qwen/Qwen2.5-0.5B-Instruct",
-                    target_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
-                    tp_size=2,
-                    gpu_count=2,
-                    note="Qwen2.5 0.5B draft -> Qwen3 30B-A3B Instruct 2507",
+
+                make_pair_config(
+                    "qwen3_4b_instruct_2507",
+                    "qwen3_30b_a3b",
+                    pair_id="qwen3_4b-instruct_to_qwen3_30b_a3b",
+                    tp_size=4,
+                    gpu_count=4,
+                    note="Qwen3 4B-Inst draft -> 30B-A3B target",
                 ),
-                PairConfig(
-                    pair_id="qwen3_0p6b_to_qwen3_4b_instruct_2507",
-                    draft_model="Qwen/Qwen3-0.6B",
-                    target_model="Qwen/Qwen3-4B-Instruct-2507",
-                    tp_size=1,
-                    gpu_count=1,
-                    note="Qwen3 0.6B draft -> Qwen3 4B Instruct 2507",
+                
+                make_pair_config(
+                    "qwen3_0p6b",
+                    "qwen3_30b_a3b",
+                    pair_id="qwen3_0p6b_to_qwen3_30b_a3b",
+                    tp_size=4,
+                    gpu_count=4,
+                    note="Qwen3 0.6B draft -> 30B-A3B target",
                 ),
-                PairConfig(
-                    pair_id="qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507",
-                    draft_model="Qwen/Qwen3-0.6B",
-                    target_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
-                    tp_size=2,
-                    gpu_count=2,
-                    note="Qwen3 0.6B draft -> Qwen3 30B-A3B Instruct 2507",
+
+                make_pair_config(
+                    "qwen3_4b",
+                    "qwen3_30b_a3b",
+                    pair_id="qwen3_4b_to_qwen3_30b_a3b",
+                    tp_size=4,
+                    gpu_count=4,
+                    note="Qwen3 4B draft -> 30B-A3B target",
                 ),
+
+                # PairConfig(
+                #     pair_id="qwen25_0p5b_to_qwen3_4b_instruct_2507",
+                #     draft_model="Qwen/Qwen2.5-0.5B-Instruct",
+                #     target_model="Qwen/Qwen3-4B-Instruct-2507",
+                #     tp_size=1,
+                #     gpu_count=1,
+                #     note="Qwen2.5 0.5B draft -> Qwen3 4B Instruct 2507",
+                # ),
+                # PairConfig(
+                #     pair_id="qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507",
+                #     draft_model="Qwen/Qwen2.5-0.5B-Instruct",
+                #     target_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+                #     tp_size=2,
+                #     gpu_count=2,
+                #     note="Qwen2.5 0.5B draft -> Qwen3 30B-A3B Instruct 2507",
+                # ),
+                # PairConfig(
+                #     pair_id="qwen3_0p6b_to_qwen3_4b_instruct_2507",
+                #     draft_model="Qwen/Qwen3-0.6B",
+                #     target_model="Qwen/Qwen3-4B-Instruct-2507",
+                #     tp_size=1,
+                #     gpu_count=1,
+                #     note="Qwen3 0.6B draft -> Qwen3 4B Instruct 2507",
+                # ),
+                # PairConfig(
+                #     pair_id="qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507",
+                #     draft_model="Qwen/Qwen3-0.6B",
+                #     target_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+                #     tp_size=4,
+                #     gpu_count=4,
+                #     note="Qwen3 0.6B draft -> Qwen3 30B-A3B Instruct 2507",
+                # ),
             ]
         )
 
@@ -1108,44 +1144,44 @@ def main() -> None:
                         time_limit_override=tl,
                     )
 
-                for pair in speculative_pairs:
+                # for pair in speculative_pairs:
+                #     _write_one(
+                #         pair=pair,
+                #         dataset=dataset,
+                #         bs=bs,
+                #         method="magicdec",
+                #         eagle_model=None,
+                #         magicdec_method=args.magicdec_method,
+                #         magicdec_kv_budget=args.magicdec_kv_budget,
+                #         time_limit_override=tl,
+                #     )
+
+                # Enable these if you want AR and EAGLE3 jobs as well.
+                for pair in ar_pairs:
                     _write_one(
                         pair=pair,
                         dataset=dataset,
                         bs=bs,
-                        method="magicdec",
+                        method="ar",
                         eagle_model=None,
-                        magicdec_method=args.magicdec_method,
-                        magicdec_kv_budget=args.magicdec_kv_budget,
                         time_limit_override=tl,
                     )
 
-                # Enable these if you want AR and EAGLE3 jobs as well.
-                # for pair in ar_pairs:
-                #     _write_one(
-                #         pair=pair,
-                #         dataset=dataset,
-                #         bs=bs,
-                #         method="ar",
-                #         eagle_model=None,
-                #         time_limit_override=tl,
-                #     )
-
-                # for pair in eagle_pairs:
-                #     eagle_model = (
-                #         eagle_llama33_speculator
-                #         if pair.target_model == llama33_70b
-                #         else eagle_qwen30b_a3b_speculator
-                #     )
-                #     _write_one(
-                #         pair=pair,
-                #         dataset=dataset,
-                #         bs=bs,
-                #         method="eagle3",
-                #         eagle_model=eagle_model,
-                #         eagle_draft_tp=1,
-                #         time_limit_override=tl,
-                #     )
+                for pair in eagle_pairs:
+                    eagle_model = (
+                        eagle_llama33_speculator
+                        if pair.target_model == llama33_70b
+                        else eagle_qwen30b_a3b_speculator
+                    )
+                    _write_one(
+                        pair=pair,
+                        dataset=dataset,
+                        bs=bs,
+                        method="eagle3",
+                        eagle_model=eagle_model,
+                        eagle_draft_tp=1,
+                        time_limit_override=tl,
+                    )
 
         num_written = len(written_scripts)
         print(f"[batch] Generated {num_written} job scripts.")
