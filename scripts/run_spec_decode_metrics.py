@@ -299,9 +299,10 @@ def _load_longbench(cfg: str, max_samples: int | None) -> list[dict[str, Any]]:
 
     - If LONGBENCH_DATA_DIR is set, load from that directory (after running
       scripts/download_longbench.py).
-    - Else try load_dataset; if that fails (dataset scripts disabled), fall
-      back to data.zip and find any file whose path contains the subset name
-      and ends with test.jsonl / test.json or <cfg>.jsonl / <cfg>.json.
+    - Else try load_dataset; if that fails (dataset scripts disabled, or
+      partial local cache e.g. only another config like musique), fall back to
+      Hub data.zip and find any file whose path contains the subset name and
+      ends with test.jsonl / test.json or <cfg>.jsonl / <cfg>.json.
     """
     # 1) Prefer local dir from download_longbench.py
     data_dir = os.environ.get("LONGBENCH_DATA_DIR")
@@ -339,64 +340,78 @@ def _load_longbench(cfg: str, max_samples: int | None) -> list[dict[str, Any]]:
 
     from datasets import load_dataset
 
+    def _longbench_zip_fallback() -> list[dict[str, Any]]:
+        """Load subset from Hub data.zip (avoids broken/partial datasets cache)."""
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as ie:
+            raise RuntimeError(
+                "LongBench could not be loaded from cache. Either set LONGBENCH_DATA_DIR "
+                "to a dir created by scripts/download_longbench.py, or install "
+                "huggingface_hub for data.zip fallback: pip install huggingface_hub"
+            ) from ie
+
+        zip_path = hf_hub_download(
+            repo_id=LONGBENCH_REPO,
+            filename="data.zip",
+            repo_type="dataset",
+        )
+
+        import zipfile
+
+        out: list[dict[str, Any]] = []
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            namelist = zf.namelist()
+
+            def _matches(name: str) -> bool:
+                if cfg not in name:
+                    return False
+                lower = name.lower()
+                if lower.endswith(".jsonl") or lower.endswith(".json"):
+                    return (
+                        "test" in lower
+                        or name.endswith(f"{cfg}.jsonl")
+                        or name.endswith(f"{cfg}.json")
+                    )
+                return False
+
+            picked = next((n for n in namelist if _matches(n)), None)
+            if picked is None:
+                picked = next(
+                    (n for n in namelist if cfg in n and n.endswith(".jsonl")),
+                    None,
+                )
+            if picked is None:
+                raise RuntimeError(
+                    f"Could not locate LongBench {cfg} inside data.zip. "
+                    "Run: python scripts/download_longbench.py --out-dir DIR "
+                    "then set LONGBENCH_DATA_DIR=DIR"
+                )
+
+            with zf.open(picked, "r") as f:
+                for raw in f:
+                    line = raw.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    out.append(json.loads(line))
+        return out
+
     try:
         ds = load_dataset(LONGBENCH_REPO, cfg, split="test")
         rows = list(ds)
-    except RuntimeError as e:
+    except (RuntimeError, ValueError) as e:
         msg = str(e)
-        if "no longer supported" in msg or "Dataset scripts" in msg:
-            try:
-                from huggingface_hub import hf_hub_download
-            except ImportError as ie:
-                raise RuntimeError(
-                    "LongBench script loading is disabled. Either set LONGBENCH_DATA_DIR "
-                    "to a dir created by scripts/download_longbench.py, or install "
-                    "huggingface_hub for fallback: pip install huggingface_hub"
-                ) from ie
-
-            zip_path = hf_hub_download(
-                repo_id=LONGBENCH_REPO,
-                filename="data.zip",
-                repo_type="dataset",
-            )
-
-            import zipfile
-
-            rows = []
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                namelist = zf.namelist()
-                # Match any member that looks like this subset's test data
-                def _matches(name: str) -> bool:
-                    if cfg not in name:
-                        return False
-                    lower = name.lower()
-                    if lower.endswith(".jsonl") or lower.endswith(".json"):
-                        # data/gov_report.jsonl, data/gov_report/test.jsonl, data/test_gov_report.jsonl, etc.
-                        return "test" in lower or name.endswith(f"{cfg}.jsonl") or name.endswith(f"{cfg}.json")
-                    return False
-
-                picked = next((n for n in namelist if _matches(n)), None)
-                if picked is None:
-                    # Fallback: any path containing cfg and ending in .jsonl
-                    picked = next(
-                        (n for n in namelist if cfg in n and n.endswith(".jsonl")),
-                        None,
-                    )
-                if picked is None:
-                    raise RuntimeError(
-                        f"Could not locate LongBench {cfg} inside data.zip. "
-                        "Run: python scripts/download_longbench.py --out-dir DIR "
-                        "then set LONGBENCH_DATA_DIR=DIR"
-                    )
-
-                with zf.open(picked, "r") as f:
-                    for raw in f:
-                        line = raw.decode("utf-8").strip()
-                        if not line:
-                            continue
-                        rows.append(json.loads(line))
-        else:
+        # HF datasets: script disabled; or local cache only has other configs (e.g. musique)
+        # and raises ValueError "Couldn't find cache ... for config 'qmsum'".
+        use_zip_fallback = (
+            "no longer supported" in msg
+            or "Dataset scripts" in msg
+            or "Couldn't find cache" in msg
+            or "Available configs in the cache" in msg
+        )
+        if not use_zip_fallback:
             raise
+        rows = _longbench_zip_fallback()
 
     if max_samples is not None:
         rows = rows[:max_samples]
