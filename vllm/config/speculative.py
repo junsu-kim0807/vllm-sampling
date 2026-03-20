@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 # - "block_random": block-level compression without KV memory copy
 #   (only block_table/seq_lens subsampling).
 HierarchicalVerificationCompressMethod = Literal["random", "block_random"]
+MagicDecMethod = Literal["streaming"]
 
 from pydantic import Field, SkipValidation, model_validator
 from typing_extensions import Self
@@ -190,6 +191,15 @@ class SpeculativeConfig:
     """When hierarchical_verification is True, use full KV cache every this
     many steps; otherwise use partial (compressed) KV cache. Must be >= 1."""
 
+    # MagicDec: optional draft-only attention metadata rewrite (see
+    # vllm/v1/attention/magicdec_streaming_attention.py).
+    magicdec: bool = False
+    """If True, apply MagicDec draft-side attention behavior when supported."""
+    magicdec_method: MagicDecMethod = "streaming"
+    """Draft attention rewrite strategy. Currently only \"streaming\" is supported."""
+    magicdec_kv_budget: int = Field(default=256, ge=1)
+    """Token budget for visible KV in streaming mode (sink + recent), block-aligned."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -213,6 +223,11 @@ class SpeculativeConfig:
             factors.append(self.compress_method)
             factors.append(self.compression_ratio)
             factors.append(self.full_verification_interval)
+
+        factors.append(self.magicdec)
+        if self.magicdec:
+            factors.append(self.magicdec_method)
+            factors.append(self.magicdec_kv_budget)
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
@@ -815,6 +830,17 @@ class SpeculativeConfig:
                 f" models. Got {self.target_model_config.hf_text_config.model_type=}"
             )
         self.verify_equal_vocab_size_if_draft_model()
+        if self.magicdec:
+            if not self.uses_draft_model():
+                raise ValueError(
+                    "magicdec is only supported with speculative method "
+                    "'draft_model' (draft-model proposer)."
+                )
+            if self.magicdec_method != "streaming":
+                raise ValueError(
+                    f"Unsupported magicdec_method={self.magicdec_method!r}; "
+                    "only 'streaming' is implemented."
+                )
         return self
 
     def verify_equal_vocab_size_if_draft_model(self):

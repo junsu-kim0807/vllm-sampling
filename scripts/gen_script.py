@@ -2,12 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Generate Slurm jobs under scripts/jobs/spec_decode/ for run_spec_decode_metrics.
 
+Examples:
   python scripts/generate_sd_script.py [--pairs ...] [--datasets ...]
   python scripts/generate_sd_script.py --test [--test-pairs ...] [--test-samples 5]
   python scripts/generate_sd_script.py --batch --datasets gov_report qmsum
+  python scripts/generate_sd_script.py --draft --datasets codeelo
+  python scripts/generate_sd_script.py --verify --datasets aime25
 
-With --batch, it generates AR/speculative decoding/eagle3 jobs for batch sizes
-1/4/16/64/256 with fixed Slurm time limits and writes a submit shell.
+Modes:
+  default  : generate regular jobs from PAIRS
+  --test   : smoke test jobs
+  --batch  : vary batch size
+  --draft  : vary num_spec_tokens while varying draft model, fixed target
+  --verify : vary num_spec_tokens while varying target model along an ordered model chain
 
 LongBench-v1: gov_report, qmsum (THUDM/LongBench). Set HF_TOKEN before submit.
 """
@@ -20,6 +27,7 @@ import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 JOBS_ROOT = REPO_ROOT / "scripts" / "jobs" / "spec_decode"
@@ -47,128 +55,320 @@ class DatasetConfig:
     max_new_tokens: int
 
 
-PAIRS: list[PairConfig] = [
-    # PairConfig(
-    #     pair_id="llama32_1b_to_llama32_3b",
-    #     draft_model="meta-llama/Llama-3.2-1B-Instruct",
-    #     target_model="meta-llama/Llama-3.2-3B-Instruct",
-    #     tp_size=1,
-    #     gpu_count=1,
-    #     note="Llama small->small",
-    # ),
-    # PairConfig(
-    #     pair_id="llama32_1b_to_llama31_8b",
-    #     draft_model="meta-llama/Llama-3.2-1B-Instruct",
-    #     target_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
-    #     tp_size=1,
-    #     gpu_count=1,
-    #     note="Llama 1B draft -> 8B target",
-    # ),
-    PairConfig(
-        pair_id="llama32_1b_to_llama31_70b",
-        draft_model="meta-llama/Llama-3.2-1B-Instruct",
-        target_model="meta-llama/Meta-Llama-3.1-70B-Instruct",
-        tp_size=2,
-        gpu_count=2,
-        note="Llama 1B draft -> 70B target",
+@dataclass(frozen=True)
+class ModelSpec:
+    key: str
+    model_name: str
+    tp_size: int
+    gpu_count: int
+    note: str = ""
+
+
+MODEL_SPECS: dict[str, ModelSpec] = {
+    "llama32_1b": ModelSpec(
+        key="llama32_1b",
+        model_name="meta-llama/Llama-3.2-1B-Instruct",
+        tp_size=1,
+        gpu_count=1,
+        note="Llama 3.2 1B",
     ),
-    # PairConfig(
-    #     pair_id="llama32_3b_to_llama31_8b",
-    #     draft_model="meta-llama/Llama-3.2-3B-Instruct",
-    #     target_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
-    #     tp_size=1,
-    #     gpu_count=1,
-    #     note="Llama 3B draft -> 8B target",
-    # ),
-    PairConfig(
-        pair_id="llama32_3b_to_llama31_70b",
-        draft_model="meta-llama/Llama-3.2-3B-Instruct",
-        target_model="meta-llama/Meta-Llama-3.1-70B-Instruct",
-        tp_size=2,
-        gpu_count=2,
-        note="Llama 3B draft -> 70B target",
+    "llama32_3b": ModelSpec(
+        key="llama32_3b",
+        model_name="meta-llama/Llama-3.2-3B-Instruct",
+        tp_size=1,
+        gpu_count=1,
+        note="Llama 3.2 3B",
     ),
-    # PairConfig(
-    #     pair_id="llama31_8b_to_llama31_70b",
-    #     draft_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
-    #     target_model="meta-llama/Meta-Llama-3.1-70B-Instruct",
-    #     tp_size=4,
-    #     gpu_count=4,
-    #     note="Llama 8B draft -> 70B target",
-    # ),
-    # PairConfig(
-    #     pair_id="deepseekcoder_1p3b_to_6p7b",
-    #     draft_model="deepseek-ai/deepseek-coder-1.3b-instruct",
-    #     target_model="deepseek-ai/deepseek-coder-6.7b-instruct",
-    #     tp_size=1,
-    #     gpu_count=1,
-    #     note="DeepSeek Coder 1.3B draft -> 6.7B target",
-    # ),
-    PairConfig(
-        pair_id="deepseekcoder_1p3b_to_33b",
-        draft_model="deepseek-ai/deepseek-coder-1.3b-instruct",
-        target_model="deepseek-ai/deepseek-coder-33b-instruct",
-        tp_size=2,
-        gpu_count=2,
-        note="DeepSeek Coder 1.3B draft -> 33B target",
+    "llama31_8b": ModelSpec(
+        key="llama31_8b",
+        model_name="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        tp_size=1,
+        gpu_count=1,
+        note="Llama 3.1 8B",
     ),
-    PairConfig(
-        pair_id="deepseekcoder_6p7b_to_33b",
-        draft_model="deepseek-ai/deepseek-coder-6.7b-instruct",
-        target_model="deepseek-ai/deepseek-coder-33b-instruct",
-        tp_size=2,
-        gpu_count=2,
-        note="DeepSeek Coder 6.7B draft -> 33B target",
+    "llama31_70b": ModelSpec(
+        key="llama31_70b",
+        model_name="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tp_size=4,
+        gpu_count=4,
+        note="Llama 3.1 70B",
     ),
-    # Qwen3 speculative decoding pairs
-    # PairConfig(
-    #     pair_id="qwen3_0p6b_to_qwen3_4b",
-    #     draft_model="Qwen/Qwen3-0.6B",
-    #     target_model="Qwen/Qwen3-4B",
-    #     tp_size=1,
-    #     gpu_count=1,
-    #     note="Qwen3 0.6B draft -> 4B target",
-    # ),
-    # PairConfig(
-    #     pair_id="qwen3_0p6b_to_qwen3_8b",
-    #     draft_model="Qwen/Qwen3-0.6B",
-    #     target_model="Qwen/Qwen3-8B",
-    #     tp_size=1,
-    #     gpu_count=1,
-    #     note="Qwen3 0.6B draft -> 8B target",
-    # ),
-    PairConfig(
-        pair_id="qwen3_0p6b_to_qwen3_30b_a3b",
-        draft_model="Qwen/Qwen3-0.6B",
-        target_model="Qwen/Qwen3-30B-A3B",
-        tp_size=2,
-        gpu_count=2,
-        note="Qwen3 0.6B draft -> 30B-A3B target",
+    "llama33_70b": ModelSpec(
+        key="llama33_70b",
+        model_name="meta-llama/Llama-3.3-70B-Instruct",
+        tp_size=4,
+        gpu_count=4,
+        note="Llama 3.3 70B",
     ),
-    # PairConfig(
-    #     pair_id="qwen3_4b_to_qwen3_8b",
-    #     draft_model="Qwen/Qwen3-4B",
-    #     target_model="Qwen/Qwen3-8B",
-    #     tp_size=1,
-    #     gpu_count=1,
-    #     note="Qwen3 4B draft -> 8B target",
-    # ),
-    PairConfig(
-        pair_id="qwen3_4b_to_qwen3_30b_a3b",
-        draft_model="Qwen/Qwen3-4B",
-        target_model="Qwen/Qwen3-30B-A3B",
-        tp_size=2,
-        gpu_count=2,
-        note="Qwen3 4B draft -> 30B-A3B target",
+    "deepseekcoder_1p3b": ModelSpec(
+        key="deepseekcoder_1p3b",
+        model_name="deepseek-ai/deepseek-coder-1.3b-instruct",
+        tp_size=1,
+        gpu_count=1,
+        note="DeepSeek Coder 1.3B",
     ),
-    # PairConfig(
-    #     pair_id="qwen3_8b_to_qwen3_30b_a3b",
-    #     draft_model="Qwen/Qwen3-8B",
-    #     target_model="Qwen/Qwen3-30B-A3B",
+    "deepseekcoder_6p7b": ModelSpec(
+        key="deepseekcoder_6p7b",
+        model_name="deepseek-ai/deepseek-coder-6.7b-instruct",
+        tp_size=1,
+        gpu_count=1,
+        note="DeepSeek Coder 6.7B",
+    ),
+    "deepseekcoder_33b": ModelSpec(
+        key="deepseekcoder_33b",
+        model_name="deepseek-ai/deepseek-coder-33b-instruct",
+        tp_size=4,
+        gpu_count=4,
+        note="DeepSeek Coder 33B",
+    ),
+    "qwen3_0p6b": ModelSpec(
+        key="qwen3_0p6b",
+        model_name="Qwen/Qwen3-0.6B",
+        tp_size=1,
+        gpu_count=1,
+        note="Qwen3 0.6B",
+    ),
+    "qwen3_4b": ModelSpec(
+        key="qwen3_4b",
+        model_name="Qwen/Qwen3-4B",
+        tp_size=1,
+        gpu_count=1,
+        note="Qwen3 4B",
+    ),
+    "qwen3_8b": ModelSpec(
+        key="qwen3_8b",
+        model_name="Qwen/Qwen3-8B",
+        tp_size=1,
+        gpu_count=1,
+        note="Qwen3 8B",
+    ),
+    # "qwen3_30b_a3b": ModelSpec(
+    #     key="qwen3_30b_a3b",
+    #     model_name="Qwen/Qwen3-30B-A3B",
     #     tp_size=2,
     #     gpu_count=2,
-    #     note="Qwen3 8B draft -> 30B-A3B target",
+    #     note="Qwen3 30B-A3B",
     # ),
+    "qwen3_30b_a3b": ModelSpec(
+        key="qwen3_30b_a3b_instruct_2507",
+        model_name="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        tp_size=4,
+        gpu_count=4,
+        note="Qwen3 30B-A3B Instruct 2507",
+    ),
+    "qwen25_0p5b_instruct": ModelSpec(
+        key="qwen25_0p5b_instruct",
+        model_name="Qwen/Qwen2.5-0.5B-Instruct",
+        tp_size=1,
+        gpu_count=1,
+        note="Qwen2.5 0.5B Instruct",
+    ),
+    "qwen3_4b_instruct_2507": ModelSpec(
+        key="qwen3_4b_instruct_2507",
+        model_name="Qwen/Qwen3-4B-Instruct-2507",
+        tp_size=1,
+        gpu_count=1,
+        note="Qwen3 4B Instruct 2507",
+    ),
+    "qwen3_30b_a3b_instruct_2507": ModelSpec(
+        key="qwen3_30b_a3b_instruct_2507",
+        model_name="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        tp_size=4,
+        gpu_count=4,
+        note="Qwen3 30B-A3B Instruct 2507",
+    ),
+}
+
+
+def make_pair_config(
+    draft_key: str,
+    target_key: str,
+    *,
+    pair_id: str | None = None,
+    tp_size: int | None = None,
+    gpu_count: int | None = None,
+    note: str = "",
+) -> PairConfig:
+    draft = MODEL_SPECS[draft_key]
+    target = MODEL_SPECS[target_key]
+    return PairConfig(
+        pair_id=pair_id or f"{draft.key}_to_{target.key}",
+        draft_model=draft.model_name,
+        target_model=target.model_name,
+        tp_size=tp_size if tp_size is not None else target.tp_size,
+        gpu_count=gpu_count if gpu_count is not None else target.gpu_count,
+        note=note or f"{draft.note} draft -> {target.note} target",
+    )
+
+
+def build_pairs_from_keys(
+    draft_keys: list[str],
+    target_keys: list[str],
+    *,
+    exclude_same: bool = False,
+    note_prefix: str = "",
+) -> list[PairConfig]:
+    pairs: list[PairConfig] = []
+    for draft_key in draft_keys:
+        for target_key in target_keys:
+            if exclude_same and draft_key == target_key:
+                continue
+            pairs.append(
+                make_pair_config(
+                    draft_key=draft_key,
+                    target_key=target_key,
+                    note=f"{note_prefix}{draft_key} -> {target_key}",
+                )
+            )
+    return pairs
+
+
+def build_chain_pairs(
+    model_keys: list[str],
+    *,
+    note_prefix: str = "",
+) -> list[PairConfig]:
+    """Ordered chain -> all forward pairs.
+
+    Example:
+      [1B, 3B, 8B, 70B]
+    becomes:
+      1B->3B, 1B->8B, 1B->70B, 3B->8B, 3B->70B, 8B->70B
+    """
+    pairs: list[PairConfig] = []
+    for i, draft_key in enumerate(model_keys):
+        for target_key in model_keys[i + 1 :]:
+            pairs.append(
+                make_pair_config(
+                    draft_key=draft_key,
+                    target_key=target_key,
+                    note=f"{note_prefix}{draft_key} -> {target_key}",
+                )
+            )
+    return pairs
+
+
+PAIRS: list[PairConfig] = [
+    make_pair_config(
+        "llama32_1b",
+        "llama32_3b",
+        pair_id="llama32_1b_to_llama32_3b",
+        tp_size=1,
+        gpu_count=1,
+        note="Llama small->small",
+    ),
+    make_pair_config(
+        "llama32_1b",
+        "llama31_8b",
+        pair_id="llama32_1b_to_llama31_8b",
+        tp_size=1,
+        gpu_count=1,
+        note="Llama 1B draft -> 8B target",
+    ),
+    make_pair_config(
+        "llama32_1b",
+        "llama33_70b",
+        pair_id="llama32_1b_to_llama33_70b",
+        tp_size=4,
+        gpu_count=4,
+        note="Llama 1B draft -> 70B target",
+    ),
+    make_pair_config(
+        "llama32_3b",
+        "llama31_8b",
+        pair_id="llama32_3b_to_llama31_8b",
+        tp_size=1,
+        gpu_count=1,
+        note="Llama 3B draft -> 8B target",
+    ),
+    make_pair_config(
+        "llama32_3b",
+        "llama33_70b",
+        pair_id="llama32_3b_to_llama33_70b",
+        tp_size=4,
+        gpu_count=4,
+        note="Llama 3B draft -> 70B target",
+    ),
+    make_pair_config(
+        "llama31_8b",
+        "llama33_70b",
+        pair_id="llama31_8b_to_llama31_70b",
+        tp_size=4,
+        gpu_count=4,
+        note="Llama 8B draft -> 70B target",
+    ),
+    make_pair_config(
+        "deepseekcoder_1p3b",
+        "deepseekcoder_6p7b",
+        pair_id="deepseekcoder_1p3b_to_6p7b",
+        tp_size=1,
+        gpu_count=1,
+        note="DeepSeek Coder 1.3B draft -> 6.7B target",
+    ),
+    make_pair_config(
+        "deepseekcoder_1p3b",
+        "deepseekcoder_33b",
+        pair_id="deepseekcoder_1p3b_to_33b",
+        tp_size=4,
+        gpu_count=4,
+        note="DeepSeek Coder 1.3B draft -> 33B target",
+    ),
+    make_pair_config(
+        "deepseekcoder_6p7b",
+        "deepseekcoder_33b",
+        pair_id="deepseekcoder_6p7b_to_33b",
+        tp_size=4,
+        gpu_count=4,
+        note="DeepSeek Coder 6.7B draft -> 33B target",
+    ),
+    make_pair_config(
+        "qwen3_0p6b",
+        "qwen3_4b",
+        pair_id="qwen3_0p6b_to_qwen3_4b",
+        tp_size=1,
+        gpu_count=1,
+        note="Qwen3 0.6B draft -> 4B target",
+    ),
+    make_pair_config(
+        "qwen3_0p6b",
+        "qwen3_8b",
+        pair_id="qwen3_0p6b_to_qwen3_8b",
+        tp_size=1,
+        gpu_count=1,
+        note="Qwen3 0.6B draft -> 8B target",
+    ),
+    make_pair_config(
+        "qwen3_0p6b",
+        "qwen3_30b_a3b",
+        pair_id="qwen3_0p6b_to_qwen3_30b_a3b",
+        tp_size=4,
+        gpu_count=4,
+        note="Qwen3 0.6B draft -> 30B-A3B target",
+    ),
+    make_pair_config(
+        "qwen3_4b",
+        "qwen3_8b",
+        pair_id="qwen3_4b_to_qwen3_8b",
+        tp_size=1,
+        gpu_count=1,
+        note="Qwen3 4B draft -> 8B target",
+    ),
+    make_pair_config(
+        "qwen3_4b",
+        "qwen3_30b_a3b",
+        pair_id="qwen3_4b_to_qwen3_30b_a3b",
+        tp_size=4,
+        gpu_count=4,
+        note="Qwen3 4B draft -> 30B-A3B target",
+    ),
+    make_pair_config(
+        "qwen3_8b",
+        "qwen3_30b_a3b",
+        pair_id="qwen3_8b_to_qwen3_30b_a3b",
+        tp_size=4,
+        gpu_count=4,
+        note="Qwen3 8B draft -> 30B-A3B target",
+    ),
 ]
 
 DATASETS: list[DatasetConfig] = [
@@ -179,6 +379,19 @@ DATASETS: list[DatasetConfig] = [
 ]
 
 DEFAULT_TEST_PAIR_IDS = frozenset({"llama32_1b_to_llama31_8b"})
+
+DEFAULT_DRAFT_SWEEP_SPEC_TOKENS = [3, 5, 9, 11]
+#DEFAULT_VERIFY_SWEEP_SPEC_TOKENS = [3, 5, 9, 11]
+DEFAULT_VERIFY_SWEEP_SPEC_TOKENS = [7]
+DEFAULT_DRAFT_SWEEP_DRAFT_KEYS = ["llama32_1b", "llama32_3b", "llama31_8b"]
+DEFAULT_DRAFT_SWEEP_TARGET_KEYS = ["llama33_70b"]
+
+DEFAULT_VERIFY_SWEEP_MODEL_CHAIN = [
+    "llama32_1b",
+    "llama32_3b",
+    "llama31_8b",
+    "llama33_70b",
+]
 
 
 def sanitize_for_path(s: str) -> str:
@@ -192,9 +405,12 @@ def pair_slug(draft_model: str, target_model: str) -> str:
 
 
 def batch_tag(batch_sizes: str) -> str:
-    """e.g. '1,4,8' -> 'b1_4_8' for use in result directory names."""
     parts = [p.strip() for p in batch_sizes.split(",") if p.strip()]
     return "b" + "_".join(parts)
+
+
+def spec_token_tag(num_spec_tokens: int) -> str:
+    return f"k{num_spec_tokens}"
 
 
 def shquote(value: str) -> str:
@@ -272,7 +488,6 @@ cd "${{REPO_DIR}}"
 source "${{VENV_DIR}}/bin/activate"
 unset PYTHONPATH PYTHONHOME
 export PYTHONNOUSERSITE=1
-# export HF_TOKEN before sbatch if models are gated
 export HF_TOKEN="${{HF_TOKEN:-}}"
 export VLLM_WORKER_MULTIPROC_METHOD="${{VLLM_WORKER_MULTIPROC_METHOD:-spawn}}"
 export HF_HOME="${{HF_HOME:-/home/jhwoo36/scratch/.cache}}"
@@ -300,10 +515,13 @@ def build_python_command(
     method: str = "speculative",
     eagle_model: str | None = None,
     eagle_draft_tp: int | None = None,
+    magicdec_method: str = "streaming",
+    magicdec_kv_budget: int = 256,
+    results_subdir: Path | None = None,
 ) -> str:
     tag = batch_tag(batch_sizes)
-    # results/spec_decode/<method>/<tag>/<dataset>/
-    root_for_dataset = RESULTS_ROOT / method / tag / dataset.name
+    base_root = RESULTS_ROOT / method / tag / dataset.name
+    root_for_dataset = base_root / results_subdir if results_subdir is not None else base_root
     slug = pair_slug(pair.draft_model, pair.target_model)
 
     parts: list[str] = [
@@ -333,7 +551,12 @@ def build_python_command(
         if not eagle_model:
             raise SystemExit("--method=eagle3 requires --eagle-model from generator")
         parts.append(f"--eagle-model {shquote(eagle_model)}")
-        parts.append(f"--eagle-draft-tp {eagle_draft_tp if eagle_draft_tp is not None else pair.tp_size}")
+        parts.append(
+            f"--eagle-draft-tp {eagle_draft_tp if eagle_draft_tp is not None else pair.tp_size}"
+        )
+    elif method == "magicdec":
+        parts.append(f"--magicdec-method {shquote(magicdec_method)}")
+        parts.append(f"--magicdec-kv-budget {magicdec_kv_budget}")
 
     if dataset.name == "aime25":
         parts.append(f"--aime-max-new-tokens {dataset.max_new_tokens}")
@@ -387,21 +610,32 @@ def render_job_script(
     method: str = "speculative",
     eagle_model: str | None = None,
     eagle_draft_tp: int | None = None,
+    magicdec_method: str = "streaming",
+    magicdec_kv_budget: int = 256,
     time_limit_override: str | None = None,
+    jobs_subdir: Path | None = None,
+    results_subdir: Path | None = None,
+    job_name_suffix: str = "",
 ) -> str:
     slug = pair_slug(pair.draft_model, pair.target_model)
     tag = batch_tag(batch_sizes)
     suffix = "_test" if test else ""
+    suffix += job_name_suffix
     job_name = f"spec_{pair.pair_id}_{dataset.name}{suffix}_{tag}"
 
-    pair_subdir = Path("test") / pair.pair_id if test else Path(pair.pair_id)
+    if jobs_subdir is not None:
+        pair_subdir = jobs_subdir
+    else:
+        pair_subdir = Path("test") / tag / pair.pair_id if test else Path(tag) / pair.pair_id
+
     job_dir = JOBS_ROOT / pair_subdir
     log_dir = LOGS_ROOT / pair_subdir
-    # Keep job script and run_spec_decode_metrics aligned:
-    # results/spec_decode/<method>/<tag>/<dataset>/
-    result_dataset_root = RESULTS_ROOT / method / tag / dataset.name
-    pair_result_dir = result_dataset_root / slug
 
+    result_dataset_root = RESULTS_ROOT / method / tag / dataset.name
+    if results_subdir is not None:
+        result_dataset_root = result_dataset_root / results_subdir
+
+    pair_result_dir = result_dataset_root / slug
     aggregate_csv = result_dataset_root / f"aggregate__{slug}.csv"
     aggregate_jsonl = result_dataset_root / f"aggregate__{slug}.jsonl"
 
@@ -435,6 +669,9 @@ def render_job_script(
         method=method,
         eagle_model=eagle_model,
         eagle_draft_tp=eagle_draft_tp,
+        magicdec_method=magicdec_method,
+        magicdec_kv_budget=magicdec_kv_budget,
+        results_subdir=results_subdir,
     )
 
     body = f"""
@@ -442,13 +679,15 @@ DATASET_NAME={shquote(dataset.name)}
 PAIR_ID={shquote(pair.pair_id)}
 PAIR_SLUG={shquote(slug)}
 TEST_MODE={shquote(str(test))}
+NUM_SPEC_TOKENS={num_spec_tokens}
 
+JOB_DIR={shquote(str(job_dir))}
 RESULT_DATASET_ROOT={shquote(str(result_dataset_root))}
 PAIR_RESULT_DIR={shquote(str(pair_result_dir))}
 AGGREGATE_CSV={shquote(str(aggregate_csv))}
 AGGREGATE_JSONL={shquote(str(aggregate_jsonl))}
 
-mkdir -p "${{RESULT_DATASET_ROOT}}" "${{PAIR_RESULT_DIR}}"
+mkdir -p "${{JOB_DIR}}" "${{RESULT_DATASET_ROOT}}" "${{PAIR_RESULT_DIR}}"
 
 echo "============================================================"
 echo "DATASET: ${{DATASET_NAME}}"
@@ -457,7 +696,9 @@ echo "TEST_MODE: ${{TEST_MODE}}"
 echo "DRAFT_MODEL: {pair.draft_model}"
 echo "TARGET_MODEL: {pair.target_model}"
 echo "TP_SIZE: {pair.tp_size}"
+echo "NUM_SPEC_TOKENS: ${{NUM_SPEC_TOKENS}}"
 echo "TIME_LIMIT: {time_limit}"
+echo "JOB_DIR: ${{JOB_DIR}}"
 echo "RESULT_DATASET_ROOT: ${{RESULT_DATASET_ROOT}}"
 echo "PAIR_RESULT_DIR: ${{PAIR_RESULT_DIR}}"
 echo "PWD: $(pwd)"
@@ -495,31 +736,99 @@ def filter_by_attr(items: list, wanted: set[str], attr: str) -> list:
     return out
 
 
+def parse_int_csv(value: str) -> list[int]:
+    out: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(int(part))
+    if not out:
+        raise argparse.ArgumentTypeError("Expected at least one integer.")
+    return out
+
+
+def parse_str_csv(value: str) -> list[str]:
+    out = [x.strip() for x in value.split(",") if x.strip()]
+    if not out:
+        raise argparse.ArgumentTypeError("Expected at least one value.")
+    return out
+
+
+def validate_model_keys(keys: list[str], *, arg_name: str) -> None:
+    unknown = [k for k in keys if k not in MODEL_SPECS]
+    if unknown:
+        known = ", ".join(sorted(MODEL_SPECS))
+        raise SystemExit(f"{arg_name}: unknown model keys {unknown}. Known: {known}")
+
+
+def add_submit_script(submit_path: Path, scripts: list[Path]) -> None:
+    with open(submit_path, "w", encoding="utf-8") as f:
+        f.write("#!/usr/bin/env bash\n")
+        f.write("set -euo pipefail\n\n")
+        f.write(f'REPO_DIR="{REPO_ROOT}"\n\n')
+        for sp in scripts:
+            f.write(f'echo "sbatch {sp}"\n')
+            f.write(f"sbatch {sp}\n")
+    submit_path.chmod(submit_path.stat().st_mode | stat.S_IXUSR)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--datasets", nargs="*", default=[], help="Subset of dataset names")
     parser.add_argument("--pairs", nargs="*", default=[], help="Subset of pair_id values")
     parser.add_argument("--batch-sizes", default="1")
+
     parser.add_argument(
         "--batch",
         action="store_true",
         help=(
-            "Generate AR/speculative decoding/eagle3 jobs for batch sizes "
-            "(1,4,16,64,256) with fixed time limits."
+            "Generate speculative decoding jobs for batch sizes "
+            "(1,4,16,64,256,512) with fixed time limits."
         ),
     )
+    parser.add_argument(
+        "--draft",
+        action="store_true",
+        help=(
+            "Generate num_spec_tokens sweep jobs while varying draft model "
+            "and keeping target fixed."
+        ),
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "Generate num_spec_tokens sweep jobs while varying target model "
+            "along an ordered model chain."
+        ),
+    )
+
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--warmup-iters", type=int, default=2)
-    parser.add_argument("--warmup-max-tokens", type=int, default=32)
+    parser.add_argument("--warmup-iters", type=int, default=10)
+    parser.add_argument("--warmup-max-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--magicdec-method",
+        default="streaming",
+        choices=["streaming"],
+        help="MagicDec method to pass when method=magicdec (default: streaming).",
+    )
+    parser.add_argument(
+        "--magicdec-kv-budget",
+        type=int,
+        default=256,
+        help="MagicDec KV budget tokens when method=magicdec (default: 256).",
+    )
     parser.add_argument("--verbose", action="store_true")
+
     parser.add_argument(
         "--test",
         action="store_true",
         help=(
-            "Write smoke-test jobs under jobs/spec_decode/test/<pair_id>/. "
+            "Write smoke-test jobs under jobs/spec_decode/test/<batch_tag>/<pair_id>/. "
             "Default pairs: llama32_1b_to_llama31_8b. Caps samples per dataset, "
             "shorter time, num_spec_tokens=3, warmup 1."
         ),
@@ -547,6 +856,42 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="With --test: override --max-model-len (default: same as --max-model-len).",
     )
+
+    parser.add_argument(
+        "--draft-num-spec-tokens",
+        type=parse_int_csv,
+        default=DEFAULT_DRAFT_SWEEP_SPEC_TOKENS,
+        help="Comma-separated num_spec_tokens for --draft (default: 3,5,9,11).",
+    )
+    parser.add_argument(
+        "--verify-num-spec-tokens",
+        type=parse_int_csv,
+        default=DEFAULT_VERIFY_SWEEP_SPEC_TOKENS,
+        help="Comma-separated num_spec_tokens for --verify (default: 3,5,9,11).",
+    )
+
+    parser.add_argument(
+        "--draft-draft-keys",
+        type=parse_str_csv,
+        default=DEFAULT_DRAFT_SWEEP_DRAFT_KEYS,
+        help="Comma-separated draft model keys for --draft.",
+    )
+    parser.add_argument(
+        "--draft-target-keys",
+        type=parse_str_csv,
+        default=DEFAULT_DRAFT_SWEEP_TARGET_KEYS,
+        help="Comma-separated target model keys for --draft.",
+    )
+    parser.add_argument(
+        "--verify-model-chain",
+        type=parse_str_csv,
+        default=DEFAULT_VERIFY_SWEEP_MODEL_CHAIN,
+        help=(
+            "Comma-separated ordered model keys for --verify. "
+            "Forward pairs are generated automatically."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -554,38 +899,40 @@ def main() -> None:
     args = parse_args()
     ensure_dirs()
 
+    selected_modes = [args.batch, args.test, args.draft, args.verify]
+    if sum(1 for x in selected_modes if x) > 1:
+        raise SystemExit("Use only one of --batch, --test, --draft, or --verify.")
+
     datasets = filter_by_attr(DATASETS, set(args.datasets), "name")
 
     if args.batch:
-        if args.test:
-            raise SystemExit("Use either --batch or --test (not both).")
         if not datasets:
             raise SystemExit(
                 "With --batch: please pass at least one --datasets value. "
                 f"Known: {[d.name for d in DATASETS]}"
             )
 
-        batch_sizes_list = [1, 4, 16, 64, 256, 512, 1024]
+        batch_sizes_list = [1, 4, 16, 64, 256, 512]
 
         def time_limit_for_batch(bs: int) -> str:
             if bs == 1:
                 return "05:00:00"
             if bs == 4:
-                return "04:00:00"
-            if bs == 16:
                 return "03:00:00"
-            if bs == 64:
+            if bs == 16:
                 return "02:00:00"
-            if bs in (256, 512, 1024):
-                return "00:30:00"
+            if bs == 64:
+                return "01:00:00"
+            if bs == 256:
+                return "01:00:00"
+            if bs in (512, 1024):
+                return "00:40:00"
             raise ValueError(f"Unsupported batch size: {bs}")
 
-        # --- model selection ---
         llama33_70b = "meta-llama/Llama-3.3-70B-Instruct"
         llama31_70b_old = "meta-llama/Meta-Llama-3.1-70B-Instruct"
         qwen30b_a3b = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
-        # You may need to adjust these two env overrides to match your HF setup.
         eagle_llama33_speculator = os.environ.get(
             "EAGLE3_LLAMA33_70B_SPECULATOR",
             "RedHatAI/Llama-3.3-70B-Instruct-speculator.eagle3",
@@ -595,7 +942,6 @@ def main() -> None:
             "RedHatAI/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3",
         )
 
-        # AR pseudo-pairs
         ar_pairs: list[PairConfig] = [
             PairConfig(
                 pair_id="ar_llama33_70b",
@@ -609,21 +955,20 @@ def main() -> None:
                 pair_id="ar_qwen30b_a3b",
                 draft_model=qwen30b_a3b,
                 target_model=qwen30b_a3b,
-                tp_size=2,
-                gpu_count=2,
+                tp_size=4,
+                gpu_count=4,
                 note="AR only (no speculative decoding)",
             ),
             PairConfig(
                 pair_id="ar_deepseekcoder_33b",
                 draft_model="deepseek-ai/deepseek-coder-33b-instruct",
                 target_model="deepseek-ai/deepseek-coder-33b-instruct",
-                tp_size=2,
-                gpu_count=2,
+                tp_size=4,
+                gpu_count=4,
                 note="AR only (no speculative decoding)",
             ),
         ]
 
-        # EAGLE3 pseudo-pairs
         eagle_pairs: list[PairConfig] = [
             PairConfig(
                 pair_id="eagle3_llama33_70b",
@@ -637,20 +982,18 @@ def main() -> None:
                 pair_id="eagle3_qwen30b_a3b",
                 draft_model=qwen30b_a3b,
                 target_model=qwen30b_a3b,
-                tp_size=2,
-                gpu_count=2,
+                tp_size=4,
+                gpu_count=4,
                 note="EAGLE3 (eagle3 method)",
             ),
         ]
 
-        # Speculative decoding pairs, but swap 70B target to Llama 3.3.
         speculative_pairs: list[PairConfig] = []
         for pair in PAIRS:
             if pair.target_model == llama31_70b_old:
-                new_pair_id = pair.pair_id.replace("llama31_70b", "llama33_70b")
                 speculative_pairs.append(
                     PairConfig(
-                        pair_id=new_pair_id,
+                        pair_id=pair.pair_id.replace("llama31_70b", "llama33_70b"),
                         draft_model=pair.draft_model,
                         target_model=llama33_70b,
                         tp_size=4,
@@ -661,7 +1004,6 @@ def main() -> None:
             else:
                 speculative_pairs.append(pair)
 
-        # Additional Qwen speculative experiments requested by user.
         speculative_pairs.extend(
             [
                 PairConfig(
@@ -699,7 +1041,6 @@ def main() -> None:
             ]
         )
 
-        # --- common tuning (prod defaults from existing generator) ---
         test = False
         test_samples = 5
         warmup_iters = args.warmup_iters
@@ -708,7 +1049,6 @@ def main() -> None:
         max_model_len = args.max_model_len
 
         written_scripts: list[Path] = []
-        num_written = 0
 
         def _write_one(
             *,
@@ -718,10 +1058,16 @@ def main() -> None:
             method: str,
             eagle_model: str | None,
             eagle_draft_tp: int | None = None,
+            magicdec_method: str = "streaming",
+            magicdec_kv_budget: int = 256,
             time_limit_override: str,
         ) -> None:
             batch_sizes_str = str(bs)
-            script_path = JOBS_ROOT / pair.pair_id / f"{dataset.name}_b{bs}.slurm"
+            ktag = spec_token_tag(num_spec)
+            batch_dir = Path(method) / f"b{bs}" / ktag / pair.pair_id
+            result_subdir = Path(ktag)
+            script_path = JOBS_ROOT / batch_dir / f"{dataset.name}.slurm"
+
             script_text = render_job_script(
                 pair=pair,
                 dataset=dataset,
@@ -739,7 +1085,12 @@ def main() -> None:
                 method=method,
                 eagle_model=eagle_model,
                 eagle_draft_tp=eagle_draft_tp,
+                magicdec_method=magicdec_method,
+                magicdec_kv_budget=magicdec_kv_budget,
                 time_limit_override=time_limit_override,
+                jobs_subdir=batch_dir,
+                results_subdir=result_subdir,
+                job_name_suffix=f"_{ktag}",
             )
             write_job_script(script_path, script_text)
             written_scripts.append(script_path)
@@ -747,18 +1098,6 @@ def main() -> None:
         for bs in batch_sizes_list:
             tl = time_limit_for_batch(bs)
             for dataset in datasets:
-                # AR
-                for pair in ar_pairs:
-                    _write_one(
-                        pair=pair,
-                        dataset=dataset,
-                        bs=bs,
-                        method="ar",
-                        eagle_model=None,
-                        time_limit_override=tl,
-                    )
-
-                # Speculative decoding (draft_model)
                 for pair in speculative_pairs:
                     _write_one(
                         pair=pair,
@@ -769,36 +1108,166 @@ def main() -> None:
                         time_limit_override=tl,
                     )
 
-                # Eagle3
-                for pair in eagle_pairs:
-                    eagle_model = (
-                        eagle_llama33_speculator
-                        if pair.target_model == llama33_70b
-                        else eagle_qwen30b_a3b_speculator
-                    )
+                for pair in speculative_pairs:
                     _write_one(
                         pair=pair,
                         dataset=dataset,
                         bs=bs,
-                        method="eagle3",
-                        eagle_model=eagle_model,
-                        eagle_draft_tp=1,
+                        method="magicdec",
+                        eagle_model=None,
+                        magicdec_method=args.magicdec_method,
+                        magicdec_kv_budget=args.magicdec_kv_budget,
                         time_limit_override=tl,
                     )
+
+                # Enable these if you want AR and EAGLE3 jobs as well.
+                # for pair in ar_pairs:
+                #     _write_one(
+                #         pair=pair,
+                #         dataset=dataset,
+                #         bs=bs,
+                #         method="ar",
+                #         eagle_model=None,
+                #         time_limit_override=tl,
+                #     )
+
+                # for pair in eagle_pairs:
+                #     eagle_model = (
+                #         eagle_llama33_speculator
+                #         if pair.target_model == llama33_70b
+                #         else eagle_qwen30b_a3b_speculator
+                #     )
+                #     _write_one(
+                #         pair=pair,
+                #         dataset=dataset,
+                #         bs=bs,
+                #         method="eagle3",
+                #         eagle_model=eagle_model,
+                #         eagle_draft_tp=1,
+                #         time_limit_override=tl,
+                #     )
 
         num_written = len(written_scripts)
         print(f"[batch] Generated {num_written} job scripts.")
 
         submit_path = REPO_ROOT / "scripts" / "submit_spec_decode_batch_scaling.sh"
-        with open(submit_path, "w", encoding="utf-8") as f:
-            f.write("#!/usr/bin/env bash\n")
-            f.write("set -euo pipefail\n\n")
-            f.write(f'REPO_DIR="{REPO_ROOT}"\n\n')
-            for sp in written_scripts:
-                f.write(f'echo "sbatch {sp}"\n')
-                f.write(f"sbatch {sp}\n")
-        submit_path.chmod(submit_path.stat().st_mode | stat.S_IXUSR)
+        add_submit_script(submit_path, written_scripts)
         print(f"[batch] Submit script: {submit_path}")
+        return
+
+    if args.draft:
+        if not datasets:
+            raise SystemExit(
+                "With --draft: please pass at least one --datasets value. "
+                f"Known: {[d.name for d in DATASETS]}"
+            )
+
+
+        validate_model_keys(args.draft_draft_keys, arg_name="--draft-draft-keys")
+        validate_model_keys(args.draft_target_keys, arg_name="--draft-target-keys")
+
+        pairs = build_pairs_from_keys(
+            draft_keys=args.draft_draft_keys,
+            target_keys=args.draft_target_keys,
+            exclude_same=True,
+            note_prefix="draft_sweep ",
+        )
+
+        written_scripts: list[Path] = []
+        batch_sizes = args.batch_sizes
+        tag = batch_tag(batch_sizes)
+
+        for pair in pairs:
+            for num_spec in args.draft_num_spec_tokens:
+                ktag = spec_token_tag(num_spec)
+                for dataset in datasets:
+                    pair_subdir = Path("draft") / tag / ktag / pair.pair_id
+                    results_subdir = Path("draft") / ktag
+                    script_path = JOBS_ROOT / pair_subdir / f"{dataset.name}.slurm"
+
+                    script_text = render_job_script(
+                        pair=pair,
+                        dataset=dataset,
+                        batch_sizes=batch_sizes,
+                        gpu_mem_util=args.gpu_memory_utilization,
+                        max_model_len=args.max_model_len,
+                        dtype=args.dtype,
+                        seed=args.seed,
+                        warmup_iters=args.warmup_iters,
+                        warmup_max_tokens=args.warmup_max_tokens,
+                        num_spec_tokens=num_spec,
+                        verbose=args.verbose,
+                        test=False,
+                        test_samples=5,
+                        method="speculative",
+                        jobs_subdir=pair_subdir,
+                        results_subdir=results_subdir,
+                        job_name_suffix=f"_{ktag}",
+                        time_limit_override="1:00:00",
+                    )
+                    write_job_script(script_path, script_text)
+                    written_scripts.append(script_path)
+                    print(f"Wrote {script_path}")
+
+        print(f"[draft] Generated {len(written_scripts)} job scripts.")
+        submit_path = REPO_ROOT / "scripts" / "submit_spec_decode_draft_sweep.sh"
+        add_submit_script(submit_path, written_scripts)
+        print(f"[draft] Submit script: {submit_path}")
+        return
+
+    if args.verify:
+        if not datasets:
+            raise SystemExit(
+                "With --verify: please pass at least one --datasets value. "
+                f"Known: {[d.name for d in DATASETS]}"
+            )
+
+        validate_model_keys(args.verify_model_chain, arg_name="--verify-model-chain")
+
+        pairs = build_chain_pairs(
+            args.verify_model_chain,
+            note_prefix="verify_sweep ",
+        )
+
+        written_scripts: list[Path] = []
+        batch_sizes = args.batch_sizes
+        tag = batch_tag(batch_sizes)
+        for pair in pairs:
+            for num_spec in args.verify_num_spec_tokens:
+                ktag = spec_token_tag(num_spec)
+                for dataset in datasets:
+                    pair_subdir = Path("verify") / tag / ktag / pair.pair_id
+                    results_subdir = Path("verify") / ktag
+                    script_path = JOBS_ROOT / pair_subdir / f"{dataset.name}.slurm"
+
+                    script_text = render_job_script(
+                        pair=pair,
+                        dataset=dataset,
+                        batch_sizes=batch_sizes,
+                        gpu_mem_util=args.gpu_memory_utilization,
+                        max_model_len=args.max_model_len,
+                        dtype=args.dtype,
+                        seed=args.seed,
+                        warmup_iters=args.warmup_iters,
+                        warmup_max_tokens=args.warmup_max_tokens,
+                        num_spec_tokens=num_spec,
+                        verbose=args.verbose,
+                        test=False,
+                        test_samples=5,
+                        method="speculative",
+                        jobs_subdir=pair_subdir,
+                        results_subdir=results_subdir,
+                        job_name_suffix=f"_{ktag}",
+                        time_limit_override="1:00:00",
+                    )
+                    write_job_script(script_path, script_text)
+                    written_scripts.append(script_path)
+                    print(f"Wrote {script_path}")
+
+        print(f"[verify] Generated {len(written_scripts)} job scripts.")
+        submit_path = REPO_ROOT / "scripts" / "submit_spec_decode_verify_sweep.sh"
+        add_submit_script(submit_path, written_scripts)
+        print(f"[verify] Submit script: {submit_path}")
         return
 
     if args.test:
@@ -826,10 +1295,19 @@ def main() -> None:
         num_spec = 7
         max_model_len = args.max_model_len
 
+    tag = batch_tag(batch_sizes)
+    ktag = spec_token_tag(num_spec)
+
     num_written = 0
     for pair in pairs:
         for dataset in datasets:
-            pair_subdir = Path("test") / pair.pair_id if test else Path(pair.pair_id)
+            if test:
+                pair_subdir = Path("test") / tag / ktag / pair.pair_id
+                results_subdir = Path("test") / ktag
+            else:
+                pair_subdir = Path(tag) / ktag / pair.pair_id
+                results_subdir = Path(ktag)
+
             script_path = JOBS_ROOT / pair_subdir / f"{dataset.name}.slurm"
             script_text = render_job_script(
                 pair=pair,
@@ -845,6 +1323,9 @@ def main() -> None:
                 verbose=args.verbose,
                 test=test,
                 test_samples=test_samples,
+                jobs_subdir=pair_subdir,
+                results_subdir=results_subdir,
+                job_name_suffix=f"_{ktag}",
             )
             write_job_script(script_path, script_text)
             num_written += 1

@@ -32,6 +32,8 @@ from typing import Any
 
 from vllm.v1.metrics.reader import Counter, Gauge, Vector
 
+def is_speculative_method(method: str) -> bool:
+    return method in ("speculative", "eagle3", "magicdec")
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -45,8 +47,25 @@ def parse_args() -> argparse.Namespace:
         "--method",
         type=str,
         default="speculative",
-        choices=["speculative", "ar", "eagle3"],
-        help="Evaluation method: 'ar' (no speculative decoding), 'speculative' (draft_model), 'eagle3' (EAGLE3 drafter).",
+        choices=["speculative", "ar", "eagle3", "magicdec"],
+        help=(
+            "Evaluation method: 'ar' (no speculative decoding), "
+            "'speculative' (draft_model), 'eagle3' (EAGLE3 drafter), "
+            "'magicdec' (draft_model + magicdec streaming KV view)."
+        ),
+    )
+    p.add_argument(
+        "--magicdec-method",
+        type=str,
+        default="streaming",
+        choices=["streaming"],
+        help="When --method=magicdec: magicdec method (default: streaming).",
+    )
+    p.add_argument(
+        "--magicdec-kv-budget",
+        type=int,
+        default=256,
+        help="When --method=magicdec: visible KV token budget (default: 256).",
     )
     p.add_argument(
         "--eagle-model",
@@ -145,8 +164,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--top-k", type=int, default=-1)
-    p.add_argument("--warmup-iters", type=int, default=2)
-    p.add_argument("--warmup-max-tokens", type=int, default=32)
+    p.add_argument("--warmup-iters", type=int, default=10)
+    p.add_argument("--warmup-max-tokens", type=int, default=1024)
     p.add_argument(
         "--profile-time",
         action="store_true",
@@ -613,6 +632,10 @@ def run_warmup(
     temperature: float,
     top_p: float,
     top_k: int,
+    *,
+    method: str,
+    num_spec_tokens: int,
+    profile_time: bool,
 ) -> None:
     if warmup_iters <= 0:
         return
@@ -626,21 +649,97 @@ def run_warmup(
         warm.append(warm[-1])
 
     warm = apply_chat_template(tokenizer, warm)
+
+    speculative = is_speculative_method(method)
+
+    # Speculative warmup에서는 draft/verify가 여러 번 돌 수 있게
+    # 너무 짧은 warmup decode 길이를 피한다.
+    effective_warmup_max_tokens = warmup_max_tokens
+    if speculative:
+        effective_warmup_max_tokens = max(
+            warmup_max_tokens,
+            max(8, num_spec_tokens * 4),
+        )
+
     sampling_params = SamplingParams(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
-        max_tokens=warmup_max_tokens,
+        max_tokens=effective_warmup_max_tokens,
     )
+
     print(
         f"[warmup] iters={warmup_iters}, batch_size={batch_size}, "
-        f"max_tokens={warmup_max_tokens}"
+        f"max_tokens={effective_warmup_max_tokens}, speculative={speculative}"
     )
-    for idx in range(warmup_iters):
+
+    # 기본 warmup은 수행하고,
+    # speculative이면 실제 draft/verify path가 관측될 때까지 추가 warmup 허용.
+    extra_budget = 4 if speculative else 0
+    total_iters = 0
+
+    saw_draft = False
+    saw_verify = False
+
+    while True:
+        before = snapshot_metrics(llm) if speculative else {}
+
         maybe_cuda_sync()
         _ = llm.generate(warm, sampling_params=sampling_params)
         maybe_cuda_sync()
-        print(f"[warmup] done {idx + 1}/{warmup_iters}")
+
+        after = snapshot_metrics(llm) if speculative else {}
+
+        total_iters += 1
+
+        if speculative:
+            num_drafts = metric_delta(after, before, SPEC_NUM_DRAFTS)
+            num_draft_tokens = metric_delta(after, before, SPEC_NUM_DRAFT_TOKENS)
+            verification_time_s = metric_delta(after, before, SPEC_VERIFICATION_TIME)
+
+            num_drafts_val = int(num_drafts) if num_drafts is not None else 0
+            num_draft_tokens_val = (
+                int(num_draft_tokens) if num_draft_tokens is not None else 0
+            )
+            verification_time_val = (
+                float(verification_time_s) if verification_time_s is not None else None
+            )
+
+            if num_drafts_val > 0 or num_draft_tokens_val > 0:
+                saw_draft = True
+
+            # profile_time이 켜져 있으면 verification_time으로 직접 확인.
+            # 꺼져 있으면 speculative generate에서 draft가 발생했다는 것 자체를
+            # verifier path도 탔다는 proxy로 본다.
+            if profile_time:
+                if verification_time_val is not None and verification_time_val > 0:
+                    saw_verify = True
+            else:
+                if saw_draft:
+                    saw_verify = True
+
+            print(
+                f"[warmup] done {total_iters} "
+                f"(drafts={num_drafts_val}, draft_tokens={num_draft_tokens_val}, "
+                f"verify_time_s={verification_time_val})"
+            )
+        else:
+            print(f"[warmup] done {total_iters}")
+
+        base_done = total_iters >= warmup_iters
+        spec_ready = (not speculative) or (saw_draft and saw_verify)
+
+        if base_done and spec_ready:
+            break
+
+        if base_done and speculative and not spec_ready:
+            if extra_budget <= 0:
+                print(
+                    "[warmup] warning: speculative warmup ended before both draft "
+                    "and verifier were clearly observed."
+                )
+                break
+            extra_budget -= 1
 
 
 def measure_dataset(
@@ -938,6 +1037,17 @@ if __name__ == "__main__":
                 "draft_tensor_parallel_size": draft_tp,
                 "num_speculative_tokens": args.num_spec_tokens,
             }
+        elif args.method == "magicdec":
+            speculative_config = {
+                "method": "draft_model",
+                "model": args.draft_model,
+                "num_speculative_tokens": args.num_spec_tokens,
+                "max_model_len": args.max_model_len,
+                "enforce_eager": args.enforce_eager,
+                "magicdec": True,
+                "magicdec_method": args.magicdec_method,
+                "magicdec_kv_budget": args.magicdec_kv_budget,
+            }
         else:
             # Speculative decoding with a draft model.
             speculative_config = {
@@ -998,6 +1108,9 @@ if __name__ == "__main__":
                     temperature=args.temperature,
                     top_p=args.top_p,
                     top_k=args.top_k,
+                    method=args.method,
+                    num_spec_tokens=args.num_spec_tokens,
+                    profile_time=args.profile_time,
                 )
 
                 metrics = measure_dataset(

@@ -18,6 +18,29 @@ from vllm.v1.attention.backends.registry import (
 logger = init_logger(__name__)
 
 
+def _magicdec_streaming_kv_budget() -> int | None:
+    """Return kv budget when MagicDec streaming should wrap the attention backend.
+
+    Only applies to the draft worker for draft-model speculative decoding.
+    """
+    from vllm.config import get_current_vllm_config
+
+    vc = get_current_vllm_config()
+    spec = vc.speculative_config
+
+    if spec is None or not spec.magicdec:
+        return None
+    if spec.magicdec_method != "streaming":
+        return None
+    if not spec.uses_draft_model() or spec.draft_model_config is None:
+        return None
+
+    model_runner = getattr(vc.model_config, "runner", None)
+    if model_runner != "draft":
+        return None
+
+    return spec.magicdec_kv_budget
+
 class AttentionSelectorConfig(NamedTuple):
     head_size: int
     dtype: torch.dtype
@@ -88,6 +111,7 @@ def get_attn_backend(
         backend=vllm_config.attention_config.backend,
         attn_selector_config=attn_selector_config,
         num_heads=num_heads,
+        magicdec_streaming_kv_budget=_magicdec_streaming_kv_budget(),
     )
 
 
@@ -96,6 +120,7 @@ def _cached_get_attn_backend(
     backend,
     attn_selector_config: AttentionSelectorConfig,
     num_heads: int | None = None,
+    magicdec_streaming_kv_budget: int | None = None,
 ) -> type[AttentionBackend]:
     from vllm.platforms import current_platform
 
@@ -121,6 +146,30 @@ def _cached_get_attn_backend(
             required_layout,
             backend.get_name(),
         )
+
+    if magicdec_streaming_kv_budget is not None:
+        bs = attn_selector_config.block_size
+        if bs is None:
+            logger.warning(
+                "MagicDec streaming skipped: attention block_size is None."
+            )
+        elif magicdec_streaming_kv_budget < bs:
+            logger.warning(
+                "MagicDec streaming skipped: kv_budget_tokens (%d) is smaller "
+                "than block_size (%d). Need at least one full sink block.",
+                magicdec_streaming_kv_budget,
+                bs,
+            )
+        else:
+            from vllm.v1.attention.magicdec_streaming_attention import (
+                create_magicdec_streaming_attention_backend,
+            )
+
+            backend = create_magicdec_streaming_attention_backend(
+                backend,
+                kv_budget_tokens=magicdec_streaming_kv_budget,
+                block_size=bs,
+            )
 
     return backend
 
