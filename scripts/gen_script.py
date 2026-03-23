@@ -35,9 +35,14 @@ LOGS_ROOT = REPO_ROOT / "scripts" / "logs" / "spec_decode"
 RESULTS_ROOT = REPO_ROOT / "results" / "spec_decode"
 
 # Override with env or edit for your cluster:
-REPO_DIR = "/home/jhwoo36/scratch/vllm-sampling"
-VENV_DIR = "/home/jhwoo36/scratch/venvs/vllm"
+USER_NAME = os.environ.get("USER") or getpass.getuser()
 
+if USER_NAME == "junsuk87":
+    REPO_DIR = "/project/def-pnair/junsu/kv_cache/vllm-sampling"
+    VENV_DIR = "/project/def-pnair/junsu/kv_cache"
+elif USER_NAME == "jhwoo36":
+    REPO_DIR = "/home/jhwoo36/scratch/vllm-sampling"
+    VENV_DIR = "/home/jhwoo36/scratch/venvs/vllm"
 
 @dataclass(frozen=True)
 class PairConfig:
@@ -1024,14 +1029,24 @@ def main() -> None:
     args = parse_args()
     ensure_dirs()
     debug_enabled = args.debug or args.spechive_debug
-    if (
-        args.spec_method == "adaptive_spechive"
-        and not args.adaptive_spechive_intermediate_model
-    ):
-        raise SystemExit(
-            "--spec-method=adaptive_spechive requires "
-            "--adaptive-spechive-intermediate-model"
-        )
+    spechive_variants: list[tuple[str | None, int, str]] = []
+    if args.spec_method != "adaptive_spechive":
+        spechive_variants = [(None, args.round, "")]
+    elif debug_enabled:
+        # Debug preset: run two intermediate verifiers with 3 rounds.
+        spechive_variants = [
+            ("meta-llama/Llama-3.2-3B-Instruct", 3, "im_llama32_3b_r3"),
+            ("meta-llama/Meta-Llama-3.1-8B-Instruct", 3, "im_llama31_8b_r3"),
+        ]
+    else:
+        if not args.adaptive_spechive_intermediate_model:
+            raise SystemExit(
+                "--spec-method=adaptive_spechive requires "
+                "--adaptive-spechive-intermediate-model"
+            )
+        spechive_variants = [
+            (args.adaptive_spechive_intermediate_model, args.round, "")
+        ]
 
     selected_modes = [args.batch, args.test, args.draft, args.verify]
     if sum(1 for x in selected_modes if x) > 1:
@@ -1273,42 +1288,55 @@ def main() -> None:
         ) -> None:
             batch_sizes_str = str(bs)
             ktag = spec_token_tag(num_spec)
-            batch_dir = Path(method) / f"b{bs}" / ktag / pair.pair_id
-            result_subdir = Path(ktag)
-            script_path = JOBS_ROOT / batch_dir / f"{dataset.name}.slurm"
-
-            script_text = render_job_script(
-                pair=pair,
-                dataset=dataset,
-                batch_sizes=batch_sizes_str,
-                gpu_mem_util=args.gpu_memory_utilization,
-                max_model_len=max_model_len,
-                dtype=args.dtype,
-                seed=args.seed,
-                warmup_iters=warmup_iters,
-                warmup_max_tokens=warmup_max_tokens,
-                num_spec_tokens=num_spec,
-                verbose=args.verbose,
-                debug=debug_enabled,
-                test=test,
-                test_samples=test_samples,
-                method=method,
-                eagle_model=eagle_model,
-                eagle_draft_tp=eagle_draft_tp,
-                magicdec_method=magicdec_method,
-                magicdec_kv_budget=magicdec_kv_budget,
-                adaptive_spechive_intermediate_model=(
-                    args.adaptive_spechive_intermediate_model
-                ),
-                adaptive_spechive_mode=args.adaptive_spechive_mode,
-                adaptive_spechive_rounds=args.round,
-                time_limit_override=time_limit_override,
-                jobs_subdir=batch_dir,
-                results_subdir=result_subdir,
-                job_name_suffix=f"_{ktag}",
+            base_batch_dir = Path(method) / f"b{bs}" / ktag / pair.pair_id
+            base_result_subdir = Path(ktag)
+            variants = (
+                spechive_variants
+                if method == "adaptive_spechive"
+                else [(None, args.round, "")]
             )
-            write_job_script(script_path, script_text)
-            written_scripts.append(script_path)
+            for im_model, rounds, variant_tag in variants:
+                batch_dir = (
+                    base_batch_dir / variant_tag if variant_tag else base_batch_dir
+                )
+                result_subdir = (
+                    base_result_subdir / variant_tag
+                    if variant_tag
+                    else base_result_subdir
+                )
+                script_path = JOBS_ROOT / batch_dir / f"{dataset.name}.slurm"
+                suffix = f"_{ktag}" + (f"_{variant_tag}" if variant_tag else "")
+
+                script_text = render_job_script(
+                    pair=pair,
+                    dataset=dataset,
+                    batch_sizes=batch_sizes_str,
+                    gpu_mem_util=args.gpu_memory_utilization,
+                    max_model_len=max_model_len,
+                    dtype=args.dtype,
+                    seed=args.seed,
+                    warmup_iters=warmup_iters,
+                    warmup_max_tokens=warmup_max_tokens,
+                    num_spec_tokens=num_spec,
+                    verbose=args.verbose,
+                    debug=debug_enabled,
+                    test=test,
+                    test_samples=test_samples,
+                    method=method,
+                    eagle_model=eagle_model,
+                    eagle_draft_tp=eagle_draft_tp,
+                    magicdec_method=magicdec_method,
+                    magicdec_kv_budget=magicdec_kv_budget,
+                    adaptive_spechive_intermediate_model=im_model,
+                    adaptive_spechive_mode=args.adaptive_spechive_mode,
+                    adaptive_spechive_rounds=rounds,
+                    time_limit_override=time_limit_override,
+                    jobs_subdir=batch_dir,
+                    results_subdir=result_subdir,
+                    job_name_suffix=suffix,
+                )
+                write_job_script(script_path, script_text)
+                written_scripts.append(script_path)
 
         for bs in batch_sizes_list:
             tl = time_limit_for_batch(bs)
@@ -1398,39 +1426,49 @@ def main() -> None:
             for num_spec in args.draft_num_spec_tokens:
                 ktag = spec_token_tag(num_spec)
                 for dataset in datasets:
-                    pair_subdir = Path("draft") / tag / ktag / pair.pair_id
-                    results_subdir = Path("draft") / ktag
-                    script_path = JOBS_ROOT / pair_subdir / f"{dataset.name}.slurm"
+                    base_pair_subdir = Path("draft") / tag / ktag / pair.pair_id
+                    base_results_subdir = Path("draft") / ktag
+                    for im_model, rounds, variant_tag in spechive_variants:
+                        pair_subdir = (
+                            base_pair_subdir / variant_tag
+                            if variant_tag
+                            else base_pair_subdir
+                        )
+                        results_subdir = (
+                            base_results_subdir / variant_tag
+                            if variant_tag
+                            else base_results_subdir
+                        )
+                        script_path = JOBS_ROOT / pair_subdir / f"{dataset.name}.slurm"
+                        suffix = f"_{ktag}" + (f"_{variant_tag}" if variant_tag else "")
 
-                    script_text = render_job_script(
-                        pair=pair,
-                        dataset=dataset,
-                        batch_sizes=batch_sizes,
-                        gpu_mem_util=args.gpu_memory_utilization,
-                        max_model_len=args.max_model_len,
-                        dtype=args.dtype,
-                        seed=args.seed,
-                        warmup_iters=args.warmup_iters,
-                        warmup_max_tokens=args.warmup_max_tokens,
-                        num_spec_tokens=num_spec,
-                        verbose=args.verbose,
-                        debug=debug_enabled,
-                        test=False,
-                        test_samples=5,
-                        method=args.spec_method,
-                        adaptive_spechive_intermediate_model=(
-                            args.adaptive_spechive_intermediate_model
-                        ),
-                        adaptive_spechive_mode=args.adaptive_spechive_mode,
-                        adaptive_spechive_rounds=args.round,
-                        jobs_subdir=pair_subdir,
-                        results_subdir=results_subdir,
-                        job_name_suffix=f"_{ktag}",
-                        time_limit_override="1:00:00",
-                    )
-                    write_job_script(script_path, script_text)
-                    written_scripts.append(script_path)
-                    print(f"Wrote {script_path}")
+                        script_text = render_job_script(
+                            pair=pair,
+                            dataset=dataset,
+                            batch_sizes=batch_sizes,
+                            gpu_mem_util=args.gpu_memory_utilization,
+                            max_model_len=args.max_model_len,
+                            dtype=args.dtype,
+                            seed=args.seed,
+                            warmup_iters=args.warmup_iters,
+                            warmup_max_tokens=args.warmup_max_tokens,
+                            num_spec_tokens=num_spec,
+                            verbose=args.verbose,
+                            debug=debug_enabled,
+                            test=False,
+                            test_samples=5,
+                            method=args.spec_method,
+                            adaptive_spechive_intermediate_model=im_model,
+                            adaptive_spechive_mode=args.adaptive_spechive_mode,
+                            adaptive_spechive_rounds=rounds,
+                            jobs_subdir=pair_subdir,
+                            results_subdir=results_subdir,
+                            job_name_suffix=suffix,
+                            time_limit_override="1:00:00",
+                        )
+                        write_job_script(script_path, script_text)
+                        written_scripts.append(script_path)
+                        print(f"Wrote {script_path}")
 
         print(f"[draft] Generated {len(written_scripts)} job scripts.")
         submit_path = REPO_ROOT / "scripts" / "submit_spec_decode_draft_sweep.sh"
@@ -1459,39 +1497,49 @@ def main() -> None:
             for num_spec in args.verify_num_spec_tokens:
                 ktag = spec_token_tag(num_spec)
                 for dataset in datasets:
-                    pair_subdir = Path("verify") / tag / ktag / pair.pair_id
-                    results_subdir = Path("verify") / ktag
-                    script_path = JOBS_ROOT / pair_subdir / f"{dataset.name}.slurm"
+                    base_pair_subdir = Path("verify") / tag / ktag / pair.pair_id
+                    base_results_subdir = Path("verify") / ktag
+                    for im_model, rounds, variant_tag in spechive_variants:
+                        pair_subdir = (
+                            base_pair_subdir / variant_tag
+                            if variant_tag
+                            else base_pair_subdir
+                        )
+                        results_subdir = (
+                            base_results_subdir / variant_tag
+                            if variant_tag
+                            else base_results_subdir
+                        )
+                        script_path = JOBS_ROOT / pair_subdir / f"{dataset.name}.slurm"
+                        suffix = f"_{ktag}" + (f"_{variant_tag}" if variant_tag else "")
 
-                    script_text = render_job_script(
-                        pair=pair,
-                        dataset=dataset,
-                        batch_sizes=batch_sizes,
-                        gpu_mem_util=args.gpu_memory_utilization,
-                        max_model_len=args.max_model_len,
-                        dtype=args.dtype,
-                        seed=args.seed,
-                        warmup_iters=args.warmup_iters,
-                        warmup_max_tokens=args.warmup_max_tokens,
-                        num_spec_tokens=num_spec,
-                        verbose=args.verbose,
-                        debug=debug_enabled,
-                        test=False,
-                        test_samples=5,
-                        method=args.spec_method,
-                        adaptive_spechive_intermediate_model=(
-                            args.adaptive_spechive_intermediate_model
-                        ),
-                        adaptive_spechive_mode=args.adaptive_spechive_mode,
-                        adaptive_spechive_rounds=args.round,
-                        jobs_subdir=pair_subdir,
-                        results_subdir=results_subdir,
-                        job_name_suffix=f"_{ktag}",
-                        time_limit_override="1:00:00",
-                    )
-                    write_job_script(script_path, script_text)
-                    written_scripts.append(script_path)
-                    print(f"Wrote {script_path}")
+                        script_text = render_job_script(
+                            pair=pair,
+                            dataset=dataset,
+                            batch_sizes=batch_sizes,
+                            gpu_mem_util=args.gpu_memory_utilization,
+                            max_model_len=args.max_model_len,
+                            dtype=args.dtype,
+                            seed=args.seed,
+                            warmup_iters=args.warmup_iters,
+                            warmup_max_tokens=args.warmup_max_tokens,
+                            num_spec_tokens=num_spec,
+                            verbose=args.verbose,
+                            debug=debug_enabled,
+                            test=False,
+                            test_samples=5,
+                            method=args.spec_method,
+                            adaptive_spechive_intermediate_model=im_model,
+                            adaptive_spechive_mode=args.adaptive_spechive_mode,
+                            adaptive_spechive_rounds=rounds,
+                            jobs_subdir=pair_subdir,
+                            results_subdir=results_subdir,
+                            job_name_suffix=suffix,
+                            time_limit_override="1:00:00",
+                        )
+                        write_job_script(script_path, script_text)
+                        written_scripts.append(script_path)
+                        print(f"Wrote {script_path}")
 
         print(f"[verify] Generated {len(written_scripts)} job scripts.")
         submit_path = REPO_ROOT / "scripts" / "submit_spec_decode_verify_sweep.sh"
@@ -1531,41 +1579,51 @@ def main() -> None:
     for pair in pairs:
         for dataset in datasets:
             if test:
-                pair_subdir = Path("test") / tag / ktag / pair.pair_id
-                results_subdir = Path("test") / ktag
+                base_pair_subdir = Path("test") / tag / ktag / pair.pair_id
+                base_results_subdir = Path("test") / ktag
             else:
-                pair_subdir = Path(tag) / ktag / pair.pair_id
-                results_subdir = Path(ktag)
+                base_pair_subdir = Path(tag) / ktag / pair.pair_id
+                base_results_subdir = Path(ktag)
 
-            script_path = JOBS_ROOT / pair_subdir / f"{dataset.name}.slurm"
-            script_text = render_job_script(
-                pair=pair,
-                dataset=dataset,
-                batch_sizes=batch_sizes,
-                gpu_mem_util=args.gpu_memory_utilization,
-                max_model_len=max_model_len,
-                dtype=args.dtype,
-                seed=args.seed,
-                warmup_iters=warmup_iters,
-                warmup_max_tokens=warmup_max_tokens,
-                num_spec_tokens=num_spec,
-                verbose=args.verbose,
-                debug=debug_enabled,
-                test=test,
-                test_samples=test_samples,
-                method=args.spec_method,
-                adaptive_spechive_intermediate_model=(
-                    args.adaptive_spechive_intermediate_model
-                ),
-                adaptive_spechive_mode=args.adaptive_spechive_mode,
-                adaptive_spechive_rounds=args.round,
-                jobs_subdir=pair_subdir,
-                results_subdir=results_subdir,
-                job_name_suffix=f"_{ktag}",
-            )
-            write_job_script(script_path, script_text)
-            num_written += 1
-            print(f"Wrote {script_path}")
+            for im_model, rounds, variant_tag in spechive_variants:
+                pair_subdir = (
+                    base_pair_subdir / variant_tag
+                    if variant_tag
+                    else base_pair_subdir
+                )
+                results_subdir = (
+                    base_results_subdir / variant_tag
+                    if variant_tag
+                    else base_results_subdir
+                )
+                script_path = JOBS_ROOT / pair_subdir / f"{dataset.name}.slurm"
+                suffix = f"_{ktag}" + (f"_{variant_tag}" if variant_tag else "")
+                script_text = render_job_script(
+                    pair=pair,
+                    dataset=dataset,
+                    batch_sizes=batch_sizes,
+                    gpu_mem_util=args.gpu_memory_utilization,
+                    max_model_len=max_model_len,
+                    dtype=args.dtype,
+                    seed=args.seed,
+                    warmup_iters=warmup_iters,
+                    warmup_max_tokens=warmup_max_tokens,
+                    num_spec_tokens=num_spec,
+                    verbose=args.verbose,
+                    debug=debug_enabled,
+                    test=test,
+                    test_samples=test_samples,
+                    method=args.spec_method,
+                    adaptive_spechive_intermediate_model=im_model,
+                    adaptive_spechive_mode=args.adaptive_spechive_mode,
+                    adaptive_spechive_rounds=rounds,
+                    jobs_subdir=pair_subdir,
+                    results_subdir=results_subdir,
+                    job_name_suffix=suffix,
+                )
+                write_job_script(script_path, script_text)
+                num_written += 1
+                print(f"Wrote {script_path}")
 
     mode = "test" if test else "prod"
     print(f"Generated {num_written} job scripts ({mode}).")
