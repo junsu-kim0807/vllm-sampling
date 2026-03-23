@@ -3065,8 +3065,8 @@ class GPUModelRunner(
         assert drafter._inter_dit is not None
         self._dit_debug_step_id += 1
         cap = self.speculative_config.runner_num_speculative_tokens()
-        L = self.speculative_config.adaptive_spechive_num_interval_tokens
-        n_inner = self.speculative_config.num_speculative_tokens
+        L = self.speculative_config.num_speculative_tokens
+        n_inner = self.speculative_config.adaptive_spechive_num_rounds
         batch_size = common_attn_metadata.batch_size()
         req_ids = list(self.input_batch.req_ids[:batch_size])
         use_draft_probs = (
@@ -3078,8 +3078,8 @@ class GPUModelRunner(
             "spechive_rounds_start",
             {
                 "batch_size": batch_size,
-                "interval_tokens": L,
-                "num_inner_rounds": n_inner,
+                "chunk_len": L,
+                "num_rounds": n_inner,
                 "runner_num_spec_tokens": cap,
             },
         )
@@ -3204,8 +3204,8 @@ class GPUModelRunner(
                 )
 
         self._dit_debug_assert(
-            n_inner == int(self.speculative_config.num_speculative_tokens),
-            "check2_round_count_matches_interval",
+            n_inner == int(self.speculative_config.adaptive_spechive_num_rounds),
+            "check2_round_count_matches_config_rounds",
             detail=f"executed_rounds={n_inner}",
         )
 

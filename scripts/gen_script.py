@@ -514,19 +514,25 @@ set -euo pipefail
 
 module load python/3.12 cuda/12.9 arrow/21.0.0
 
-REPO_DIR={shquote(REPO_DIR)}
-VENV_DIR={shquote(VENV_DIR)}
+REPO_DIR={shquote(str(REPO_DIR))}
+VENV_DIR={shquote(str(VENV_DIR))}
 
 cd "${{REPO_DIR}}"
 source "${{VENV_DIR}}/bin/activate"
+
+if [[ -f ~/.bashrc ]]; then
+  source ~/.bashrc
+fi
+
 unset PYTHONPATH PYTHONHOME
 export PYTHONNOUSERSITE=1
 export HF_TOKEN="${{HF_TOKEN:-}}"
 export VLLM_WORKER_MULTIPROC_METHOD="${{VLLM_WORKER_MULTIPROC_METHOD:-spawn}}"
-export HF_HOME="${{HF_HOME:-/home/jhwoo36/scratch/.cache}}"
-export TRANSFORMERS_CACHE="${{TRANSFORMERS_CACHE:-/home/jhwoo36/scratch/.cache/transformers}}"
-export HUGGINGFACE_HUB_CACHE="${{HUGGINGFACE_HUB_CACHE:-/home/jhwoo36/scratch/.cache/huggingface_hub}}"
-export HF_DATASETS_CACHE="${{HF_DATASETS_CACHE:-/home/jhwoo36/scratch/.cache/datasets}}"
+
+export HF_HOME="${{HOME}}/scratch/.cache"
+export TRANSFORMERS_CACHE="${{TRANSFORMERS_CACHE:-/$TRANSFORMERS_CACHE}}"
+export HUGGINGFACE_HUB_CACHE="${{HUGGINGFACE_HUB_CACHE:-$HUGGINGFACE_HUB_CACHE}}"
+export HF_DATASETS_CACHE="${{HF_DATASETS_CACHE:-$HF_DATASETS_CACHE}}"
 """
 
 
@@ -551,6 +557,9 @@ def build_python_command(
     eagle_draft_tp: int | None = None,
     magicdec_method: str = "streaming",
     magicdec_kv_budget: int = 256,
+    adaptive_spechive_intermediate_model: str | None = None,
+    adaptive_spechive_mode: str = "hierarchical_verification",
+    adaptive_spechive_rounds: int = 1,
     results_subdir: Path | None = None,
 ) -> str:
     tag = batch_tag(batch_sizes)
@@ -591,6 +600,21 @@ def build_python_command(
     elif method == "magicdec":
         parts.append(f"--magicdec-method {shquote(magicdec_method)}")
         parts.append(f"--magicdec-kv-budget {magicdec_kv_budget}")
+    elif method == "adaptive_spechive":
+        if not adaptive_spechive_intermediate_model:
+            raise SystemExit(
+                "--method=adaptive_spechive requires intermediate model in generator "
+                "(pass --adaptive-spechive-intermediate-model)."
+            )
+        parts.append(
+            f"--intermediate-model {shquote(adaptive_spechive_intermediate_model)}"
+        )
+        parts.append(
+            f"--adaptive-spechive-mode {shquote(adaptive_spechive_mode)}"
+        )
+        parts.append(
+            f"--round {adaptive_spechive_rounds}"
+        )
 
     if dataset.name == "aime25":
         parts.append(f"--aime-max-new-tokens {dataset.max_new_tokens}")
@@ -649,6 +673,9 @@ def render_job_script(
     eagle_draft_tp: int | None = None,
     magicdec_method: str = "streaming",
     magicdec_kv_budget: int = 256,
+    adaptive_spechive_intermediate_model: str | None = None,
+    adaptive_spechive_mode: str = "hierarchical_verification",
+    adaptive_spechive_rounds: int = 1,
     time_limit_override: str | None = None,
     jobs_subdir: Path | None = None,
     results_subdir: Path | None = None,
@@ -709,6 +736,9 @@ def render_job_script(
         eagle_draft_tp=eagle_draft_tp,
         magicdec_method=magicdec_method,
         magicdec_kv_budget=magicdec_kv_budget,
+        adaptive_spechive_intermediate_model=adaptive_spechive_intermediate_model,
+        adaptive_spechive_mode=adaptive_spechive_mode,
+        adaptive_spechive_rounds=adaptive_spechive_rounds,
         results_subdir=results_subdir,
     )
 
@@ -869,6 +899,38 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="MagicDec KV budget tokens when method=magicdec (default: 256).",
     )
+    parser.add_argument(
+        "--adaptive-spechive-intermediate-model",
+        type=str,
+        default=None,
+        help=(
+            "Intermediate verifier model id to pass when generating "
+            "method=adaptive_spechive jobs."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-spechive-mode",
+        type=str,
+        default="hierarchical_verification",
+        choices=["draft_target", "inter_verification", "hierarchical_verification"],
+        help="adaptive_spechive mode to pass to run_spec_decode_metrics.py.",
+    )
+    parser.add_argument(
+        "--round",
+        type=int,
+        default=1,
+        help="Number of adaptive_spechive hierarchical verification rounds.",
+    )
+    parser.add_argument(
+        "--spec-method",
+        type=str,
+        default="speculative",
+        choices=["speculative", "adaptive_spechive"],
+        help=(
+            "Method used for speculative jobs in this generator. "
+            "Use adaptive_spechive to emit staged D/I/T runs."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
         "--debug",
@@ -962,6 +1024,14 @@ def main() -> None:
     args = parse_args()
     ensure_dirs()
     debug_enabled = args.debug or args.spechive_debug
+    if (
+        args.spec_method == "adaptive_spechive"
+        and not args.adaptive_spechive_intermediate_model
+    ):
+        raise SystemExit(
+            "--spec-method=adaptive_spechive requires "
+            "--adaptive-spechive-intermediate-model"
+        )
 
     selected_modes = [args.batch, args.test, args.draft, args.verify]
     if sum(1 for x in selected_modes if x) > 1:
@@ -1227,6 +1297,11 @@ def main() -> None:
                 eagle_draft_tp=eagle_draft_tp,
                 magicdec_method=magicdec_method,
                 magicdec_kv_budget=magicdec_kv_budget,
+                adaptive_spechive_intermediate_model=(
+                    args.adaptive_spechive_intermediate_model
+                ),
+                adaptive_spechive_mode=args.adaptive_spechive_mode,
+                adaptive_spechive_rounds=args.round,
                 time_limit_override=time_limit_override,
                 jobs_subdir=batch_dir,
                 results_subdir=result_subdir,
@@ -1243,7 +1318,7 @@ def main() -> None:
                         pair=pair,
                         dataset=dataset,
                         bs=bs,
-                        method="speculative",
+                        method=args.spec_method,
                         eagle_model=None,
                         time_limit_override=tl,
                     )
@@ -1342,7 +1417,12 @@ def main() -> None:
                         debug=debug_enabled,
                         test=False,
                         test_samples=5,
-                        method="speculative",
+                        method=args.spec_method,
+                        adaptive_spechive_intermediate_model=(
+                            args.adaptive_spechive_intermediate_model
+                        ),
+                        adaptive_spechive_mode=args.adaptive_spechive_mode,
+                        adaptive_spechive_rounds=args.round,
                         jobs_subdir=pair_subdir,
                         results_subdir=results_subdir,
                         job_name_suffix=f"_{ktag}",
@@ -1398,7 +1478,12 @@ def main() -> None:
                         debug=debug_enabled,
                         test=False,
                         test_samples=5,
-                        method="speculative",
+                        method=args.spec_method,
+                        adaptive_spechive_intermediate_model=(
+                            args.adaptive_spechive_intermediate_model
+                        ),
+                        adaptive_spechive_mode=args.adaptive_spechive_mode,
+                        adaptive_spechive_rounds=args.round,
                         jobs_subdir=pair_subdir,
                         results_subdir=results_subdir,
                         job_name_suffix=f"_{ktag}",
@@ -1468,6 +1553,12 @@ def main() -> None:
                 debug=debug_enabled,
                 test=test,
                 test_samples=test_samples,
+                method=args.spec_method,
+                adaptive_spechive_intermediate_model=(
+                    args.adaptive_spechive_intermediate_model
+                ),
+                adaptive_spechive_mode=args.adaptive_spechive_mode,
+                adaptive_spechive_rounds=args.round,
                 jobs_subdir=pair_subdir,
                 results_subdir=results_subdir,
                 job_name_suffix=f"_{ktag}",

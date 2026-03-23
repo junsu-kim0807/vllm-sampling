@@ -196,7 +196,9 @@ class SpeculativeConfig:
     intermediate_tensor_parallel_size: int | None = Field(default=None, ge=1)
     """TP size for I; defaults to draft_tensor_parallel_size when unset."""
     adaptive_spechive_num_interval_tokens: int = Field(default=1, ge=1)
-    """n_iv: inner verification interval length (D↔I rounds); used to bound outer length."""
+    """Deprecated compatibility field (hierarchical chunk length now uses num_speculative_tokens)."""
+    adaptive_spechive_num_rounds: int = Field(default=1, ge=1)
+    """Number of hierarchical verification rounds per outer iteration."""
     adaptive_spechive_mode: AdaptiveSpechiveMode = "draft_target"
     """draft_target: draft→T. inter_verification: I proposes like draft→T. hierarchical_verification: D proposes, I verifies via RejectionSampler, then→T."""
     adaptive_spechive_enable_inter_verification: bool = True
@@ -239,6 +241,7 @@ class SpeculativeConfig:
         if self.method == "adaptive_spechive":
             factors.append(self.intermediate_model)
             factors.append(self.adaptive_spechive_num_interval_tokens)
+            factors.append(self.adaptive_spechive_num_rounds)
             factors.append(self.adaptive_spechive_mode)
             factors.append(self.adaptive_spechive_enable_inter_verification)
             factors.append(self.adaptive_spechive_enable_hierarchical_verification)
@@ -926,18 +929,15 @@ class SpeculativeConfig:
                         f"to share the same hidden size (got draft={d_h}, "
                         f"intermediate={i_h})."
                     )
-            outer_upper = (
-                self.adaptive_spechive_num_interval_tokens
-                + self.num_speculative_tokens
-                * (self.adaptive_spechive_num_interval_tokens + 1)
-            )
+            chunk_len = self.num_speculative_tokens
+            rounds = self.adaptive_spechive_num_rounds
+            outer_upper = chunk_len + rounds * (chunk_len + 1)
             if outer_upper > _ADAPTIVE_CASCADE_MAX_SPEC_LEN:
                 raise ValueError(
                     f"adaptive_spechive: implied max outer verify length "
-                    f"{outer_upper} = n_iv + num_speculative_tokens * (n_iv + 1) "
+                    f"{outer_upper} = chunk_len + rounds * (chunk_len + 1) "
                     f"exceeds {_ADAPTIVE_CASCADE_MAX_SPEC_LEN} (sampler limit). "
-                    "Reduce num_speculative_tokens or "
-                    "adaptive_spechive_num_interval_tokens."
+                    "Reduce num_speculative_tokens or adaptive_spechive_num_rounds."
                 )
             if self.parallel_drafting:
                 raise ValueError(
@@ -1032,9 +1032,9 @@ class SpeculativeConfig:
             self.method == "adaptive_spechive"
             and self.adaptive_spechive_mode == "hierarchical_verification"
         ):
-            n_iv = self.adaptive_spechive_num_interval_tokens
-            n = self.num_speculative_tokens
-            return n_iv + n * (n_iv + 1)
+            chunk_len = self.num_speculative_tokens
+            rounds = self.adaptive_spechive_num_rounds
+            return chunk_len + rounds * (chunk_len + 1)
         return self.num_speculative_tokens
 
     def use_eagle(self) -> bool:
@@ -1057,5 +1057,6 @@ class SpeculativeConfig:
         if method == "adaptive_spechive":
             im = self.intermediate_model
             acm = self.adaptive_spechive_mode
-            return f"SpeculativeConfig({method=}, {model=}, {im=}, {acm=}, {num_spec_tokens=})"
+            rounds = self.adaptive_spechive_num_rounds
+            return f"SpeculativeConfig({method=}, {model=}, {im=}, {acm=}, {num_spec_tokens=}, {rounds=})"
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"

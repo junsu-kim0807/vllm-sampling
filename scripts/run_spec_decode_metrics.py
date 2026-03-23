@@ -60,8 +60,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "When --method=adaptive_spechive: intermediate verifier model id. "
-            "Defaults to --draft-model."
+            "When --method=adaptive_spechive: intermediate verifier model id."
         ),
     )
     p.add_argument(
@@ -72,12 +71,11 @@ def parse_args() -> argparse.Namespace:
         help="When --method=adaptive_spechive: adaptive spechive mode.",
     )
     p.add_argument(
-        "--adaptive-spechive-interval-tokens",
+        "--round",
         type=int,
         default=1,
         help=(
-            "When --method=adaptive_spechive: D->I interval chunk length "
-            "(adaptive_spechive_num_interval_tokens)."
+            "When --method=adaptive_spechive: number of hierarchical verification rounds."
         ),
     )
     p.add_argument(
@@ -1027,6 +1025,10 @@ def write_pair_info(
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.method == "adaptive_spechive" and not args.intermediate_model:
+        raise SystemExit(
+            "--method=adaptive_spechive requires --intermediate-model"
+        )
     random.seed(args.seed)
 
     if args.profile_time:
@@ -1109,12 +1111,10 @@ if __name__ == "__main__":
             speculative_config = {
                 "method": "adaptive_spechive",
                 "model": args.draft_model,
-                "intermediate_model": args.intermediate_model or args.draft_model,
+                "intermediate_model": args.intermediate_model,
                 "num_speculative_tokens": args.num_spec_tokens,
                 "adaptive_spechive_mode": args.adaptive_spechive_mode,
-                "adaptive_spechive_num_interval_tokens": (
-                    args.adaptive_spechive_interval_tokens
-                ),
+                "adaptive_spechive_num_rounds": args.round,
                 "max_model_len": args.max_model_len,
                 "enforce_eager": args.enforce_eager,
             }

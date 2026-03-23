@@ -5,7 +5,7 @@
 ``draft_target``: draft→target. ``inter_verification``: intermediate as draft→target.
 
 ``hierarchical_verification``: run multi-round D/I verification in round orchestration.
-Each round drafts a chunk of ``L=adaptive_spechive_num_interval_tokens`` and
+Each round drafts a chunk of ``L=num_speculative_tokens`` and
 intermediate-verifies it into a logical emitted prefix. Right before final
 bundle construction, DIT performs one additional draft-only tail proposal and
 lets the standard target rejection-sampling path verify the whole bundle in one
@@ -714,7 +714,7 @@ class AdaptiveSpechiveProposer:
         spec = vllm_config.speculative_config
         assert spec is not None
         self._mode = spec.adaptive_spechive_mode
-        self._L = spec.adaptive_spechive_num_interval_tokens
+        self._L = spec.num_speculative_tokens
 
         self._delegate: DraftModelProposer
         self._inter_dit: IntermediateDraftModelProposer | None = None
