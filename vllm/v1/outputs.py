@@ -208,7 +208,7 @@ class ECConnectorOutput:
 
 @dataclass
 class SpecDecodeCostBreakdown:
-    """Per-batch cost breakdown for hierarchical speculative verification.
+    """Per-batch optional timing breakdown for speculative decoding (e.g. profiling).
 
     Batch-level times are added once to SpecDecodingStats; per-request
     num_partial_accepted_tokens are accumulated per request.
@@ -265,7 +265,7 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
-    # Hierarchical speculative verification: timing and partial acceptance per batch.
+    # Staged speculative verification cost breakdown per batch.
     spec_decode_cost_breakdown: SpecDecodeCostBreakdown | None = None
 
 

@@ -1,90 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for hierarchical verification config and spec decode cost breakdown metrics.
-
-Run from repo root:
-  pytest tests/v1/spec_decode/test_hierarchical_verification_config.py -v
-  python scripts/run_hierarchical_verification_tests.py
-"""
+"""Tests for spec decode cost breakdown metrics (SpecDecodingStats / logging)."""
 
 import pytest
-from pydantic import ValidationError
 
-from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingStats
 
 
-def _make_ngram_speculative_config(
-    hierarchical_verification: bool = False,
-    compress_method: str = "random",
-    compression_ratio: float = 0.5,
-) -> SpeculativeConfig:
-    """Minimal SpeculativeConfig with ngram (no draft model) for config tests."""
-    target_model_config = ModelConfig(
-        "facebook/opt-125m",
-        trust_remote_code=True,
-    )
-    return SpeculativeConfig(
-        method="ngram",
-        prompt_lookup_min=1,
-        prompt_lookup_max=1,
-        num_speculative_tokens=2,
-        target_model_config=target_model_config,
-        target_parallel_config=ParallelConfig(),
-        hierarchical_verification=hierarchical_verification,
-        compress_method=compress_method,
-        compression_ratio=compression_ratio,
-    )
-
-
-class TestHierarchicalVerificationConfig:
-    """Tests for hierarchical_verification, compress_method, compression_ratio."""
-
-    def test_defaults(self) -> None:
-        """Without hierarchical_verification, defaults are applied."""
-        config = _make_ngram_speculative_config()
-        assert config.hierarchical_verification is False
-        assert config.compress_method == "random"
-        assert config.compression_ratio == 0.5
-
-    def test_hierarchical_verification_explicit(self) -> None:
-        """Explicit hierarchical_verification=True and custom compression."""
-        config = _make_ngram_speculative_config(
-            hierarchical_verification=True,
-            compress_method="random",
-            compression_ratio=0.25,
-        )
-        assert config.hierarchical_verification is True
-        assert config.compress_method == "random"
-        assert config.compression_ratio == 0.25
-
-    def test_compression_ratio_bounds(self) -> None:
-        """compression_ratio must be in (0, 1]."""
-        with pytest.raises(ValidationError):
-            _make_ngram_speculative_config(compression_ratio=0.0)
-        with pytest.raises(ValidationError):
-            _make_ngram_speculative_config(compression_ratio=1.5)
-        # valid
-        c = _make_ngram_speculative_config(compression_ratio=1.0)
-        assert c.compression_ratio == 1.0
-
-    def test_compute_hash_includes_hierarchical_verification(self) -> None:
-        """Hash differs when hierarchical_verification or compression params change."""
-        c1 = _make_ngram_speculative_config(hierarchical_verification=False)
-        c2 = _make_ngram_speculative_config(hierarchical_verification=True)
-        assert c1.compute_hash() != c2.compute_hash()
-
-        c3 = _make_ngram_speculative_config(
-            hierarchical_verification=True, compression_ratio=0.3
-        )
-        c4 = _make_ngram_speculative_config(
-            hierarchical_verification=True, compression_ratio=0.5
-        )
-        assert c3.compute_hash() != c4.compute_hash()
-
-
 class TestSpecDecodingStatsCostBreakdown:
-    """Tests for SpecDecodingStats cost breakdown fields and observe_draft_with_cost_breakdown."""
+    """Tests for SpecDecodingStats cost breakdown and observe_draft_with_cost_breakdown."""
 
     def test_new_has_zero_cost_breakdown(self) -> None:
         stats = SpecDecodingStats.new(num_spec_tokens=4)

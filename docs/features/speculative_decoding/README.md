@@ -10,27 +10,10 @@ vLLM supports a variety of methods of speculative decoding. Model-based methods 
 
 - [EAGLE](eagle.md)
 - [Draft Model](draft_model.md)
+- **Adaptive spechive** (`method=adaptive_spechive`): load a draft model (`model`), an intermediate verifier (`intermediate_model`), and choose `adaptive_spechive_mode`: `draft_target` (draft→target), `inter_verification` (intermediate→target, same proposer path as draft), or `hierarchical_verification` (draft proposes, intermediate verifies with the same `RejectionSampler` contract as target, `draft_probs=None`). Draft and intermediate must share the target vocabulary and (for `inter_verification`/`hierarchical_verification`) the same hidden size. `adaptive_spechive_num_interval_tokens` bounds the implied outer length `n_iv + num_speculative_tokens * (n_iv + 1)` against the sampler limit (128). Chunked multi-round hierarchical verification uses `n_iv` rounds.
 - [Multi-Layer Perceptron](mlp.md)
 - [N-Gram](n_gram.md)
 - [Suffix Decoding](suffix.md)
-
-### Hierarchical speculative verification (experimental in this branch)
-
-In this branch, we add an **experimental hierarchical verification** mechanism
-for speculative decoding. It uses:
-
-- A **partial verification** step with a **compressed KV cache** (either
-  token-level or block-level compression), and
-- Periodic **full verification** steps with the full KV cache,
-  controlled by `SpeculativeConfig.full_verification_interval`.
-
-This can reduce the cost of verification for medium/long sequences, at the cost
-of a more complex scheduling and KV cache management strategy.
-
-For design details, configuration fields, instrumentation, and a benchmark
-script, see:
-
-- [Hierarchical Speculative Verification with Compressed KV](hierarchical_verification.md)
 
 ## Lossless guarantees of Speculative Decoding
 

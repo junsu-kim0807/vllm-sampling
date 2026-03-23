@@ -542,6 +542,7 @@ def build_python_command(
     warmup_max_tokens: int,
     num_spec_tokens: int,
     verbose: bool,
+    debug: bool,
     *,
     test: bool,
     test_samples: int,
@@ -621,6 +622,8 @@ def build_python_command(
 
     if verbose:
         parts.append("--verbose")
+    if debug:
+        parts.append("--debug")
 
     return " \\\n  ".join(parts)
 
@@ -637,6 +640,7 @@ def render_job_script(
     warmup_max_tokens: int,
     num_spec_tokens: int,
     verbose: bool,
+    debug: bool,
     *,
     test: bool,
     test_samples: int,
@@ -697,6 +701,7 @@ def render_job_script(
         warmup_max_tokens=warmup_max_tokens,
         num_spec_tokens=num_spec_tokens,
         verbose=verbose,
+        debug=debug,
         test=test,
         test_samples=test_samples,
         method=method,
@@ -713,6 +718,7 @@ PAIR_ID={shquote(pair.pair_id)}
 PAIR_SLUG={shquote(slug)}
 TEST_MODE={shquote(str(test))}
 NUM_SPEC_TOKENS={num_spec_tokens}
+SPECHIVE_DEBUG={shquote("1" if debug else "0")}
 
 JOB_DIR={shquote(str(job_dir))}
 RESULT_DATASET_ROOT={shquote(str(result_dataset_root))}
@@ -730,6 +736,7 @@ echo "DRAFT_MODEL: {pair.draft_model}"
 echo "TARGET_MODEL: {pair.target_model}"
 echo "TP_SIZE: {pair.tp_size}"
 echo "NUM_SPEC_TOKENS: ${{NUM_SPEC_TOKENS}}"
+echo "SPECHIVE_DEBUG: ${{SPECHIVE_DEBUG}}"
 echo "TIME_LIMIT: {time_limit}"
 echo "JOB_DIR: ${{JOB_DIR}}"
 echo "RESULT_DATASET_ROOT: ${{RESULT_DATASET_ROOT}}"
@@ -737,6 +744,13 @@ echo "PAIR_RESULT_DIR: ${{PAIR_RESULT_DIR}}"
 echo "PWD: $(pwd)"
 echo "PYTHON: $(which python)"
 echo "============================================================"
+
+if [[ "${{SPECHIVE_DEBUG}}" == "1" ]]; then
+  export VLLM_SPEC_DIT_DEBUG=1
+  export VLLM_SPEC_DIT_DEBUG_SUMMARY=1
+  export VLLM_SPEC_SPECHIVE_DEBUG=1
+  export VLLM_SPEC_SPECHIVE_DEBUG_SUMMARY=1
+fi
 
 {command}
 
@@ -856,6 +870,22 @@ def parse_args() -> argparse.Namespace:
         help="MagicDec KV budget tokens when method=magicdec (default: 256).",
     )
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Enable DIT runtime debug validation in generated jobs "
+            "(exports VLLM_SPEC_DIT_DEBUG=1 and passes --debug)."
+        ),
+    )
+    parser.add_argument(
+        "--spechive-debug",
+        action="store_true",
+        help=(
+            "Enable spechive runtime debug checks in generated jobs "
+            "(exports VLLM_SPEC_SPECHIVE_DEBUG=1 and passes --debug)."
+        ),
+    )
 
     parser.add_argument(
         "--test",
@@ -931,6 +961,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     ensure_dirs()
+    debug_enabled = args.debug or args.spechive_debug
 
     selected_modes = [args.batch, args.test, args.draft, args.verify]
     if sum(1 for x in selected_modes if x) > 1:
@@ -1188,6 +1219,7 @@ def main() -> None:
                 warmup_max_tokens=warmup_max_tokens,
                 num_spec_tokens=num_spec,
                 verbose=args.verbose,
+                debug=debug_enabled,
                 test=test,
                 test_samples=test_samples,
                 method=method,
@@ -1307,6 +1339,7 @@ def main() -> None:
                         warmup_max_tokens=args.warmup_max_tokens,
                         num_spec_tokens=num_spec,
                         verbose=args.verbose,
+                        debug=debug_enabled,
                         test=False,
                         test_samples=5,
                         method="speculative",
@@ -1362,6 +1395,7 @@ def main() -> None:
                         warmup_max_tokens=args.warmup_max_tokens,
                         num_spec_tokens=num_spec,
                         verbose=args.verbose,
+                        debug=debug_enabled,
                         test=False,
                         test_samples=5,
                         method="speculative",
@@ -1431,6 +1465,7 @@ def main() -> None:
                 warmup_max_tokens=warmup_max_tokens,
                 num_spec_tokens=num_spec,
                 verbose=args.verbose,
+                debug=debug_enabled,
                 test=test,
                 test_samples=test_samples,
                 jobs_subdir=pair_subdir,

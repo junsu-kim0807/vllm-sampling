@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import json
 import os
 import threading
 import time
@@ -60,7 +61,6 @@ from vllm.model_executor.layers.rotary_embedding import (
     XDRotaryEmbedding,
 )
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -125,7 +125,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -139,13 +139,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
-)
-from vllm.v1.spec_decode.kv_compression import (
-    CompressedKVMetadata,
-    build_block_level_compression_view,
-    build_compressed_kv_caches,
-    build_compressed_kv_metadata,
-    get_compression_indices_batch,
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -166,16 +159,26 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
+    PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
     get_spec_verify_draft_match_time_sec_and_reset,
 )
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.adaptive_spechive import (
+    AdaptiveSpechiveProposer,
+    _build_hybrid_bundle_from_rows,
+    _flatten_prob_rows_for_output,
+)
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
-from vllm.v1.spec_decode.kv_compression import build_compression_mask
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.spec_stage_ops import (
+    sanitize_hybrid_bundle_for_metadata,
+)
+from vllm.v1.spec_decode.spec_stage_runtime import HybridProposalBundle
+from vllm.v1.spec_decode.spec_stage_utils import slice_sampling_metadata_for_subbatch
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -385,9 +388,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
-    compression_time_sec: float = 0.0
-    # Hierarchical verification: timing from execute_model (one forward for now).
-    partial_verification_time_sec: float = 0.0
+    # Target forward time when VLLM_SPEC_PROFILE_TIME=1 (synced for GPU timing).
     full_verification_time_sec: float = 0.0
 
 
@@ -494,8 +495,6 @@ class GPUModelRunner(
         self.kv_caches: list[torch.Tensor] = []
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
-        # For hierarchical verification: step count (incremented on each spec-decode forward).
-        self._hierarchical_verification_step: int = 0
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
@@ -515,6 +514,7 @@ class GPUModelRunner(
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DraftModelProposer
+                | AdaptiveSpechiveProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
             )
@@ -522,6 +522,12 @@ class GPUModelRunner(
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "adaptive_spechive":
+                self.drafter = AdaptiveSpechiveProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
+                )
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
                     vllm_config=self.vllm_config,
@@ -551,10 +557,27 @@ class GPUModelRunner(
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(self.sampler)
+        self.pending_hybrid_spec_bundle: HybridProposalBundle | None = None
+        self._dit_debug_enabled = (
+            os.environ.get("VLLM_SPEC_DIT_DEBUG", "0") == "1"
+            or os.environ.get("VLLM_SPEC_SPECHIVE_DEBUG", "0") == "1"
+        )
+        self._dit_debug_summary = (
+            os.environ.get("VLLM_SPEC_DIT_DEBUG_SUMMARY", "0") == "1"
+            or os.environ.get("VLLM_SPEC_SPECHIVE_DEBUG_SUMMARY", "0") == "1"
+        )
+        self._dit_debug_step_id = 0
+        self._dit_debug_check_counts: dict[str, list[int]] = defaultdict(
+            lambda: [0, 0]
+        )
+        self._dit_debug_last_commit_len: dict[str, int] = {}
+        self._dit_debug_last_commit_token: dict[str, int] = {}
 
         self.num_spec_tokens = 0
         if self.speculative_config:
-            self.num_spec_tokens = self.speculative_config.num_speculative_tokens
+            self.num_spec_tokens = (
+                self.speculative_config.runner_num_speculative_tokens()
+            )
             draft_config = self.speculative_config.draft_model_config
             if draft_config is not None and draft_config.max_model_len is not None:
                 self.effective_drafter_max_model_len = draft_config.max_model_len
@@ -1794,7 +1817,6 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
-        compressed_kv_metadata: CompressedKVMetadata | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1868,23 +1890,6 @@ class GPUModelRunner(
             slot_mapping=slot_mapping_gid_0,
             causal=True,
         )
-        if compressed_kv_metadata is not None:
-            seq_lens_comp = torch.zeros(
-                num_reqs_padded, dtype=torch.int32, device=self.device
-            )
-            seq_lens_comp[:num_reqs] = torch.as_tensor(
-                compressed_kv_metadata.seq_lens, dtype=torch.int32, device=self.device
-            )
-            cm_base.seq_lens = seq_lens_comp
-            n_comp_blocks = compressed_kv_metadata.block_table.shape[1]
-            block_table_comp = torch.full(
-                (num_reqs_padded, n_comp_blocks), -1, dtype=torch.int32, device=self.device
-            )
-            block_table_comp[:num_reqs] = torch.as_tensor(
-                compressed_kv_metadata.block_table, dtype=torch.int32, device=self.device
-            )
-            cm_base.block_table_tensor = block_table_comp
-            cm_base.max_seq_len = int(compressed_kv_metadata.num_compressed_slots)
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -2991,17 +2996,406 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    def set_pending_hybrid_spec_bundle(
+        self, bundle: HybridProposalBundle | None
+    ) -> None:
+        self.pending_hybrid_spec_bundle = bundle
+
+    def take_pending_hybrid_spec_bundle(self) -> HybridProposalBundle | None:
+        bundle = self.pending_hybrid_spec_bundle
+        self.pending_hybrid_spec_bundle = None
+        return bundle
+
+    def _is_dit_debug_enabled(self) -> bool:
+        return self._dit_debug_enabled
+
+    def _dit_debug_event(self, event_name: str, payload: dict[str, Any]) -> None:
+        if not self._is_dit_debug_enabled():
+            return
+        event = {
+            "event": event_name,
+            "step_id": self._dit_debug_step_id,
+            **payload,
+        }
+        logger.info("DIT_DEBUG %s", json.dumps(event, sort_keys=True, default=str))
+
+    def _dit_debug_assert(
+        self, cond: bool, code: str, *, detail: str = "", context: dict[str, Any] | None = None
+    ) -> bool:
+        if not self._is_dit_debug_enabled():
+            return cond
+        counts = self._dit_debug_check_counts[code]
+        if cond:
+            counts[0] += 1
+        else:
+            counts[1] += 1
+        payload: dict[str, Any] = {"check_code": code, "ok": cond, "detail": detail}
+        if context is not None:
+            payload.update(context)
+        self._dit_debug_event("check", payload)
+        return cond
+
+    def _dit_debug_emit_summary(self, *, reason: str) -> None:
+        if not (self._is_dit_debug_enabled() and self._dit_debug_summary):
+            return
+        summary = {
+            code: {"pass": counts[0], "fail": counts[1]}
+            for code, counts in self._dit_debug_check_counts.items()
+        }
+        self._dit_debug_event("summary", {"reason": reason, "checks": summary})
+        self._dit_debug_check_counts.clear()
+
+    # DIT shadow replay helpers were removed. DIT now runs with local round
+    # orchestration and token buffers inside run_hierarchical_verification_rounds().
+
+    def run_hierarchical_verification_rounds(
+        self,
+        *,
+        drafter: AdaptiveSpechiveProposer,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata: SamplingMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, HybridProposalBundle]:
+        assert self.speculative_config is not None
+        assert drafter._inter_dit is not None
+        self._dit_debug_step_id += 1
+        cap = self.speculative_config.runner_num_speculative_tokens()
+        L = self.speculative_config.adaptive_spechive_num_interval_tokens
+        n_inner = self.speculative_config.num_speculative_tokens
+        batch_size = common_attn_metadata.batch_size()
+        req_ids = list(self.input_batch.req_ids[:batch_size])
+        use_draft_probs = (
+            self.speculative_config.use_draft_probs_in_rejection
+            and not sampling_metadata.all_greedy
+        )
+        vocab_size = self.model_config.get_vocab_size()
+        self._dit_debug_event(
+            "spechive_rounds_start",
+            {
+                "batch_size": batch_size,
+                "interval_tokens": L,
+                "num_inner_rounds": n_inner,
+                "runner_num_spec_tokens": cap,
+            },
+        )
+        for b, req_id in enumerate(req_ids):
+            if req_id in self._dit_debug_last_commit_token:
+                expected = self._dit_debug_last_commit_token[req_id]
+                got = int(next_token_ids[b].item())
+                self._dit_debug_assert(
+                    got == expected,
+                    "check6_next_draft_starts_from_committed_token",
+                    detail=f"req_id={req_id}, expected_next={expected}, got_next={got}",
+                )
+
+        prefix_rows: list[list[int]] = [[] for _ in range(batch_size)]
+        prefix_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+        source_stage_rows: list[list[int]] = [[] for _ in range(batch_size)]
+        expected_prefix_rows: list[list[int]] = [[] for _ in range(batch_size)]
+
+        for round_idx in range(n_inner):
+            self._dit_debug_assert(
+                prefix_rows == expected_prefix_rows,
+                "check3_next_draft_starts_from_intermediate_prefix",
+                detail=f"round={round_idx}",
+            )
+            round_sm = slice_sampling_metadata_for_subbatch(
+                sampling_metadata,
+                list(range(batch_size)),
+                provisional_prefix_rows=prefix_rows,
+                sampled_ids_only=True,
+            )
+            if self._is_dit_debug_enabled():
+                for b in range(batch_size):
+                    base_len = len(sampling_metadata.output_token_ids[b])
+                    got_len = len(round_sm.output_token_ids[b])
+                    want_len = base_len + len(prefix_rows[b])
+                    self._dit_debug_assert(
+                        got_len == want_len,
+                        "check_meta_sampling_prefix_slicing",
+                        detail=(
+                            f"round={round_idx}, req={b}, base_len={base_len}, "
+                            f"prefix_len={len(prefix_rows[b])}, got_len={got_len}"
+                        ),
+                    )
+            proposal = drafter.propose_chunk_from_prefix(
+                base_target_token_ids=target_token_ids,
+                base_target_positions=target_positions,
+                base_target_hidden_states=target_hidden_states,
+                base_next_token_ids=next_token_ids,
+                base_common_attn_metadata=common_attn_metadata,
+                base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                prefix_rows=prefix_rows,
+                chunk_len=L,
+                sampling_metadata=round_sm,
+                use_draft_probs=use_draft_probs,
+            )
+            self._dit_debug_assert(
+                int(proposal.tokens.shape[1]) == int(L),
+                "check1_chunk_proposal_width",
+                detail=(
+                    f"round={round_idx}, expected_chunk={L}, "
+                    f"proposal_shape={tuple(proposal.tokens.shape)}"
+                ),
+            )
+            verification = drafter.verify_chunk_with_inter_verifier(
+                base_target_token_ids=target_token_ids,
+                base_target_positions=target_positions,
+                base_target_hidden_states=target_hidden_states,
+                base_next_token_ids=next_token_ids,
+                base_common_attn_metadata=common_attn_metadata,
+                base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                prefix_rows=prefix_rows,
+                candidate_tokens=proposal.tokens,
+            )
+            self._dit_debug_assert(
+                int(verification.logits_flat.shape[0]) == int(batch_size * L),
+                "check1_chunk_verification_batchxL",
+                detail=(
+                    f"round={round_idx}, expected_rows={batch_size * L}, "
+                    f"got={verification.logits_flat.shape[0]}"
+                ),
+            )
+            decision = drafter.run_inter_verification_acceptance(
+                proposal=proposal,
+                verification=verification,
+                sampling_metadata=round_sm,
+                rejection_sampler=self.rejection_sampler,
+                vocab_size=vocab_size,
+                use_draft_probs=use_draft_probs,
+            )
+            before_lens = [len(r) for r in prefix_rows]
+            for b, emitted in enumerate(decision.emitted_rows):
+                prefix_rows[b].extend(emitted)
+                expected_prefix_rows[b].extend(emitted)
+                source_stage_rows[b].extend([0] * len(emitted))
+                if use_draft_probs:
+                    prefix_prob_rows[b].extend(decision.emitted_prob_rows[b])
+            after_lens = [len(r) for r in prefix_rows]
+            self._dit_debug_assert(
+                all(
+                    after_lens[b] - before_lens[b] == len(decision.emitted_rows[b])
+                    for b in range(batch_size)
+                ),
+                "check_hv_round_prefix_growth",
+                detail=f"round={round_idx}, before={before_lens}, after={after_lens}",
+            )
+            self._dit_debug_assert(
+                all(
+                    len(source_stage_rows[b]) == len(prefix_rows[b]) for b in range(batch_size)
+                ),
+                "check_hv_probs_and_stage_alignment",
+                detail=f"round={round_idx}, source_stage_lens={[len(r) for r in source_stage_rows]}",
+            )
+            if use_draft_probs:
+                self._dit_debug_assert(
+                    all(
+                        len(prefix_prob_rows[b]) == len(prefix_rows[b])
+                        and len(decision.emitted_prob_rows[b]) == len(decision.emitted_rows[b])
+                        for b in range(batch_size)
+                    ),
+                    "check_hv_probs_and_stage_alignment",
+                    detail=f"round={round_idx}, prefix_prob_lens={[len(r) for r in prefix_prob_rows]}",
+                )
+
+        self._dit_debug_assert(
+            n_inner == int(self.speculative_config.num_speculative_tokens),
+            "check2_round_count_matches_interval",
+            detail=f"executed_rounds={n_inner}",
+        )
+
+        remaining_cap = max(
+            (max(0, cap - len(prefix_rows[b])) for b in range(batch_size)),
+            default=0,
+        )
+        tail_len = min(L, remaining_cap)
+        if tail_len > 0:
+            tail_sm = slice_sampling_metadata_for_subbatch(
+                sampling_metadata,
+                list(range(batch_size)),
+                provisional_prefix_rows=prefix_rows,
+                sampled_ids_only=True,
+            )
+            tail = drafter.propose_chunk_from_prefix(
+                base_target_token_ids=target_token_ids,
+                base_target_positions=target_positions,
+                base_target_hidden_states=target_hidden_states,
+                base_next_token_ids=next_token_ids,
+                base_common_attn_metadata=common_attn_metadata,
+                base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                prefix_rows=prefix_rows,
+                chunk_len=tail_len,
+                sampling_metadata=tail_sm,
+                use_draft_probs=use_draft_probs,
+            )
+            tail_rows = [
+                [int(tok) for tok in tail.tokens[b].tolist()] for b in range(batch_size)
+            ]
+            tail_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+            if use_draft_probs and tail.probs is not None:
+                for b in range(batch_size):
+                    tail_prob_rows[b] = [tail.probs[b, j] for j in range(tail_len)]
+            for b, emitted in enumerate(tail_rows):
+                prefix_rows[b].extend(emitted)
+                source_stage_rows[b].extend([1] * len(emitted))
+                if use_draft_probs:
+                    prefix_prob_rows[b].extend(tail_prob_rows[b])
+            self._dit_debug_assert(
+                all(
+                    len(source_stage_rows[b]) == len(prefix_rows[b]) for b in range(batch_size)
+                ),
+                "check_hv_probs_and_stage_alignment",
+                detail=f"tail, source_stage_lens={[len(r) for r in source_stage_rows]}",
+            )
+            if use_draft_probs:
+                self._dit_debug_assert(
+                    all(len(prefix_prob_rows[b]) == len(prefix_rows[b]) for b in range(batch_size)),
+                    "check_hv_probs_and_stage_alignment",
+                    detail=f"tail, prefix_prob_lens={[len(r) for r in prefix_prob_rows]}",
+                )
+
+        out = torch.full(
+            (batch_size, cap),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=target_token_ids.device,
+        )
+        for b in range(batch_size):
+            valid = min(cap, len(prefix_rows[b]))
+            if valid > 0:
+                out[b, :valid] = torch.tensor(
+                    prefix_rows[b][:valid],
+                    dtype=torch.int32,
+                    device=target_token_ids.device,
+                )
+                source_stage_rows[b] = source_stage_rows[b][:valid]
+        draft_probs_flat = (
+            _flatten_prob_rows_for_output(prefix_prob_rows, out)
+            if use_draft_probs
+            else None
+        )
+        bundle = _build_hybrid_bundle_from_rows(
+            out,
+            mode="hierarchical_verification",
+            draft_probs=draft_probs_flat,
+            source_stage_rows=source_stage_rows,
+        )
+        inter_verified_lens = [
+            sum(1 for stage in source_stage_rows[b] if stage == 0)
+            for b in range(batch_size)
+        ]
+        tail_draft_lens = [
+            sum(1 for stage in source_stage_rows[b] if stage == 1)
+            for b in range(batch_size)
+        ]
+        valid_out_lens = [
+            int((out[b] != PLACEHOLDER_TOKEN_ID).sum().item()) for b in range(batch_size)
+        ]
+        self._dit_debug_assert(
+            bundle.max_spec_len == cap,
+            "check4_target_verify_width_equals_num_spec_tokens",
+            detail=f"bundle.max_spec_len={bundle.max_spec_len}, cap={cap}",
+        )
+        self._dit_debug_assert(
+            all(
+                inter_verified_lens[b] + tail_draft_lens[b] == valid_out_lens[b]
+                for b in range(batch_size)
+            ),
+            "check5_target_verify_uses_intermediate_plus_tail_bundle",
+            detail=(
+                f"inter={inter_verified_lens}, tail={tail_draft_lens}, "
+                f"valid={valid_out_lens}"
+            ),
+        )
+        self._dit_debug_event(
+            "spechive_bundle_pre_target_verify",
+            {
+                "inter_verified_lens": inter_verified_lens,
+                "tail_draft_lens": tail_draft_lens,
+                "valid_out_lens": valid_out_lens,
+                "bundle_num_draft_tokens": bundle.num_draft_tokens,
+            },
+        )
+        self._dit_debug_assert(
+            all(stage in (0, 1) for row in source_stage_rows for stage in row),
+            "check_hv_probs_and_stage_alignment",
+            detail="source_stage must be in {0,1}",
+        )
+        return out, bundle
+
+    def _validate_hybrid_spec_bundle(
+        self,
+        bundle: HybridProposalBundle,
+        spec_decode_metadata: SpecDecodeMetadata,
+    ) -> HybridProposalBundle | None:
+        """Validate proposer bundle against current target verification contract."""
+        pre = {
+            "num_draft_tokens": list(bundle.num_draft_tokens),
+            "bundle_total": int(bundle.cu_num_draft_tokens[-1].item())
+            if bundle.cu_num_draft_tokens.numel() > 0
+            else 0,
+            "expected_total": int(spec_decode_metadata.cu_num_draft_tokens[-1].item())
+            if spec_decode_metadata.cu_num_draft_tokens.numel() > 0
+            else 0,
+            "max_spec_len": int(bundle.max_spec_len),
+            "runner_num_spec_tokens": int(self.num_spec_tokens),
+            "has_draft_probs": bundle.draft_probs is not None,
+            "has_source_stage": bundle.source_stage is not None,
+        }
+        sanitized, info = sanitize_hybrid_bundle_for_metadata(
+            bundle,
+            spec_decode_metadata,
+            runner_num_spec_tokens=self.num_spec_tokens,
+        )
+        post = {
+            "sanitized_is_none": sanitized is None,
+            "has_draft_probs": sanitized.draft_probs is not None if sanitized is not None else False,
+            "has_source_stage": sanitized.source_stage is not None if sanitized is not None else False,
+        }
+        self._dit_debug_event(
+            "spechive_bundle_sanitize",
+            {**pre, **post, "info": info},
+        )
+        if sanitized is None:
+            logger.warning("Dropping hybrid bundle: %s.", info)
+            return None
+        if info is not None:
+            logger.warning("Hybrid bundle note: %s.", info)
+        if bundle.draft_probs is not None and sanitized.draft_probs is None:
+            logger.warning(
+                "Ignoring hybrid draft_probs due to shape mismatch: %s",
+                tuple(bundle.draft_probs.shape),
+            )
+        if bundle.source_stage is not None and sanitized.source_stage is None:
+            logger.warning(
+                "Ignoring hybrid source_stage due to shape mismatch: %s",
+                tuple(bundle.source_stage.shape),
+            )
+        return sanitized
+
     def _sample(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> SamplerOutput:
+
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
+            self.pending_hybrid_spec_bundle = None
+            discard_pending_state = getattr(
+                self.drafter, "discard_pending_hierarchical_verification_state", None
+            )
+            if callable(discard_pending_state):
+                discard_pending_state()
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
@@ -3013,12 +3407,89 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
+        draft_probs = None
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_draft_probs_in_rejection
+        ):
+            draft_probs = getattr(self.drafter, "last_draft_probs_flat", None)
+        bundle = self.take_pending_hybrid_spec_bundle()
+        if bundle is not None:
+            validated_bundle = self._validate_hybrid_spec_bundle(
+                bundle, spec_decode_metadata
+            )
+            if validated_bundle is None:
+                self._dit_debug_event(
+                    "spechive_bundle_cleanup_on_validation_failure",
+                    {"reason": "bundle_validation_failed"},
+                )
+                discard_pending_state = getattr(
+                    self.drafter, "discard_pending_hierarchical_verification_state", None
+                )
+                if callable(discard_pending_state):
+                    discard_pending_state()
+            bundle = validated_bundle
+        if bundle is not None and bundle.draft_probs is not None:
+            draft_probs = bundle.draft_probs
+
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
-            None,  # draft_probs
+            draft_probs,
             logits,
             sampling_metadata,
         )
+        if bundle is not None and bundle.mode == "hierarchical_verification":
+            req_ids = list(self.input_batch.req_ids[: sampler_output.sampled_token_ids.shape[0]])
+            committed_lens: list[int] = []
+            committed_last_tokens: list[int] = []
+            for b, req_id in enumerate(req_ids):
+                row = sampler_output.sampled_token_ids[b]
+                committed = int((row != PLACEHOLDER_TOKEN_ID).sum().item())
+                committed_lens.append(committed)
+                last_token = (
+                    int(row[committed - 1].item()) if committed > 0 else PLACEHOLDER_TOKEN_ID
+                )
+                committed_last_tokens.append(last_token)
+                self._dit_debug_last_commit_len[req_id] = committed
+                if committed > 0:
+                    self._dit_debug_last_commit_token[req_id] = last_token
+            self._dit_debug_assert(
+                all(
+                    committed_lens[b] <= bundle.num_draft_tokens[b] + 1
+                    for b in range(len(committed_lens))
+                ),
+                "check5_target_verification_commits_from_bundle",
+                detail=(
+                    f"committed={committed_lens}, "
+                    f"bundle_num_draft={bundle.num_draft_tokens}"
+                ),
+            )
+            self._dit_debug_event(
+                "spechive_target_commit",
+                {
+                    "committed_lens": committed_lens,
+                    "committed_last_tokens": committed_last_tokens,
+                    "bundle_num_draft_tokens": bundle.num_draft_tokens,
+                },
+            )
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_draft_probs_in_rejection
+        ):
+            clear_fn = getattr(self.drafter, "clear_draft_probs", None)
+            if clear_fn is not None:
+                clear_fn()
+        if bundle is not None:
+            on_target_verification = getattr(
+                self.drafter, "on_target_verification", None
+            )
+            if callable(on_target_verification):
+                on_target_verification(
+                    bundle=bundle,
+                    sampled_token_ids=sampler_output.sampled_token_ids,
+                )
+            if bundle.mode == "hierarchical_verification":
+                self._dit_debug_emit_summary(reason="target_verification_done")
         return sampler_output
 
     def _bookkeeping_sync(
@@ -3367,40 +3838,6 @@ class GPUModelRunner(
                 pyt_hooks.register_hooks(self.model, self.model.__class__.__name__)
                 self.layerwise_nvtx_hooks_registered = True
 
-    def _get_ordered_kv_layer_names(self) -> list[str]:
-        """Return KV layer names in the same order as self.kv_caches (for swap)."""
-        num_attn_module = 1
-        index2name: dict[int, list[str]] = defaultdict(list)
-        for kv_cache_group in self.kv_cache_config.kv_cache_groups:
-            for layer_name in kv_cache_group.layer_names:
-                idx = extract_layer_index(layer_name, num_attn_module)
-                index2name[idx].append(layer_name)
-        return [
-            name
-            for idx in sorted(index2name)
-            for name in index2name[idx]
-        ]
-
-    def _swap_kv_caches_for_partial(
-        self, compressed_caches: list[torch.Tensor]
-    ) -> None:
-        """Temporarily bind compressed KV caches to attention layers (for partial verification)."""
-        names = self._get_ordered_kv_layer_names()
-        assert len(names) == len(compressed_caches), (
-            f"Layer count {len(names)} != compressed caches {len(compressed_caches)}"
-        )
-        for i, name in enumerate(names):
-            mod = self.model.get_submodule(name)
-            mod.kv_cache = [compressed_caches[i]]
-
-    def _restore_kv_caches(self) -> None:
-        """Restore full KV caches on attention layers after partial verification."""
-        names = self._get_ordered_kv_layer_names()
-        assert len(names) == len(self.kv_caches)
-        for i, name in enumerate(names):
-            mod = self.model.get_submodule(name)
-            mod.kv_cache = [self.kv_caches[i]]
-
     def _get_slot_mappings(
         self,
         num_tokens_padded: int,
@@ -3644,121 +4081,6 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            # Hierarchical verification: partial step uses compressed KV.
-            spec_config = self.speculative_config
-            is_partial_step = False
-            compressed_kv_caches: list[torch.Tensor] | None = None
-            compressed_kv_metadata: CompressedKVMetadata | None = None
-            if (
-                use_spec_decode
-                and spec_config is not None
-                and getattr(spec_config, "hierarchical_verification", False)
-                and len(self.kv_caches) > 0
-            ):
-                interval = getattr(spec_config, "full_verification_interval", 1)
-                is_partial_step = (
-                    self._hierarchical_verification_step % interval != 0
-                )
-                if is_partial_step:
-                    seed = getattr(
-                        self.vllm_config.model_config,
-                        "seed",
-                        0,
-                    )
-                    # Two compression modes:
-                    # - "random": token-level compaction (full -> compressed buffer).
-                    # - "block_random": block-level subsampling (no KV copy).
-                    if getattr(spec_config, "compress_method", "random") == "random":
-                        compression_indices = get_compression_indices_batch(
-                            num_tokens_unpadded,
-                            spec_config.compression_ratio,
-                            spec_config.compress_method,
-                            self.device,
-                            seed=seed,
-                        )
-                        if (
-                            compression_indices is not None
-                            and compression_indices.shape[0] > 0
-                        ):
-                            block_size = (
-                                self.kv_cache_config.kv_cache_groups[0]
-                                .kv_cache_spec.block_size
-                            )
-                            slot_mapping_g0 = slot_mappings_by_group[0][
-                                :num_tokens_unpadded
-                            ]
-                            t_comp = time.perf_counter()
-                            compressed_kv_caches = build_compressed_kv_caches(
-                                self.kv_caches,
-                                slot_mapping_g0,
-                                compression_indices,
-                                block_size,
-                            )
-                            query_start_loc_np = self.query_start_loc.np[: num_reqs + 1]
-                            compressed_kv_metadata = build_compressed_kv_metadata(
-                                compression_indices,
-                                query_start_loc_np,
-                                num_reqs,
-                                block_size,
-                            )
-                            compression_time_sec = time.perf_counter() - t_comp
-                        else:
-                            is_partial_step = False
-                    elif (
-                        getattr(spec_config, "compress_method", "random")
-                        == "block_random"
-                    ):
-                        # Block-level compression: subsample blocks in block_table
-                        # without touching the underlying KV cache tensors.
-                        blk = self.input_batch.block_table[0]
-                        block_table_np = blk.block_table.np[:num_reqs, :]
-                        num_blocks_per_row = blk.num_blocks_per_row[:num_reqs]
-                        t_comp = time.perf_counter()
-                        compressed_block_table_np, compressed_blocks_per_row = (
-                            build_block_level_compression_view(
-                                block_table_np,
-                                num_blocks_per_row,
-                                spec_config.compression_ratio,
-                                seed=seed,
-                            )
-                        )
-                        # Build compressed seq_lens (tokens) from blocks.
-                        block_size = (
-                            self.kv_cache_config.kv_cache_groups[0]
-                            .kv_cache_spec.block_size
-                        )
-                        seq_lens_comp = torch.as_tensor(
-                            compressed_blocks_per_row * block_size,
-                            dtype=torch.int32,
-                            device=self.device,
-                        )
-                        # Prepare a block_table tensor padded to num_reqs_padded.
-                        max_blocks_kept = compressed_block_table_np.shape[1]
-                        compressed_block_table = torch.full(
-                            (num_reqs_padded, max_blocks_kept),
-                            -1,
-                            dtype=torch.int32,
-                            device=self.device,
-                        )
-                        compressed_block_table[:num_reqs] = torch.as_tensor(
-                            compressed_block_table_np,
-                            dtype=torch.int32,
-                            device=self.device,
-                        )
-                        # For block-level compression, we don't build a separate
-                        # compressed KV buffer, but we pass the overridden
-                        # block_table/seq_lens via CompressedKVMetadata-like object.
-                        compressed_kv_metadata = CompressedKVMetadata(
-                            seq_lens=seq_lens_comp.cpu().numpy(),
-                            block_table=compressed_block_table_np,
-                            block_size=block_size,
-                            num_compressed_slots=int(seq_lens_comp.sum().item()),
-                        )
-                        compression_time_sec = time.perf_counter() - t_comp
-                    else:
-                        # Unknown compress_method for hierarchical verification.
-                        is_partial_step = False
-
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -3772,7 +4094,6 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
-                    compressed_kv_metadata=compressed_kv_metadata,
                 )
             )
 
@@ -3807,8 +4128,7 @@ class GPUModelRunner(
         # When spec decode is enabled, delay clearing connector metadata
         # until after draft model runs in sample_tokens.
         clear_kv_metadata = self.speculative_config is None
-        compression_time_sec = 0.0
-        partial_verification_time_sec = 0.0
+        spec_config = self.speculative_config
         full_verification_time_sec = 0.0
         with (
             set_forward_context(
@@ -3821,62 +4141,32 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
-                compressed_kv_caches=compressed_kv_caches,
-                compressed_kv_metadata=compressed_kv_metadata,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output, clear_metadata=clear_kv_metadata
             ) as kv_connector_output,
         ):
-            if compressed_kv_caches is not None:
-                self._swap_kv_caches_for_partial(compressed_kv_caches)
-            try:
-                # When reporting verification time (hierarchical or VLLM_SPEC_PROFILE_TIME),
-                # sync so we measure actual GPU execution time, not kernel launch time.
-                # Without sync, 4B/8B/30B all show similar small values (async launch only).
-                sync_for_verification_timing = (
-                    use_spec_decode
-                    and spec_config is not None
-                    and (
-                        getattr(spec_config, "hierarchical_verification", False)
-                        or os.environ.get("VLLM_SPEC_PROFILE_TIME", "0") == "1"
-                    )
-                )
-                if sync_for_verification_timing:
-                    torch.cuda.synchronize()
-                t_forward_start = time.perf_counter()
-                model_output = self._model_forward(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-                if sync_for_verification_timing:
-                    torch.cuda.synchronize()
-                elapsed_forward = time.perf_counter() - t_forward_start
-                # Attribute forward time either to partial or full verification,
-                # depending on whether this step is using compressed KV.
-                if (
-                    use_spec_decode
-                    and spec_config is not None
-                    and getattr(spec_config, "hierarchical_verification", False)
-                    and is_partial_step
-                ):
-                    partial_verification_time_sec = elapsed_forward
-                else:
-                    full_verification_time_sec = elapsed_forward
-            finally:
-                if compressed_kv_caches is not None:
-                    self._restore_kv_caches()
-
-            if (
+            # When VLLM_SPEC_PROFILE_TIME=1, sync so we measure actual GPU time,
+            # not kernel launch latency only.
+            sync_for_verification_timing = (
                 use_spec_decode
                 and spec_config is not None
-                and getattr(spec_config, "hierarchical_verification", False)
-            ):
-                self._hierarchical_verification_step += 1
+                and os.environ.get("VLLM_SPEC_PROFILE_TIME", "0") == "1"
+            )
+            if sync_for_verification_timing:
+                torch.cuda.synchronize()
+            t_forward_start = time.perf_counter()
+            model_output = self._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
+            if sync_for_verification_timing:
+                torch.cuda.synchronize()
+                full_verification_time_sec = time.perf_counter() - t_forward_start
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3948,8 +4238,6 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
-            compression_time_sec,
-            partial_verification_time_sec,
             full_verification_time_sec,
         )
         self.kv_connector_output = kv_connector_output
@@ -3989,36 +4277,15 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
-            compression_time_sec,
-            partial_verification_time_sec,
             full_verification_time_sec,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # Hierarchical verification: optional compression and timing (for cost breakdown).
-        hierarchical_draft_time_sec = 0.0
-        hierarchical_compression_time_sec = compression_time_sec
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         spec_config = self.speculative_config
-        if (
-            use_spec_decode
-            and spec_config is not None
-            and getattr(spec_config, "hierarchical_verification", False)
-            and getattr(spec_config, "compress_method", "random") == "random"
-        ):
-            # For token-level compression ("random"), we keep a lightweight
-            # timing of mask construction on CPU only. The actual KV compaction
-            # happens in execute_model; no GPU work is needed here.
-            num_positions = hidden_states.shape[0]
-            t_comp = time.perf_counter()
-            _ = build_compression_mask(
-                num_positions,
-                spec_config.compression_ratio,
-                spec_config.compress_method,
-                torch.device("cpu"),
-            )
-            hierarchical_compression_time_sec = time.perf_counter() - t_comp
+
+        profiled_draft_time_sec = 0.0
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -4064,13 +4331,7 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         profile_spec_time = os.environ.get("VLLM_SPEC_PROFILE_TIME", "0") == "1"
-        measure_draft_time = (
-            spec_config is not None
-            and (
-                getattr(spec_config, "hierarchical_verification", False)
-                or profile_spec_time
-            )
-        )
+        measure_draft_time = spec_config is not None and profile_spec_time
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
@@ -4087,7 +4348,10 @@ class GPUModelRunner(
                 # as inputs, and does not need to wait for bookkeeping to finish.
                 assert isinstance(
                     self.drafter,
-                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                    EagleProposer
+                    | DraftModelProposer
+                    | AdaptiveSpechiveProposer
+                    | ExtractHiddenStatesProposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
@@ -4096,7 +4360,7 @@ class GPUModelRunner(
                         t0 = time.perf_counter()
                         propose_draft_token_ids(sampled_token_ids)
                         torch.cuda.synchronize()
-                        hierarchical_draft_time_sec = time.perf_counter() - t0
+                        profiled_draft_time_sec = time.perf_counter() - t0
                     else:
                         propose_draft_token_ids(sampled_token_ids)
                 elif self.valid_sampled_token_count_event is not None:
@@ -4148,7 +4412,7 @@ class GPUModelRunner(
                 t0 = time.perf_counter()
                 propose_draft_token_ids(valid_sampled_token_ids)
                 torch.cuda.synchronize()
-                hierarchical_draft_time_sec = time.perf_counter() - t0
+                profiled_draft_time_sec = time.perf_counter() - t0
             else:
                 propose_draft_token_ids(valid_sampled_token_ids)
 
@@ -4173,22 +4437,18 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
-            # Cost breakdown: when hierarchical_verification or VLLM_SPEC_PROFILE_TIME=1,
-            # report draft and verification times for metrics/logging.
+            # Cost breakdown when VLLM_SPEC_PROFILE_TIME=1 (draft + target forward times).
             spec_decode_cost_breakdown = None
             if use_spec_decode and spec_config is not None:
-                if (
-                    getattr(spec_config, "hierarchical_verification", False)
-                    or profile_spec_time
-                ):
+                if profile_spec_time:
                     num_reqs = len(req_ids_output_copy)
                     reject_sample_time_sec = (
                         get_spec_verify_draft_match_time_sec_and_reset()
                     )
                     spec_decode_cost_breakdown = SpecDecodeCostBreakdown(
-                        draft_time_sec=hierarchical_draft_time_sec,
-                        compression_time_sec=hierarchical_compression_time_sec,
-                        partial_verification_time_sec=partial_verification_time_sec,
+                        draft_time_sec=profiled_draft_time_sec,
+                        compression_time_sec=0.0,
+                        partial_verification_time_sec=0.0,
                         full_verification_time_sec=full_verification_time_sec,
                         num_partial_accepted_per_req=[0] * num_reqs,
                         reject_sample_time_sec=reject_sample_time_sec,
@@ -4370,6 +4630,7 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
+        self.set_pending_hybrid_spec_bundle(None)
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -4456,7 +4717,10 @@ class GPUModelRunner(
             )
 
         elif spec_config.use_eagle() or spec_config.uses_draft_model():
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+            assert isinstance(
+                self.drafter,
+                EagleProposer | DraftModelProposer | AdaptiveSpechiveProposer,
+            )
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -4566,6 +4830,11 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
+            take_bundle = getattr(self.drafter, "take_pending_spechive_bundle", None)
+            if callable(take_bundle):
+                self.set_pending_hybrid_spec_bundle(take_bundle())
+            else:
+                self.set_pending_hybrid_spec_bundle(None)
 
         return draft_token_ids
 
@@ -4681,6 +4950,10 @@ class GPUModelRunner(
                 drafter_model := getattr(drafter, "model", None)
             ):
                 prepare_communication_buffer_for_model(drafter_model)
+            if (drafter := getattr(self, "drafter", None)) and (
+                im := getattr(drafter, "intermediate_model", None)
+            ):
+                prepare_communication_buffer_for_model(im)
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
@@ -5327,7 +5600,10 @@ class GPUModelRunner(
             ):
                 assert isinstance(
                     self.drafter,
-                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                    EagleProposer
+                    | DraftModelProposer
+                    | AdaptiveSpechiveProposer
+                    | ExtractHiddenStatesProposer,
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
@@ -5887,7 +6163,10 @@ class GPUModelRunner(
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+            assert isinstance(
+                self.drafter,
+                EagleProposer | DraftModelProposer | AdaptiveSpechiveProposer,
+            )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
     def _check_and_update_cudagraph_mode(

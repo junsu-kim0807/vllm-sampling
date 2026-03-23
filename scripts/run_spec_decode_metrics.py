@@ -33,7 +33,7 @@ from typing import Any
 from vllm.v1.metrics.reader import Counter, Gauge, Vector
 
 def is_speculative_method(method: str) -> bool:
-    return method in ("speculative", "eagle3", "magicdec")
+    return method in ("speculative", "eagle3", "magicdec", "adaptive_spechive")
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -47,11 +47,37 @@ def parse_args() -> argparse.Namespace:
         "--method",
         type=str,
         default="speculative",
-        choices=["speculative", "ar", "eagle3", "magicdec"],
+        choices=["speculative", "ar", "eagle3", "magicdec", "adaptive_spechive"],
         help=(
             "Evaluation method: 'ar' (no speculative decoding), "
             "'speculative' (draft_model), 'eagle3' (EAGLE3 drafter), "
-            "'magicdec' (draft_model + magicdec streaming KV view)."
+            "'magicdec' (draft_model + magicdec streaming KV view), "
+            "'adaptive_spechive' (draft + intermediate staged proposer)."
+        ),
+    )
+    p.add_argument(
+        "--intermediate-model",
+        type=str,
+        default=None,
+        help=(
+            "When --method=adaptive_spechive: intermediate verifier model id. "
+            "Defaults to --draft-model."
+        ),
+    )
+    p.add_argument(
+        "--adaptive-spechive-mode",
+        type=str,
+        default="hierarchical_verification",
+        choices=["draft_target", "inter_verification", "hierarchical_verification"],
+        help="When --method=adaptive_spechive: adaptive spechive mode.",
+    )
+    p.add_argument(
+        "--adaptive-spechive-interval-tokens",
+        type=int,
+        default=1,
+        help=(
+            "When --method=adaptive_spechive: D->I interval chunk length "
+            "(adaptive_spechive_num_interval_tokens)."
         ),
     )
     p.add_argument(
@@ -197,6 +223,14 @@ def parse_args() -> argparse.Namespace:
         "--no-responses",
         action="store_true",
         help="Do not write responses JSONL.",
+    )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Enable DIT runtime debug validation "
+            "(sets VLLM_SPEC_DIT_DEBUG=1, VLLM_SPEC_DIT_DEBUG_SUMMARY=1)."
+        ),
     )
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
@@ -1005,6 +1039,13 @@ if __name__ == "__main__":
     else:
         os.environ["VLLM_SPEC_PROFILE_TIME"] = "0"
         os.environ["VLLM_SPEC_VERIFY_DRAFT_MATCH"] = "0"
+    if args.debug:
+        os.environ["VLLM_SPEC_DIT_DEBUG"] = "1"
+        os.environ["VLLM_SPEC_DIT_DEBUG_SUMMARY"] = "1"
+        print("[dit_debug] VLLM_SPEC_DIT_DEBUG=1, VLLM_SPEC_DIT_DEBUG_SUMMARY=1")
+    else:
+        os.environ["VLLM_SPEC_DIT_DEBUG"] = "0"
+        os.environ["VLLM_SPEC_DIT_DEBUG_SUMMARY"] = "0"
 
     batch_sizes = [int(x) for x in parse_csv_list(args.batch_sizes)]
     target_models = parse_csv_list(args.target_models)
@@ -1015,6 +1056,7 @@ if __name__ == "__main__":
     print("[args] target_models =", target_models)
     print("[args] tp_map =", tp_map)
     print("[args] profile_time =", args.profile_time)
+    print("[args] debug =", args.debug)
     print("[args] results_root =", args.results_root)
 
     if args.no_responses:
@@ -1063,6 +1105,19 @@ if __name__ == "__main__":
                 "magicdec_method": args.magicdec_method,
                 "magicdec_kv_budget": args.magicdec_kv_budget,
             }
+        elif args.method == "adaptive_spechive":
+            speculative_config = {
+                "method": "adaptive_spechive",
+                "model": args.draft_model,
+                "intermediate_model": args.intermediate_model or args.draft_model,
+                "num_speculative_tokens": args.num_spec_tokens,
+                "adaptive_spechive_mode": args.adaptive_spechive_mode,
+                "adaptive_spechive_num_interval_tokens": (
+                    args.adaptive_spechive_interval_tokens
+                ),
+                "max_model_len": args.max_model_len,
+                "enforce_eager": args.enforce_eager,
+            }
         else:
             # Speculative decoding with a draft model.
             speculative_config = {
@@ -1076,21 +1131,34 @@ if __name__ == "__main__":
         print("=" * 80)
         print(f"[model-pair] draft={args.draft_model} | target={target_model} | tp={tp}")
 
-        llm = LLM(
-            model=target_model,
-            tensor_parallel_size=tp,
-            trust_remote_code=args.trust_remote_code,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            speculative_config=speculative_config,
-            max_model_len=args.max_model_len,
-            dtype=args.dtype,
-            seed=args.seed,
-            disable_log_stats=args.disable_log_stats,
-            enforce_eager=args.enforce_eager,
-            enable_chunked_prefill=args.enable_chunked_prefill,
-            disable_custom_all_reduce=args.disable_custom_all_reduce,
-            max_num_seqs=max_num_seqs,
-        )
+        try:
+            llm = LLM(
+                model=target_model,
+                tensor_parallel_size=tp,
+                trust_remote_code=args.trust_remote_code,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                speculative_config=speculative_config,
+                max_model_len=args.max_model_len,
+                dtype=args.dtype,
+                seed=args.seed,
+                disable_log_stats=args.disable_log_stats,
+                enforce_eager=args.enforce_eager,
+                enable_chunked_prefill=args.enable_chunked_prefill,
+                disable_custom_all_reduce=args.disable_custom_all_reduce,
+                max_num_seqs=max_num_seqs,
+            )
+        except ValueError as e:
+            msg = str(e)
+            if (
+                "Target and draft model should have the same vocabulary size" in msg
+                or "Target and intermediate (verifier) model must share the same vocabulary size" in msg
+            ):
+                print(
+                    "[skip:model-pair] incompatible speculative vocab/tokenizer "
+                    f"(draft={args.draft_model}, target={target_model}): {msg}"
+                )
+                continue
+            raise
         tokenizer = llm.get_tokenizer()
         target_rows: list[dict[str, Any]] = []
         pair_response_records: list[dict[str, Any]] = []

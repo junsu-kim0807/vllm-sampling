@@ -5,12 +5,12 @@ import ast
 import copy
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
-# Compression method for hierarchical verification (partial KV cache).
-# - "random": token-level compression with compaction (full -> compressed buffer).
-# - "block_random": block-level compression without KV memory copy
-#   (only block_table/seq_lens subsampling).
-HierarchicalVerificationCompressMethod = Literal["random", "block_random"]
 MagicDecMethod = Literal["streaming"]
+AdaptiveSpechiveMode = Literal[
+    "draft_target",
+    "inter_verification",
+    "hierarchical_verification",
+]
 
 from pydantic import Field, SkipValidation, model_validator
 from typing_extensions import Self
@@ -59,9 +59,13 @@ SpeculativeMethod = Literal[
     "medusa",
     "mlp_speculator",
     "draft_model",
+    "adaptive_spechive",
     "suffix",
     EagleModelTypes,
 ]
+
+# Must stay aligned with vllm.v1.sample.rejection_sampler.MAX_SPEC_LEN
+_ADAPTIVE_CASCADE_MAX_SPEC_LEN = 128
 
 
 @config
@@ -120,6 +124,10 @@ class SpeculativeConfig:
     for draft token generation. Reduces communication from O(vocab_size) to
     O(2 * tp_size) per token. Only applies to greedy draft selection in
     non-tree speculation."""
+    use_draft_probs_in_rejection: bool = False
+    """If True, draft-model speculation records per-position proposal distributions
+    (when the batch is not all-greedy) and passes them to ``RejectionSampler``.
+    Enables the stochastic lossless rejection path; ignored for greedy-only batches."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -150,6 +158,10 @@ class SpeculativeConfig:
     """The configuration of the draft model initialized internal."""
     draft_parallel_config: SkipValidation[ParallelConfig] = None  # type: ignore
     """The parallel configuration for the draft model initialized internal."""
+    intermediate_model_config: SkipValidation[ModelConfig] = None  # type: ignore
+    """The intermediate (verifier) model config when using adaptive_spechive."""
+    intermediate_parallel_config: SkipValidation[ParallelConfig] = None  # type: ignore
+    """Parallel config for the intermediate model."""
 
     # Suffix decoding configuration
     suffix_decoding_max_tree_depth: int = 24
@@ -176,20 +188,21 @@ class SpeculativeConfig:
     """Load config for the draft model. If not specified, will use the load
     config from the target model."""
 
-    # Hierarchical verification: partial (compressed) KV verification first,
-    # then full KV verification for partially verified tokens.
-    hierarchical_verification: bool = False
-    """If True, use partial (compressed) KV cache for initial verification
-    steps, then full KV cache to verify partially accepted tokens."""
-    compress_method: HierarchicalVerificationCompressMethod = "random"
-    """Method to compress KV cache for partial verification."""
-    compression_ratio: float = Field(default=0.5, ge=0, le=1)
-    """DROP ratio for KV cache in partial verification (e.g. 0.5 = drop 50% of
-    tokens/blocks, keep the remaining 50%). 0 disables compression; 1 drops as
-    much as possible while keeping at least one position."""
-    full_verification_interval: int = Field(default=1, ge=1)
-    """When hierarchical_verification is True, use full KV cache every this
-    many steps; otherwise use partial (compressed) KV cache. Must be >= 1."""
+    # adaptive_spechive: draft (D) + intermediate (I) + target (T)
+    intermediate_model: str | None = None
+    """HF model id for the intermediate verifier (I) when method is adaptive_spechive."""
+    intermediate_revision: str | None = None
+    """Optional revision for intermediate_model (defaults to draft revision)."""
+    intermediate_tensor_parallel_size: int | None = Field(default=None, ge=1)
+    """TP size for I; defaults to draft_tensor_parallel_size when unset."""
+    adaptive_spechive_num_interval_tokens: int = Field(default=1, ge=1)
+    """n_iv: inner verification interval length (D↔I rounds); used to bound outer length."""
+    adaptive_spechive_mode: AdaptiveSpechiveMode = "draft_target"
+    """draft_target: draft→T. inter_verification: I proposes like draft→T. hierarchical_verification: D proposes, I verifies via RejectionSampler, then→T."""
+    adaptive_spechive_enable_inter_verification: bool = True
+    """Must be True when adaptive_spechive_mode is ``inter_verification``."""
+    adaptive_spechive_enable_hierarchical_verification: bool = True
+    """Must be True when adaptive_spechive_mode is ``hierarchical_verification``."""
 
     # MagicDec: optional draft-only attention metadata rewrite (see
     # vllm/v1/attention/magicdec_streaming_attention.py).
@@ -217,17 +230,18 @@ class SpeculativeConfig:
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = self.method in ("eagle3", "extract_hidden_states")
         factors.append(uses_aux_hidden_states)
-        # Hierarchical verification changes the verification path (partial then full).
-        factors.append(self.hierarchical_verification)
-        if self.hierarchical_verification:
-            factors.append(self.compress_method)
-            factors.append(self.compression_ratio)
-            factors.append(self.full_verification_interval)
 
         factors.append(self.magicdec)
         if self.magicdec:
             factors.append(self.magicdec_method)
             factors.append(self.magicdec_kv_budget)
+
+        if self.method == "adaptive_spechive":
+            factors.append(self.intermediate_model)
+            factors.append(self.adaptive_spechive_num_interval_tokens)
+            factors.append(self.adaptive_spechive_mode)
+            factors.append(self.adaptive_spechive_enable_inter_verification)
+            factors.append(self.adaptive_spechive_enable_hierarchical_verification)
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
@@ -507,7 +521,13 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3"):
+                if self.method == "adaptive_spechive":
+                    if not self.intermediate_model:
+                        raise ValueError(
+                            "adaptive_spechive requires `intermediate_model` "
+                            "(verifier I) in addition to `model` (draft D)."
+                        )
+                elif self.method in ("eagle", "eagle3"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -631,6 +651,58 @@ class SpeculativeConfig:
                         self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
+
+                if self.method == "adaptive_spechive":
+                    assert self.intermediate_model is not None
+                    int_rev = (
+                        self.intermediate_revision
+                        if self.intermediate_revision is not None
+                        else self.revision
+                    )
+                    self.intermediate_model_config = ModelConfig(
+                        model=self.intermediate_model,
+                        runner="draft",
+                        tokenizer=self.target_model_config.tokenizer,
+                        tokenizer_mode=self.target_model_config.tokenizer_mode,
+                        trust_remote_code=self.target_model_config.trust_remote_code,
+                        allowed_local_media_path=self.target_model_config.allowed_local_media_path,
+                        allowed_media_domains=self.target_model_config.allowed_media_domains,
+                        dtype=self.target_model_config.dtype,
+                        seed=self.target_model_config.seed,
+                        revision=int_rev,
+                        code_revision=self.code_revision,
+                        tokenizer_revision=self.target_model_config.tokenizer_revision,
+                        spec_target_max_model_len=self.target_model_config.max_model_len,
+                        quantization=self.quantization,
+                        enforce_eager=self.target_model_config.enforce_eager,
+                        max_logprobs=self.target_model_config.max_logprobs,
+                        hf_overrides=SpeculativeConfig.hf_config_override,
+                        config_format=self.target_model_config.config_format,
+                    )
+                    int_tp = (
+                        self.intermediate_tensor_parallel_size
+                        or self.draft_tensor_parallel_size
+                    )
+                    self.intermediate_tensor_parallel_size = (
+                        SpeculativeConfig._verify_and_get_draft_tp(
+                            self.target_parallel_config,
+                            int_tp,
+                            self.intermediate_model_config.hf_config,
+                        )
+                    )
+                    self.intermediate_model_config.max_model_len = (
+                        SpeculativeConfig._maybe_override_draft_max_model_len(
+                            self.max_model_len,
+                            self.intermediate_model_config.max_model_len,
+                            self.target_model_config.max_model_len,
+                        )
+                    )
+                    self.intermediate_parallel_config = (
+                        SpeculativeConfig.create_draft_parallel_config(
+                            self.target_parallel_config,
+                            self.intermediate_tensor_parallel_size,
+                        )
+                    )
         return self
 
     def _validate_suffix_decoding(self):
@@ -807,6 +879,71 @@ class SpeculativeConfig:
                 self.draft_parallel_config
             )
 
+        if (
+            self.method == "adaptive_spechive"
+            and self.intermediate_model_config is not None
+            and self.intermediate_parallel_config is not None
+        ):
+            self.intermediate_model_config.verify_with_parallel_config(
+                self.intermediate_parallel_config
+            )
+
+        if self.method == "adaptive_spechive":
+            if self.adaptive_spechive_mode not in (
+                "draft_target",
+                "inter_verification",
+                "hierarchical_verification",
+            ):
+                raise ValueError(
+                    f"Invalid adaptive_spechive_mode={self.adaptive_spechive_mode!r}; "
+                    "expected 'draft_target', 'inter_verification', or 'hierarchical_verification'."
+                )
+            if (
+                self.adaptive_spechive_mode == "inter_verification"
+                and not self.adaptive_spechive_enable_inter_verification
+            ):
+                raise ValueError(
+                    "adaptive_spechive_mode='inter_verification' requires adaptive_spechive_enable_inter_verification=True."
+                )
+            if (
+                self.adaptive_spechive_mode == "hierarchical_verification"
+                and not self.adaptive_spechive_enable_hierarchical_verification
+            ):
+                raise ValueError(
+                    "adaptive_spechive_mode='hierarchical_verification' requires adaptive_spechive_enable_hierarchical_verification=True."
+                )
+            if self.adaptive_spechive_mode in (
+                "inter_verification",
+                "hierarchical_verification",
+            ):
+                assert self.draft_model_config is not None
+                assert self.intermediate_model_config is not None
+                d_h = self.draft_model_config.get_hidden_size()
+                i_h = self.intermediate_model_config.get_hidden_size()
+                if d_h != i_h:
+                    raise ValueError(
+                        "adaptive_spechive inter/hierarchical verification requires draft and intermediate models "
+                        f"to share the same hidden size (got draft={d_h}, "
+                        f"intermediate={i_h})."
+                    )
+            outer_upper = (
+                self.adaptive_spechive_num_interval_tokens
+                + self.num_speculative_tokens
+                * (self.adaptive_spechive_num_interval_tokens + 1)
+            )
+            if outer_upper > _ADAPTIVE_CASCADE_MAX_SPEC_LEN:
+                raise ValueError(
+                    f"adaptive_spechive: implied max outer verify length "
+                    f"{outer_upper} = n_iv + num_speculative_tokens * (n_iv + 1) "
+                    f"exceeds {_ADAPTIVE_CASCADE_MAX_SPEC_LEN} (sampler limit). "
+                    "Reduce num_speculative_tokens or "
+                    "adaptive_spechive_num_interval_tokens."
+                )
+            if self.parallel_drafting:
+                raise ValueError(
+                    "parallel_drafting is not supported with adaptive_spechive."
+                )
+
         aux_hidden_states_supported = [
             "llama",
             "qwen",
@@ -831,7 +968,7 @@ class SpeculativeConfig:
             )
         self.verify_equal_vocab_size_if_draft_model()
         if self.magicdec:
-            if not self.uses_draft_model():
+            if self.method != "draft_model":
                 raise ValueError(
                     "magicdec is only supported with speculative method "
                     "'draft_model' (draft-model proposer)."
@@ -845,7 +982,7 @@ class SpeculativeConfig:
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
-            self.method == "draft_model"
+            self.method in ("draft_model", "adaptive_spechive")
             and self.target_model_config is not None
             and self.draft_model_config is not None
         ):
@@ -858,6 +995,19 @@ class SpeculativeConfig:
                     f"Draft model vocab_size={draft_vocab_size}. "
                     f"Using models with different tokenizers can cause out-of-bounds "
                     f"errors during speculative decoding."
+                )
+        if (
+            self.method == "adaptive_spechive"
+            and self.target_model_config is not None
+            and self.intermediate_model_config is not None
+        ):
+            target_vocab_size = self.target_model_config.get_vocab_size()
+            i_vocab = self.intermediate_model_config.get_vocab_size()
+            if target_vocab_size != i_vocab:
+                raise ValueError(
+                    "Target and intermediate (verifier) model must share the same "
+                    f"vocabulary size. Target vocab_size={target_vocab_size}, "
+                    f"intermediate vocab_size={i_vocab}."
                 )
 
     @property
@@ -876,11 +1026,22 @@ class SpeculativeConfig:
             slots_per_req += 1
         return slots_per_req
 
+    def runner_num_speculative_tokens(self) -> int:
+        """Tensor width for draft outputs / scheduler lookahead (may differ for DIT)."""
+        if (
+            self.method == "adaptive_spechive"
+            and self.adaptive_spechive_mode == "hierarchical_verification"
+        ):
+            n_iv = self.adaptive_spechive_num_interval_tokens
+            n = self.num_speculative_tokens
+            return n_iv + n * (n_iv + 1)
+        return self.num_speculative_tokens
+
     def use_eagle(self) -> bool:
         return self.method in ("eagle", "eagle3", "mtp")
 
     def uses_draft_model(self) -> bool:
-        return self.method == "draft_model"
+        return self.method in ("draft_model", "adaptive_spechive")
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"
@@ -893,4 +1054,8 @@ class SpeculativeConfig:
             else self.draft_model_config.model
         )
         num_spec_tokens = self.num_speculative_tokens
+        if method == "adaptive_spechive":
+            im = self.intermediate_model
+            acm = self.adaptive_spechive_mode
+            return f"SpeculativeConfig({method=}, {model=}, {im=}, {acm=}, {num_spec_tokens=})"
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"

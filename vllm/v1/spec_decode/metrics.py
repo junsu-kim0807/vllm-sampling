@@ -21,10 +21,10 @@ class SpecDecodingStats:
     aggregated across requests by the scheduler and returned to the
     frontend in EngineCoreOutputs->SchedulerStats.
 
-    Cost breakdown (for hierarchical verification):
+    Optional cost breakdown (e.g. when profiling staged spec decode):
     - draft_time_sec, compression_time_sec, partial_verification_time_sec,
       full_verification_time_sec: accumulated seconds per step.
-    - num_partial_accepted_tokens: tokens accepted at partial verification.
+    - num_partial_accepted_tokens: optional per-step staged partial-accept counter.
     - full_acceptance_length: use 1 + num_accepted_tokens/num_drafts (existing).
     - end-to-end TPO: use FinishedRequestStats.mean_time_per_output_token.
     """
@@ -35,7 +35,7 @@ class SpecDecodingStats:
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
 
-    # Cost breakdown: hierarchical verification timing and partial acceptance.
+    # Optional cost breakdown timing fields.
     draft_time_sec: float = 0.0
     compression_time_sec: float = 0.0
     partial_verification_time_sec: float = 0.0
@@ -71,7 +71,7 @@ class SpecDecodingStats:
         full_verification_time_sec: float = 0.0,
         reject_sample_time_sec: float = 0.0,
     ) -> None:
-        """Same as observe_draft plus optional cost breakdown (e.g. hierarchical)."""
+        """Same as observe_draft plus optional cost breakdown fields."""
         self.observe_draft(num_draft_tokens, num_accepted_tokens)
         self.draft_time_sec += draft_time_sec
         self.compression_time_sec += compression_time_sec
@@ -154,7 +154,7 @@ class SpecDecodingLogging:
         acceptance_rates = np.sum(pos_matrix, axis=0) / num_drafts
         rates_str = ", ".join(f"{p:.3f}" for p in acceptance_rates)
 
-        # Cost breakdown (hierarchical verification)
+        # Optional cost breakdown
         total_draft_time = np.sum(self.draft_time_sec)
         total_compression_time = np.sum(self.compression_time_sec)
         total_partial_verification_time = np.sum(self.partial_verification_time_sec)

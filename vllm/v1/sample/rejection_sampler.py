@@ -182,6 +182,81 @@ class RejectionSampler(nn.Module):
             logprobs_tensors=logprobs_tensors,
         )
 
+    def forward_with_processed_probs(
+        self,
+        metadata: SpecDecodeMetadata,
+        draft_probs: torch.Tensor | None,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        """Forward path that also returns processed target/bonus probabilities.
+
+        This is intended for internal staged-verification flows that need the
+        exact processed proposal distributions used during verification.
+        """
+        assert metadata.max_spec_len <= MAX_SPEC_LEN
+
+        bonus_logits_indices = metadata.bonus_logits_indices
+        target_logits_indices = metadata.target_logits_indices
+        assert logits is not None
+
+        # Use the exact sampler path so bonus probs match sampled bonus semantics.
+        bonus_sampler_output = self.sampler(
+            logits=logits[bonus_logits_indices],
+            sampling_metadata=replace(
+                sampling_metadata,
+                max_num_logprobs=-1,
+            ),
+            predict_bonus_token=True,
+            logprobs_mode_override="processed_logits",
+        )
+        bonus_token_ids = bonus_sampler_output.sampled_token_ids
+        assert bonus_sampler_output.logprobs_tensors is not None
+        processed_bonus_logits = bonus_sampler_output.logprobs_tensors.logprobs.to(
+            torch.float32
+        )
+        bonus_probs = processed_bonus_logits.softmax(dim=-1, dtype=torch.float32)
+
+        # Process target logits once.
+        target_logits = logits[target_logits_indices].to(torch.float32)
+        target_logits = self.apply_logits_processors(
+            target_logits, sampling_metadata, metadata
+        )
+        target_logits = apply_sampling_constraints(
+            target_logits,
+            metadata.cu_num_draft_tokens,
+            sampling_metadata,
+        )
+        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+
+        output_token_ids = rejection_sample(
+            metadata.draft_token_ids,
+            metadata.num_draft_tokens,
+            metadata.max_spec_len,
+            metadata.cu_num_draft_tokens,
+            draft_probs,
+            target_logits,
+            bonus_token_ids,
+            sampling_metadata,
+        )
+
+        if _should_verify_draft_match():
+            global _SPEC_VERIFY_DRAFT_MATCH_TIME_SEC
+            t0 = time.perf_counter()
+            _verify_draft_match_sampled(
+                output_token_ids,
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.cu_num_draft_tokens,
+            )
+            _SPEC_VERIFY_DRAFT_MATCH_TIME_SEC += time.perf_counter() - t0
+
+        return (
+            SamplerOutput(sampled_token_ids=output_token_ids, logprobs_tensors=None),
+            target_probs,
+            bonus_probs,
+        )
+
     def _get_logprobs_tensors(
         self,
         max_num_logprobs: int,
@@ -357,6 +432,7 @@ class RejectionSampler(nn.Module):
         result = []
         for out, spec in zip(output_token_ids, spec_token_ids):
             if len(spec) == 0:
+                result.append(out)
                 continue
             result.append(out)
             for i in range(len(spec) - 1):
