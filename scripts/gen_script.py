@@ -506,7 +506,7 @@ def job_header(job_name: str, gpu_count: int, time_limit: str, log_dir: Path) ->
 #SBATCH --job-name={job_name}
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task={12*gpu_count}
 #SBATCH --account=rrg-pnair_gpu
 #SBATCH --qos=rrg-pnair
 #SBATCH --gres=gpu:h100:{gpu_count}
