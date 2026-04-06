@@ -565,6 +565,8 @@ def build_python_command(
     adaptive_spechive_intermediate_model: str | None = None,
     adaptive_spechive_mode: str = "hierarchical_verification",
     adaptive_spechive_rounds: int = 1,
+    tetris_extra_proposals: int = 0,
+    tetris_turn_on_batch_size: int | None = None,
     results_subdir: Path | None = None,
 ) -> str:
     tag = batch_tag(batch_sizes)
@@ -605,21 +607,27 @@ def build_python_command(
     elif method == "magicdec":
         parts.append(f"--magicdec-method {shquote(magicdec_method)}")
         parts.append(f"--magicdec-kv-budget {magicdec_kv_budget}")
-    elif method == "adaptive_spechive":
+    elif method in ("adaptive_spechive", "pivot"):
         if not adaptive_spechive_intermediate_model:
             raise SystemExit(
-                "--method=adaptive_spechive requires intermediate model in generator "
+                f"--method={method} requires intermediate model in generator "
                 "(pass --adaptive-spechive-intermediate-model)."
             )
         parts.append(
             f"--intermediate-model {shquote(adaptive_spechive_intermediate_model)}"
         )
-        parts.append(
-            f"--adaptive-spechive-mode {shquote(adaptive_spechive_mode)}"
-        )
-        parts.append(
-            f"--round {adaptive_spechive_rounds}"
-        )
+        if method == "adaptive_spechive":
+            parts.append(
+                f"--adaptive-spechive-mode {shquote(adaptive_spechive_mode)}"
+            )
+            parts.append(
+                f"--round {adaptive_spechive_rounds}"
+            )
+    elif method == "tetris":
+        if tetris_extra_proposals:
+            parts.append(f"--tetris-extra-proposals {tetris_extra_proposals}")
+        if tetris_turn_on_batch_size is not None:
+            parts.append(f"--tetris-turn-on-batch-size {tetris_turn_on_batch_size}")
 
     if dataset.name == "aime25":
         parts.append(f"--aime-max-new-tokens {dataset.max_new_tokens}")
@@ -681,6 +689,8 @@ def render_job_script(
     adaptive_spechive_intermediate_model: str | None = None,
     adaptive_spechive_mode: str = "hierarchical_verification",
     adaptive_spechive_rounds: int = 1,
+    tetris_extra_proposals: int = 0,
+    tetris_turn_on_batch_size: int | None = None,
     time_limit_override: str | None = None,
     jobs_subdir: Path | None = None,
     results_subdir: Path | None = None,
@@ -744,6 +754,8 @@ def render_job_script(
         adaptive_spechive_intermediate_model=adaptive_spechive_intermediate_model,
         adaptive_spechive_mode=adaptive_spechive_mode,
         adaptive_spechive_rounds=adaptive_spechive_rounds,
+        tetris_extra_proposals=tetris_extra_proposals,
+        tetris_turn_on_batch_size=tetris_turn_on_batch_size,
         results_subdir=results_subdir,
     )
 
@@ -930,10 +942,30 @@ def parse_args() -> argparse.Namespace:
         "--spec-method",
         type=str,
         default="speculative",
-        choices=["speculative", "adaptive_spechive"],
+        choices=["speculative", "adaptive_spechive", "pivot", "tetris"],
         help=(
             "Method used for speculative jobs in this generator. "
-            "Use adaptive_spechive to emit staged D/I/T runs."
+            "Use adaptive_spechive for staged D/I/T runs, pivot for "
+            "intermediate-pivot plus draft-tail, or tetris for TETRIS "
+            "optimal draft token selection (ACL 2025)."
+        ),
+    )
+    parser.add_argument(
+        "--tetris-extra-proposals",
+        type=int,
+        default=0,
+        help=(
+            "When --spec-method=tetris: extra verification slots beyond "
+            "batch_size * num_spec_tokens (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--tetris-turn-on-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "When --spec-method=tetris: minimum batch size before TETRIS "
+            "activates; smaller batches use standard spec-decode (default: always on)."
         ),
     )
     parser.add_argument("--verbose", action="store_true")
@@ -1030,9 +1062,9 @@ def main() -> None:
     ensure_dirs()
     debug_enabled = args.debug or args.spechive_debug
     spechive_variants: list[tuple[str | None, int, str]] = []
-    if args.spec_method != "adaptive_spechive":
+    if args.spec_method not in ("adaptive_spechive", "pivot"):
         spechive_variants = [(None, args.round, "")]
-    elif debug_enabled:
+    elif args.spec_method == "adaptive_spechive" and debug_enabled:
         # Debug preset: run two intermediate verifiers with 3 rounds.
         spechive_variants = [
             ("meta-llama/Llama-3.2-3B-Instruct", 3, "im_llama32_3b_r3"),
@@ -1041,7 +1073,7 @@ def main() -> None:
     else:
         if not args.adaptive_spechive_intermediate_model:
             raise SystemExit(
-                "--spec-method=adaptive_spechive requires "
+                f"--spec-method={args.spec_method} requires "
                 "--adaptive-spechive-intermediate-model"
             )
         spechive_variants = [
@@ -1284,6 +1316,8 @@ def main() -> None:
             eagle_draft_tp: int | None = None,
             magicdec_method: str = "streaming",
             magicdec_kv_budget: int = 256,
+            tetris_extra_proposals: int = 0,
+            tetris_turn_on_batch_size: int | None = None,
             time_limit_override: str,
         ) -> None:
             batch_sizes_str = str(bs)
@@ -1292,7 +1326,7 @@ def main() -> None:
             base_result_subdir = Path(ktag)
             variants = (
                 spechive_variants
-                if method == "adaptive_spechive"
+                if method in ("adaptive_spechive", "pivot")
                 else [(None, args.round, "")]
             )
             for im_model, rounds, variant_tag in variants:
@@ -1330,6 +1364,8 @@ def main() -> None:
                     adaptive_spechive_intermediate_model=im_model,
                     adaptive_spechive_mode=args.adaptive_spechive_mode,
                     adaptive_spechive_rounds=rounds,
+                    tetris_extra_proposals=tetris_extra_proposals,
+                    tetris_turn_on_batch_size=tetris_turn_on_batch_size,
                     time_limit_override=time_limit_override,
                     jobs_subdir=batch_dir,
                     results_subdir=result_subdir,
@@ -1362,6 +1398,19 @@ def main() -> None:
                         eagle_model=None,
                         magicdec_method=args.magicdec_method,
                         magicdec_kv_budget=args.magicdec_kv_budget,
+                        time_limit_override=tl,
+                    )
+
+                # TETRIS
+                for pair in speculative_pairs:
+                    _write_one(
+                        pair=pair,
+                        dataset=dataset,
+                        bs=bs,
+                        method="tetris",
+                        eagle_model=None,
+                        tetris_extra_proposals=args.tetris_extra_proposals,
+                        tetris_turn_on_batch_size=args.tetris_turn_on_batch_size,
                         time_limit_override=tl,
                     )
 
@@ -1461,6 +1510,8 @@ def main() -> None:
                             adaptive_spechive_intermediate_model=im_model,
                             adaptive_spechive_mode=args.adaptive_spechive_mode,
                             adaptive_spechive_rounds=rounds,
+                            tetris_extra_proposals=args.tetris_extra_proposals,
+                            tetris_turn_on_batch_size=args.tetris_turn_on_batch_size,
                             jobs_subdir=pair_subdir,
                             results_subdir=results_subdir,
                             job_name_suffix=suffix,
@@ -1532,6 +1583,8 @@ def main() -> None:
                             adaptive_spechive_intermediate_model=im_model,
                             adaptive_spechive_mode=args.adaptive_spechive_mode,
                             adaptive_spechive_rounds=rounds,
+                            tetris_extra_proposals=args.tetris_extra_proposals,
+                            tetris_turn_on_batch_size=args.tetris_turn_on_batch_size,
                             jobs_subdir=pair_subdir,
                             results_subdir=results_subdir,
                             job_name_suffix=suffix,
@@ -1617,6 +1670,8 @@ def main() -> None:
                     adaptive_spechive_intermediate_model=im_model,
                     adaptive_spechive_mode=args.adaptive_spechive_mode,
                     adaptive_spechive_rounds=rounds,
+                    tetris_extra_proposals=args.tetris_extra_proposals,
+                    tetris_turn_on_batch_size=args.tetris_turn_on_batch_size,
                     jobs_subdir=pair_subdir,
                     results_subdir=results_subdir,
                     job_name_suffix=suffix,

@@ -33,7 +33,14 @@ from typing import Any
 from vllm.v1.metrics.reader import Counter, Gauge, Vector
 
 def is_speculative_method(method: str) -> bool:
-    return method in ("speculative", "eagle3", "magicdec", "adaptive_spechive")
+    return method in (
+        "speculative",
+        "eagle3",
+        "magicdec",
+        "adaptive_spechive",
+        "pivot",
+        "tetris",
+    )
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -47,12 +54,32 @@ def parse_args() -> argparse.Namespace:
         "--method",
         type=str,
         default="speculative",
-        choices=["speculative", "ar", "eagle3", "magicdec", "adaptive_spechive"],
+        choices=["speculative", "ar", "eagle3", "magicdec", "adaptive_spechive", "pivot", "tetris"],
         help=(
             "Evaluation method: 'ar' (no speculative decoding), "
             "'speculative' (draft_model), 'eagle3' (EAGLE3 drafter), "
             "'magicdec' (draft_model + magicdec streaming KV view), "
-            "'adaptive_spechive' (draft + intermediate staged proposer)."
+            "'adaptive_spechive' (draft + intermediate staged proposer), "
+            "'pivot' (intermediate pivot token + draft tail), "
+            "'tetris' (TETRIS optimal draft token selection, ACL 2025)."
+        ),
+    )
+    p.add_argument(
+        "--tetris-extra-proposals",
+        type=int,
+        default=0,
+        help=(
+            "When --method=tetris: extra verification slots beyond "
+            "batch_size * num_spec_tokens (default: 0)."
+        ),
+    )
+    p.add_argument(
+        "--tetris-turn-on-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "When --method=tetris: minimum batch size before TETRIS activates; "
+            "smaller batches fall back to standard spec-decode (default: always on)."
         ),
     )
     p.add_argument(
@@ -1025,9 +1052,9 @@ def write_pair_info(
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.method == "adaptive_spechive" and not args.intermediate_model:
+    if args.method in ("adaptive_spechive", "pivot") and not args.intermediate_model:
         raise SystemExit(
-            "--method=adaptive_spechive requires --intermediate-model"
+            f"--method={args.method} requires --intermediate-model"
         )
     random.seed(args.seed)
 
@@ -1118,6 +1145,26 @@ if __name__ == "__main__":
                 "max_model_len": args.max_model_len,
                 "enforce_eager": args.enforce_eager,
             }
+        elif args.method == "pivot":
+            speculative_config = {
+                "method": "pivot",
+                "model": args.draft_model,
+                "intermediate_model": args.intermediate_model,
+                "num_speculative_tokens": args.num_spec_tokens,
+                "max_model_len": args.max_model_len,
+                "enforce_eager": args.enforce_eager,
+            }
+        elif args.method == "tetris":
+            speculative_config = {
+                "method": "draft_model",
+                "model": args.draft_model,
+                "num_speculative_tokens": args.num_spec_tokens,
+                "max_model_len": args.max_model_len,
+                "enforce_eager": args.enforce_eager,
+                "tetris": True,
+                "tetris_extra_proposals": args.tetris_extra_proposals,
+                "tetris_turn_on_batch_size": args.tetris_turn_on_batch_size,
+            }
         else:
             # Speculative decoding with a draft model.
             speculative_config = {
@@ -1152,6 +1199,7 @@ if __name__ == "__main__":
             if (
                 "Target and draft model should have the same vocabulary size" in msg
                 or "Target and intermediate (verifier) model must share the same vocabulary size" in msg
+                or "pivot requires intermediate output compatibility with target" in msg
             ):
                 print(
                     "[skip:model-pair] incompatible speculative vocab/tokenizer "
