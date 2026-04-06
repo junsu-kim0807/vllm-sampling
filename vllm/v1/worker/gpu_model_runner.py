@@ -127,6 +127,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.spec_decode.tetris import apply_tetris
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
@@ -2838,6 +2839,38 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 common_attn_metadata=common_attn_metadata,
                 mm_embed_inputs=mm_embed_inputs,
             )
+
+        # ---- TETRIS post-processing ----------------------------------------
+        spec_config = self.speculative_config
+        if (
+            spec_config is not None
+            and getattr(spec_config, "tetris", False)
+            and isinstance(draft_token_ids, torch.Tensor)
+            and hasattr(self.drafter, "last_draft_logprobs")
+            and self.drafter.last_draft_logprobs is not None
+        ):
+            draft_token_ids = apply_tetris(
+                draft_token_ids=draft_token_ids,
+                draft_token_logprobs=self.drafter.last_draft_logprobs,
+                num_speculative_tokens=spec_config.num_speculative_tokens,
+                extra_proposals=getattr(
+                    spec_config, "tetris_extra_proposals", 0
+                ),
+                turn_on_batch_size=getattr(
+                    spec_config, "tetris_turn_on_batch_size", None
+                ),
+            )
+        elif isinstance(draft_token_ids, torch.Tensor):
+            num_spec = (
+                spec_config.num_speculative_tokens
+                if spec_config is not None
+                else draft_token_ids.shape[1]
+            )
+            draft_token_ids = [
+                draft_token_ids[i, :num_spec].tolist()
+                for i in range(draft_token_ids.shape[0])
+            ]
+        # ---- end TETRIS ----------------------------------------------------
 
         return draft_token_ids
 

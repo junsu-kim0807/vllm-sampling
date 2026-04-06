@@ -122,6 +122,30 @@ class SpeculativeConfig:
     speculative_token_tree: str | None = None
     """Specifies the tree structure for speculative token generation.
     """
+
+    # ---- TETRIS fields -------------------------------------------------------
+    tetris: bool = False
+    """Enable TETRIS optimal draft token selection.
+
+    TETRIS (ACL 2025) selects which draft tokens across all requests in a
+    batch to verify, given a total capacity budget, to maximise expected
+    accepted tokens.  It requires logprobs from an EAGLE / draft-model
+    proposer; ngram proposers are not supported and TETRIS is silently
+    skipped for them.
+
+    Reference: https://arxiv.org/pdf/2502.15197
+    """
+    tetris_extra_proposals: int = 0
+    """Additional token-verification slots added on top of the natural
+    capacity (batch_size * num_speculative_tokens) when running TETRIS.
+    A positive value allows TETRIS to explore deeper drafts for high-quality
+    requests at the cost of slightly more verification work."""
+    tetris_turn_on_batch_size: int | None = None
+    """Minimum number of concurrently decoded requests required before TETRIS
+    is activated.  When the live batch is smaller than this threshold, plain
+    speculative decoding is used (no TETRIS selection).  ``None`` means
+    TETRIS is always active when ``tetris=True``."""
+    # --------------------------------------------------------------------------
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""

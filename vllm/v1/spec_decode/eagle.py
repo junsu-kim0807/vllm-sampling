@@ -197,6 +197,21 @@ class EagleProposer:
         else:
             self.positions[:num_tokens] = positions
 
+    def _greedy_sample_with_logprobs(
+        self,
+        logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Greedy-sample draft tokens AND return their log-probabilities.
+
+        Called by ``propose()`` when ``speculative_config.tetris=True``.
+        """
+        token_ids = logits.argmax(dim=-1)                         # [B]
+        log_probs = logits.log_softmax(dim=-1)                    # [B, V]
+        token_logprobs = log_probs.gather(
+            1, token_ids.unsqueeze(1)
+        ).squeeze(1)                                              # [B]
+        return token_ids, token_logprobs
+
     def propose(
         self,
         # [num_tokens]
@@ -212,6 +227,14 @@ class EagleProposer:
         sampling_metadata: SamplingMetadata,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        # --- TETRIS: set up per-step logprob collection --------------------
+        _tetris_enabled: bool = getattr(
+            self.speculative_config, "tetris", False
+        )
+        _draft_logprobs_list: list[torch.Tensor] = []
+        self.last_draft_logprobs: torch.Tensor | None = None
+        # -------------------------------------------------------------------
+
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
 
@@ -308,7 +331,12 @@ class EagleProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_token_ids = logits.argmax(dim=-1)
+            if _tetris_enabled:
+                draft_token_ids, _lp = self._greedy_sample_with_logprobs(
+                    logits)
+                self.last_draft_logprobs = _lp.unsqueeze(1)
+            else:
+                draft_token_ids = logits.argmax(dim=-1)
             return draft_token_ids.view(-1, 1)
 
         if self.uses_mrope:
@@ -332,7 +360,12 @@ class EagleProposer:
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
 
-        draft_token_ids = logits.argmax(dim=-1)
+        # Sequential multi-step drafting: first token.
+        if _tetris_enabled:
+            draft_token_ids, _lp = self._greedy_sample_with_logprobs(logits)
+            _draft_logprobs_list.append(_lp)
+        else:
+            draft_token_ids = logits.argmax(dim=-1)
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -467,11 +500,24 @@ class EagleProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
-            draft_token_ids = logits.argmax(dim=-1)
+            # Sequential multi-step drafting: tokens 1..(K-1).
+            if _tetris_enabled:
+                draft_token_ids, _lp = self._greedy_sample_with_logprobs(
+                    logits)
+                _draft_logprobs_list.append(_lp)
+            else:
+                draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+
+        # Store accumulated logprobs for TETRIS consumption in model runner.
+        if _tetris_enabled and _draft_logprobs_list:
+            # Shape: [batch_size, num_speculative_tokens]
+            self.last_draft_logprobs = torch.stack(
+                _draft_logprobs_list, dim=1)
+
         return draft_token_ids
 
     def prepare_next_token_ids_cpu(
