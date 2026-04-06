@@ -60,6 +60,7 @@ SpeculativeMethod = Literal[
     "mlp_speculator",
     "draft_model",
     "adaptive_spechive",
+    "pivot",
     "suffix",
     EagleModelTypes,
 ]
@@ -245,6 +246,8 @@ class SpeculativeConfig:
             factors.append(self.adaptive_spechive_mode)
             factors.append(self.adaptive_spechive_enable_inter_verification)
             factors.append(self.adaptive_spechive_enable_hierarchical_verification)
+        elif self.method == "pivot":
+            factors.append(self.intermediate_model)
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
@@ -524,11 +527,11 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method == "adaptive_spechive":
+                if self.method in ("adaptive_spechive", "pivot"):
                     if not self.intermediate_model:
                         raise ValueError(
-                            "adaptive_spechive requires `intermediate_model` "
-                            "(verifier I) in addition to `model` (draft D)."
+                            f"{self.method} requires `intermediate_model` "
+                            "(pivot/intermediate I) in addition to `model` (draft D)."
                         )
                 elif self.method in ("eagle", "eagle3"):
                     pass
@@ -564,7 +567,7 @@ class SpeculativeConfig:
                             "one layer. Might need some code changes "
                             "to support multiple layers."
                         )
-                elif self.method == "draft_model":
+                elif self.method in ("draft_model", "pivot"):
                     pass
                 else:
                     raise NotImplementedError(
@@ -655,7 +658,7 @@ class SpeculativeConfig:
                     )
                 )
 
-                if self.method == "adaptive_spechive":
+                if self.method in ("adaptive_spechive", "pivot"):
                     assert self.intermediate_model is not None
                     int_rev = (
                         self.intermediate_revision
@@ -883,7 +886,7 @@ class SpeculativeConfig:
             )
 
         if (
-            self.method == "adaptive_spechive"
+            self.method in ("adaptive_spechive", "pivot")
             and self.intermediate_model_config is not None
             and self.intermediate_parallel_config is not None
         ):
@@ -943,6 +946,8 @@ class SpeculativeConfig:
                 raise ValueError(
                     "parallel_drafting is not supported with adaptive_spechive."
                 )
+        if self.method == "pivot" and self.parallel_drafting:
+            raise ValueError("parallel_drafting is not supported with pivot.")
 
         aux_hidden_states_supported = [
             "llama",
@@ -982,7 +987,7 @@ class SpeculativeConfig:
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
-            self.method in ("draft_model", "adaptive_spechive")
+            self.method in ("draft_model", "adaptive_spechive", "pivot")
             and self.target_model_config is not None
             and self.draft_model_config is not None
         ):
@@ -996,11 +1001,9 @@ class SpeculativeConfig:
                     f"Using models with different tokenizers can cause out-of-bounds "
                     f"errors during speculative decoding."
                 )
-        if (
-            self.method == "adaptive_spechive"
-            and self.target_model_config is not None
-            and self.intermediate_model_config is not None
-        ):
+        if self.target_model_config is None or self.intermediate_model_config is None:
+            return
+        if self.method == "adaptive_spechive":
             target_vocab_size = self.target_model_config.get_vocab_size()
             i_vocab = self.intermediate_model_config.get_vocab_size()
             if target_vocab_size != i_vocab:
@@ -1009,6 +1012,31 @@ class SpeculativeConfig:
                     f"vocabulary size. Target vocab_size={target_vocab_size}, "
                     f"intermediate vocab_size={i_vocab}."
                 )
+        if self.method == "pivot":
+            target_vocab_size = self.target_model_config.get_vocab_size()
+            i_vocab = self.intermediate_model_config.get_vocab_size()
+            if (
+                target_vocab_size != i_vocab
+                and not self._pivot_intermediate_uses_shared_output_semantics()
+            ):
+                raise ValueError(
+                    "pivot requires intermediate output compatibility with target. "
+                    "Either use an intermediate model with matching vocabulary size "
+                    "(direct token-id emission), or an EAGLE-style intermediate model "
+                    "that declares shared output semantics."
+                )
+
+    def _pivot_intermediate_uses_shared_output_semantics(self) -> bool:
+        if self.intermediate_model_config is None:
+            return False
+        hf_config = self.intermediate_model_config.hf_config
+        model_type = getattr(hf_config, "model_type", "")
+        if model_type in ("eagle", "speculators"):
+            return True
+        for arch in getattr(hf_config, "architectures", []) or []:
+            if isinstance(arch, str) and "Eagle" in arch:
+                return True
+        return False
 
     @property
     def max_num_new_slots_for_drafting(self) -> int:
@@ -1041,7 +1069,7 @@ class SpeculativeConfig:
         return self.method in ("eagle", "eagle3", "mtp")
 
     def uses_draft_model(self) -> bool:
-        return self.method in ("draft_model", "adaptive_spechive")
+        return self.method in ("draft_model", "adaptive_spechive", "pivot")
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"
@@ -1059,4 +1087,7 @@ class SpeculativeConfig:
             acm = self.adaptive_spechive_mode
             rounds = self.adaptive_spechive_num_rounds
             return f"SpeculativeConfig({method=}, {model=}, {im=}, {acm=}, {num_spec_tokens=}, {rounds=})"
+        if method == "pivot":
+            im = self.intermediate_model
+            return f"SpeculativeConfig({method=}, {model=}, {im=}, {num_spec_tokens=})"
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"

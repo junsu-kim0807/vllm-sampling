@@ -174,6 +174,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.pivot import PivotProposer
 from vllm.v1.spec_decode.spec_stage_ops import (
     sanitize_hybrid_bundle_for_metadata,
 )
@@ -515,6 +516,7 @@ class GPUModelRunner(
                 | EagleProposer
                 | DraftModelProposer
                 | AdaptiveSpechiveProposer
+                | PivotProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
             )
@@ -524,6 +526,12 @@ class GPUModelRunner(
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "adaptive_spechive":
                 self.drafter = AdaptiveSpechiveProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
+                )
+            elif self.speculative_config.method == "pivot":
+                self.drafter = PivotProposer(
                     vllm_config=self.vllm_config,
                     device=self.device,
                     runner=self,
@@ -4351,6 +4359,7 @@ class GPUModelRunner(
                     EagleProposer
                     | DraftModelProposer
                     | AdaptiveSpechiveProposer
+                    | PivotProposer
                     | ExtractHiddenStatesProposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
@@ -4719,7 +4728,7 @@ class GPUModelRunner(
         elif spec_config.use_eagle() or spec_config.uses_draft_model():
             assert isinstance(
                 self.drafter,
-                EagleProposer | DraftModelProposer | AdaptiveSpechiveProposer,
+                EagleProposer | DraftModelProposer | AdaptiveSpechiveProposer | PivotProposer,
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -5603,6 +5612,7 @@ class GPUModelRunner(
                     EagleProposer
                     | DraftModelProposer
                     | AdaptiveSpechiveProposer
+                    | PivotProposer
                     | ExtractHiddenStatesProposer,
                 )
                 assert self.speculative_config is not None
@@ -6165,7 +6175,7 @@ class GPUModelRunner(
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DraftModelProposer | AdaptiveSpechiveProposer,
+                EagleProposer | DraftModelProposer | AdaptiveSpechiveProposer | PivotProposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 

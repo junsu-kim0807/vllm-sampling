@@ -13,6 +13,7 @@ SpecStageMode = Literal[
     "draft_target",
     "inter_verification",
     "hierarchical_verification",
+    "pivot",
 ]
 
 
