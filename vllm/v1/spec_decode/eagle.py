@@ -400,6 +400,21 @@ class SpecDecodeBaseProposer:
         ]
         return replace(sampling_metadata, output_token_ids=output_token_ids)
 
+    def _greedy_sample_with_logprobs(
+        self,
+        logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Greedy-sample draft tokens AND return their log-probabilities.
+
+        Called by ``propose()`` when ``speculative_config.tetris=True``.
+        """
+        token_ids = logits.argmax(dim=-1)                         # [B]
+        log_probs = logits.log_softmax(dim=-1)                    # [B, V]
+        token_logprobs = log_probs.gather(
+            1, token_ids.unsqueeze(1)
+        ).squeeze(1)                                              # [B]
+        return token_ids, token_logprobs
+
     def propose(
         self,
         # [num_tokens]
@@ -419,6 +434,15 @@ class SpecDecodeBaseProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,
     ) -> torch.Tensor:
+        # --- TETRIS: set up per-step logprob collection --------------------
+        _tetris_enabled: bool = (
+            getattr(self.speculative_config, "tetris", False)
+            and not self.use_local_argmax_reduction
+        )
+        _draft_logprobs_list: list[torch.Tensor] = []
+        self.last_draft_logprobs: torch.Tensor | None = None
+        # -------------------------------------------------------------------
+
         batch_size = common_attn_metadata.batch_size()
         self.last_draft_probs_flat = None
 
@@ -512,8 +536,18 @@ class SpecDecodeBaseProposer:
                     sampling_metadata,
                 )
                 self.last_draft_probs_flat = probs0
+                if _tetris_enabled:
+                    _lp = logits0.log_softmax(dim=-1).gather(
+                        1, draft_token_ids.unsqueeze(1)
+                    ).squeeze(1)
+                    self.last_draft_logprobs = _lp.unsqueeze(1)
             else:
-                draft_token_ids = self._greedy_sample(sample_hidden_states)
+                if _tetris_enabled:
+                    logits0 = self.model.compute_logits(sample_hidden_states)
+                    draft_token_ids, _lp = self._greedy_sample_with_logprobs(logits0)
+                    self.last_draft_logprobs = _lp.unsqueeze(1)
+                else:
+                    draft_token_ids = self._greedy_sample(sample_hidden_states)
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -549,8 +583,18 @@ class SpecDecodeBaseProposer:
                 sampling_metadata,
             )
             probs_per_step.append(p0)
+            if _tetris_enabled:
+                _lp = logits0.log_softmax(dim=-1).gather(
+                    1, draft_token_ids.unsqueeze(1)
+                ).squeeze(1)
+                _draft_logprobs_list.append(_lp)
         else:
-            draft_token_ids = self._greedy_sample(sample_hidden_states)
+            if _tetris_enabled:
+                logits0 = self.model.compute_logits(sample_hidden_states)
+                draft_token_ids, _lp = self._greedy_sample_with_logprobs(logits0)
+                _draft_logprobs_list.append(_lp)
+            else:
+                draft_token_ids = self._greedy_sample(sample_hidden_states)
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -723,8 +767,18 @@ class SpecDecodeBaseProposer:
                     step_sm,
                 )
                 probs_per_step.append(pi)
+                if _tetris_enabled:
+                    _lp = logits_i.log_softmax(dim=-1).gather(
+                        1, draft_token_ids.unsqueeze(1)
+                    ).squeeze(1)
+                    _draft_logprobs_list.append(_lp)
             else:
-                draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
+                if _tetris_enabled:
+                    logits_i = self.model.compute_logits(last_hidden_states[:batch_size])
+                    draft_token_ids, _lp = self._greedy_sample_with_logprobs(logits_i)
+                    _draft_logprobs_list.append(_lp)
+                else:
+                    draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
@@ -733,6 +787,10 @@ class SpecDecodeBaseProposer:
             self.last_draft_probs_flat = torch.stack(probs_per_step, dim=1).reshape(
                 -1, probs_per_step[0].shape[-1]
             )
+        # Store accumulated logprobs for TETRIS consumption in model runner.
+        if _tetris_enabled and _draft_logprobs_list:
+            # Shape: [batch_size, num_speculative_tokens]
+            self.last_draft_logprobs = torch.stack(_draft_logprobs_list, dim=1)
         return draft_token_ids
 
     def set_inputs_first_pass(
