@@ -543,7 +543,9 @@ cd "${{REPO_DIR}}"
 source "${{VENV_DIR}}/bin/activate"
 
 if [[ -f ~/.bashrc ]]; then
+  set +u
   source ~/.bashrc
+  set -u
 fi
 
 unset PYTHONPATH PYTHONHOME
