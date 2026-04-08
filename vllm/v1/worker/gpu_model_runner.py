@@ -12,7 +12,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
@@ -176,9 +176,14 @@ from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.pivot import PivotProposer
 from vllm.v1.spec_decode.spec_stage_ops import (
+    collapse_pivot_expanded_sampled_to_origin,
     sanitize_hybrid_bundle_for_metadata,
 )
-from vllm.v1.spec_decode.spec_stage_runtime import HybridProposalBundle
+from vllm.v1.spec_decode.spec_stage_runtime import (
+    HybridProposalBundle,
+    PivotExpansionPlan,
+    expand_hybrid_bundle_for_pivot_expansion,
+)
 from vllm.v1.spec_decode.spec_stage_utils import slice_sampling_metadata_for_subbatch
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.tetris import apply_tetris
@@ -218,6 +223,36 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 logger = init_logger(__name__)
+
+
+def _expand_list_rows_by_pivot_plan(
+    rows: list[list[Any]], plan: PivotExpansionPlan
+) -> list[list[Any]]:
+    return [list(rows[o]) for o in plan.expanded_to_origin]
+
+
+def _collapse_draft_tensor_rows_for_scheduler(
+    out_exp: torch.Tensor,
+    plan: PivotExpansionPlan | None,
+    batch_size: int,
+) -> torch.Tensor:
+    """Scheduler/drafter return value is origin-batch rows; bundle may be B'."""
+    if plan is None:
+        return out_exp
+    device, cap = out_exp.device, out_exp.shape[1]
+    out = torch.full(
+        (batch_size, cap),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=device,
+    )
+    for o in range(batch_size):
+        j = next(
+            idx for idx, orig in enumerate(plan.expanded_to_origin) if orig == o
+        )
+        out[o].copy_(out_exp[j])
+    return out
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -567,6 +602,7 @@ class GPUModelRunner(
                 )
             self.rejection_sampler = RejectionSampler(self.sampler)
         self.pending_hybrid_spec_bundle: HybridProposalBundle | None = None
+        self.pending_pivot_expansion_plan: PivotExpansionPlan | None = None
         self._dit_debug_enabled = (
             os.environ.get("VLLM_SPEC_DIT_DEBUG", "0") == "1"
             or os.environ.get("VLLM_SPEC_SPECHIVE_DEBUG", "0") == "1"
@@ -1787,9 +1823,42 @@ class GPUModelRunner(
                     >= self.input_batch.num_prompt_tokens[req_idx]
                 ):
                     num_decode_draft_tokens[req_idx] = len(draft_token_ids)
-            spec_decode_metadata = self._calc_spec_decode_metadata(
-                num_draft_tokens, cu_num_tokens
+            pivot_plan = self.pending_pivot_expansion_plan
+            pb = self.pending_hybrid_spec_bundle
+            use_pivot_expanded = (
+                pivot_plan is not None
+                and pb is not None
+                and pivot_plan.expanded_batch_size > 0
+                and len(pivot_plan.expanded_to_origin) == pivot_plan.expanded_batch_size
+                and len(pb.num_draft_tokens) == pivot_plan.expanded_batch_size
             )
+            if use_pivot_expanded:
+                assert pb.expansion_plan is pivot_plan, (
+                    "pending bundle expansion_plan must match pending pivot plan"
+                )
+                assert int(pb.draft_token_ids.shape[0]) == int(
+                    pb.cu_num_draft_tokens[-1].item()
+                ), "bundle flat draft rows must match cu_num_draft_tokens tail"
+                num_draft_meta = num_draft_tokens[pivot_plan.expanded_to_origin]
+                cu_meta = cu_num_tokens[pivot_plan.expanded_to_origin]
+                spec_decode_metadata = self._calc_spec_decode_metadata(
+                    num_draft_meta,
+                    cu_meta,
+                    expansion_plan=pivot_plan,
+                )
+                assert int(spec_decode_metadata.cu_num_draft_tokens[-1].item()) == int(
+                    pb.draft_token_ids.shape[0]
+                ), "metadata and bundle draft token counts must match"
+                spec_decode_metadata = dataclass_replace(
+                    spec_decode_metadata,
+                    draft_token_ids=pb.draft_token_ids,
+                )
+            else:
+                spec_decode_metadata = self._calc_spec_decode_metadata(
+                    num_draft_tokens,
+                    cu_num_tokens,
+                    expansion_plan=None,
+                )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
@@ -2291,6 +2360,8 @@ class GPUModelRunner(
         self,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
+        *,
+        expansion_plan: PivotExpansionPlan | None = None,
     ) -> SpecDecodeMetadata:
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
@@ -2364,6 +2435,7 @@ class GPUModelRunner(
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+            expansion_plan=expansion_plan,
         )
 
     def _prepare_kv_sharing_fast_prefill(
@@ -3008,11 +3080,19 @@ class GPUModelRunner(
     def set_pending_hybrid_spec_bundle(
         self, bundle: HybridProposalBundle | None
     ) -> None:
+        if bundle is not None:
+            bundle = expand_hybrid_bundle_for_pivot_expansion(bundle)
         self.pending_hybrid_spec_bundle = bundle
+        self.pending_pivot_expansion_plan = (
+            bundle.expansion_plan if bundle is not None else None
+        )
 
     def take_pending_hybrid_spec_bundle(self) -> HybridProposalBundle | None:
         bundle = self.pending_hybrid_spec_bundle
         self.pending_hybrid_spec_bundle = None
+        self.pending_pivot_expansion_plan = (
+            bundle.expansion_plan if bundle is not None else None
+        )
         return bundle
 
     def _is_dit_debug_enabled(self) -> bool:
@@ -3075,7 +3155,14 @@ class GPUModelRunner(
         self._dit_debug_step_id += 1
         cap = self.speculative_config.runner_num_speculative_tokens()
         L = self.speculative_config.num_speculative_tokens
-        n_inner = self.speculative_config.adaptive_spechive_num_rounds
+        # pivot_spechive: inner D=>I round count (expanded rows flow through all).
+        if (
+            self.speculative_config.method == "pivot"
+            and self.speculative_config.pivot_spechive
+        ):
+            n_inner = self.speculative_config.pivot_spechive_num_rounds
+        else:
+            n_inner = self.speculative_config.adaptive_spechive_num_rounds
         batch_size = common_attn_metadata.batch_size()
         req_ids = list(self.input_batch.req_ids[:batch_size])
         use_draft_probs = (
@@ -3106,6 +3193,7 @@ class GPUModelRunner(
         prefix_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
         source_stage_rows: list[list[int]] = [[] for _ in range(batch_size)]
         expected_prefix_rows: list[list[int]] = [[] for _ in range(batch_size)]
+        pivot_expansion_plan: PivotExpansionPlan | None = None
 
         for round_idx in range(n_inner):
             self._dit_debug_assert(
@@ -3113,15 +3201,25 @@ class GPUModelRunner(
                 "check3_next_draft_starts_from_intermediate_prefix",
                 detail=f"round={round_idx}",
             )
+            sm_idxs = (
+                pivot_expansion_plan.expanded_to_origin
+                if pivot_expansion_plan is not None
+                else list(range(batch_size))
+            )
             round_sm = slice_sampling_metadata_for_subbatch(
                 sampling_metadata,
-                list(range(batch_size)),
+                sm_idxs,
                 provisional_prefix_rows=prefix_rows,
                 sampled_ids_only=True,
             )
             if self._is_dit_debug_enabled():
-                for b in range(batch_size):
-                    base_len = len(sampling_metadata.output_token_ids[b])
+                for b in range(len(prefix_rows)):
+                    origin_b = (
+                        pivot_expansion_plan.expanded_to_origin[b]
+                        if pivot_expansion_plan is not None
+                        else b
+                    )
+                    base_len = len(sampling_metadata.output_token_ids[origin_b])
                     got_len = len(round_sm.output_token_ids[b])
                     want_len = base_len + len(prefix_rows[b])
                     self._dit_debug_assert(
@@ -3144,6 +3242,30 @@ class GPUModelRunner(
                 sampling_metadata=round_sm,
                 use_draft_probs=use_draft_probs,
             )
+            if proposal.expansion_plan is not None and pivot_expansion_plan is None:
+                pivot_expansion_plan = proposal.expansion_plan
+            eff_bs = int(proposal.tokens.shape[0])
+            if eff_bs != len(prefix_rows):
+                assert pivot_expansion_plan is not None, (
+                    "prefix row count must match proposal without a pivot plan"
+                )
+                prefix_rows = _expand_list_rows_by_pivot_plan(
+                    prefix_rows, pivot_expansion_plan
+                )
+                prefix_prob_rows = _expand_list_rows_by_pivot_plan(
+                    prefix_prob_rows, pivot_expansion_plan
+                )
+                source_stage_rows = _expand_list_rows_by_pivot_plan(
+                    source_stage_rows, pivot_expansion_plan
+                )
+                expected_prefix_rows = _expand_list_rows_by_pivot_plan(
+                    expected_prefix_rows, pivot_expansion_plan
+                )
+            self._dit_debug_assert(
+                eff_bs == len(prefix_rows),
+                "check_pivot_expanded_prefix_alignment",
+                detail=f"round={round_idx}, eff_bs={eff_bs}, prefix_lists={len(prefix_rows)}",
+            )
             self._dit_debug_assert(
                 int(proposal.tokens.shape[1]) == int(L),
                 "check1_chunk_proposal_width",
@@ -3163,10 +3285,10 @@ class GPUModelRunner(
                 candidate_tokens=proposal.tokens,
             )
             self._dit_debug_assert(
-                int(verification.logits_flat.shape[0]) == int(batch_size * L),
+                int(verification.logits_flat.shape[0]) == int(eff_bs * L),
                 "check1_chunk_verification_batchxL",
                 detail=(
-                    f"round={round_idx}, expected_rows={batch_size * L}, "
+                    f"round={round_idx}, expected_rows={eff_bs * L}, "
                     f"got={verification.logits_flat.shape[0]}"
                 ),
             )
@@ -3189,14 +3311,14 @@ class GPUModelRunner(
             self._dit_debug_assert(
                 all(
                     after_lens[b] - before_lens[b] == len(decision.emitted_rows[b])
-                    for b in range(batch_size)
+                    for b in range(eff_bs)
                 ),
                 "check_hv_round_prefix_growth",
                 detail=f"round={round_idx}, before={before_lens}, after={after_lens}",
             )
             self._dit_debug_assert(
                 all(
-                    len(source_stage_rows[b]) == len(prefix_rows[b]) for b in range(batch_size)
+                    len(source_stage_rows[b]) == len(prefix_rows[b]) for b in range(eff_bs)
                 ),
                 "check_hv_probs_and_stage_alignment",
                 detail=f"round={round_idx}, source_stage_lens={[len(r) for r in source_stage_rows]}",
@@ -3206,16 +3328,24 @@ class GPUModelRunner(
                     all(
                         len(prefix_prob_rows[b]) == len(prefix_rows[b])
                         and len(decision.emitted_prob_rows[b]) == len(decision.emitted_rows[b])
-                        for b in range(batch_size)
+                        for b in range(eff_bs)
                     ),
                     "check_hv_probs_and_stage_alignment",
                     detail=f"round={round_idx}, prefix_prob_lens={[len(r) for r in prefix_prob_rows]}",
                 )
 
+        expected_rounds = (
+            self.speculative_config.pivot_spechive_num_rounds
+            if (
+                self.speculative_config.method == "pivot"
+                and self.speculative_config.pivot_spechive
+            )
+            else self.speculative_config.adaptive_spechive_num_rounds
+        )
         self._dit_debug_assert(
-            n_inner == int(self.speculative_config.adaptive_spechive_num_rounds),
+            n_inner == int(expected_rounds),
             "check2_round_count_matches_config_rounds",
-            detail=f"executed_rounds={n_inner}",
+            detail=f"executed_rounds={n_inner}, expected_rounds={expected_rounds}",
         )
 
         remaining_cap = max(
@@ -3224,9 +3354,14 @@ class GPUModelRunner(
         )
         tail_len = min(L, remaining_cap)
         if tail_len > 0:
+            tail_sm_idxs = (
+                pivot_expansion_plan.expanded_to_origin
+                if pivot_expansion_plan is not None
+                else list(range(batch_size))
+            )
             tail_sm = slice_sampling_metadata_for_subbatch(
                 sampling_metadata,
-                list(range(batch_size)),
+                tail_sm_idxs,
                 provisional_prefix_rows=prefix_rows,
                 sampled_ids_only=True,
             )
@@ -3242,12 +3377,27 @@ class GPUModelRunner(
                 sampling_metadata=tail_sm,
                 use_draft_probs=use_draft_probs,
             )
+            if tail.expansion_plan is not None and pivot_expansion_plan is None:
+                pivot_expansion_plan = tail.expansion_plan
+            tail_eff = int(tail.tokens.shape[0])
+            if tail_eff != len(prefix_rows):
+                assert pivot_expansion_plan is not None, "tail batch must match prefix rows"
+                prefix_rows = _expand_list_rows_by_pivot_plan(
+                    prefix_rows, pivot_expansion_plan
+                )
+                prefix_prob_rows = _expand_list_rows_by_pivot_plan(
+                    prefix_prob_rows, pivot_expansion_plan
+                )
+                source_stage_rows = _expand_list_rows_by_pivot_plan(
+                    source_stage_rows, pivot_expansion_plan
+                )
+            tail_eff = int(tail.tokens.shape[0])
             tail_rows = [
-                [int(tok) for tok in tail.tokens[b].tolist()] for b in range(batch_size)
+                [int(tok) for tok in tail.tokens[b].tolist()] for b in range(tail_eff)
             ]
-            tail_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+            tail_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(tail_eff)]
             if use_draft_probs and tail.probs is not None:
-                for b in range(batch_size):
+                for b in range(tail_eff):
                     tail_prob_rows[b] = [tail.probs[b, j] for j in range(tail_len)]
             for b, emitted in enumerate(tail_rows):
                 prefix_rows[b].extend(emitted)
@@ -3256,54 +3406,57 @@ class GPUModelRunner(
                     prefix_prob_rows[b].extend(tail_prob_rows[b])
             self._dit_debug_assert(
                 all(
-                    len(source_stage_rows[b]) == len(prefix_rows[b]) for b in range(batch_size)
+                    len(source_stage_rows[b]) == len(prefix_rows[b]) for b in range(tail_eff)
                 ),
                 "check_hv_probs_and_stage_alignment",
                 detail=f"tail, source_stage_lens={[len(r) for r in source_stage_rows]}",
             )
             if use_draft_probs:
                 self._dit_debug_assert(
-                    all(len(prefix_prob_rows[b]) == len(prefix_rows[b]) for b in range(batch_size)),
+                    all(len(prefix_prob_rows[b]) == len(prefix_rows[b]) for b in range(tail_eff)),
                     "check_hv_probs_and_stage_alignment",
                     detail=f"tail, prefix_prob_lens={[len(r) for r in prefix_prob_rows]}",
                 )
 
-        out = torch.full(
-            (batch_size, cap),
+        eff_rows = len(prefix_rows)
+        out_exp = torch.full(
+            (eff_rows, cap),
             PLACEHOLDER_TOKEN_ID,
             dtype=torch.int32,
             device=target_token_ids.device,
         )
-        for b in range(batch_size):
+        for b in range(eff_rows):
             valid = min(cap, len(prefix_rows[b]))
             if valid > 0:
-                out[b, :valid] = torch.tensor(
+                out_exp[b, :valid] = torch.tensor(
                     prefix_rows[b][:valid],
                     dtype=torch.int32,
                     device=target_token_ids.device,
                 )
                 source_stage_rows[b] = source_stage_rows[b][:valid]
         draft_probs_flat = (
-            _flatten_prob_rows_for_output(prefix_prob_rows, out)
+            _flatten_prob_rows_for_output(prefix_prob_rows, out_exp)
             if use_draft_probs
             else None
         )
         bundle = _build_hybrid_bundle_from_rows(
-            out,
+            out_exp,
             mode="hierarchical_verification",
             draft_probs=draft_probs_flat,
             source_stage_rows=source_stage_rows,
         )
+        if pivot_expansion_plan is not None:
+            bundle = dataclass_replace(bundle, expansion_plan=pivot_expansion_plan)
         inter_verified_lens = [
             sum(1 for stage in source_stage_rows[b] if stage == 0)
-            for b in range(batch_size)
+            for b in range(eff_rows)
         ]
         tail_draft_lens = [
             sum(1 for stage in source_stage_rows[b] if stage == 1)
-            for b in range(batch_size)
+            for b in range(eff_rows)
         ]
         valid_out_lens = [
-            int((out[b] != PLACEHOLDER_TOKEN_ID).sum().item()) for b in range(batch_size)
+            int((out_exp[b] != PLACEHOLDER_TOKEN_ID).sum().item()) for b in range(eff_rows)
         ]
         self._dit_debug_assert(
             bundle.max_spec_len == cap,
@@ -3313,7 +3466,7 @@ class GPUModelRunner(
         self._dit_debug_assert(
             all(
                 inter_verified_lens[b] + tail_draft_lens[b] == valid_out_lens[b]
-                for b in range(batch_size)
+                for b in range(eff_rows)
             ),
             "check5_target_verify_uses_intermediate_plus_tail_bundle",
             detail=(
@@ -3334,6 +3487,9 @@ class GPUModelRunner(
             all(stage in (0, 1) for row in source_stage_rows for stage in row),
             "check_hv_probs_and_stage_alignment",
             detail="source_stage must be in {0,1}",
+        )
+        out = _collapse_draft_tensor_rows_for_scheduler(
+            out_exp, pivot_expansion_plan, batch_size
         )
         return out, bundle
 
@@ -3400,6 +3556,7 @@ class GPUModelRunner(
         self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
             self.pending_hybrid_spec_bundle = None
+            self.pending_pivot_expansion_plan = None
             discard_pending_state = getattr(
                 self.drafter, "discard_pending_hierarchical_verification_state", None
             )
@@ -3428,6 +3585,7 @@ class GPUModelRunner(
                 bundle, spec_decode_metadata
             )
             if validated_bundle is None:
+                self.pending_pivot_expansion_plan = None
                 self._dit_debug_event(
                     "spechive_bundle_cleanup_on_validation_failure",
                     {"reason": "bundle_validation_failed"},
@@ -3441,12 +3599,47 @@ class GPUModelRunner(
         if bundle is not None and bundle.draft_probs is not None:
             draft_probs = bundle.draft_probs
 
+        verity_sm = sampling_metadata
+        if spec_decode_metadata is not None:
+            plan = spec_decode_metadata.expansion_plan
+            if (
+                plan is not None
+                and plan.expanded_batch_size > 0
+                and len(plan.expanded_to_origin) == plan.expanded_batch_size
+                and len(spec_decode_metadata.num_draft_tokens)
+                == plan.expanded_batch_size
+            ):
+                verity_sm = slice_sampling_metadata_for_subbatch(
+                    sampling_metadata,
+                    plan.expanded_to_origin,
+                    sampled_ids_only=False,
+                )
+
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
             logits,
-            sampling_metadata,
+            verity_sm,
         )
+        expansion_plan: PivotExpansionPlan | None = None
+        if bundle is not None:
+            expansion_plan = bundle.expansion_plan
+        if expansion_plan is None:
+            expansion_plan = self.pending_pivot_expansion_plan
+        if expansion_plan is None and spec_decode_metadata is not None:
+            expansion_plan = spec_decode_metadata.expansion_plan
+        num_draft_for_collapse = (
+            spec_decode_metadata.num_draft_tokens
+            if spec_decode_metadata is not None
+            else None
+        )
+        if expansion_plan is not None:
+            sampler_output.sampled_token_ids = collapse_pivot_expanded_sampled_to_origin(
+                sampler_output.sampled_token_ids,
+                expansion_plan,
+                num_draft_tokens=num_draft_for_collapse,
+            )
+        self.pending_pivot_expansion_plan = None
         if bundle is not None and bundle.mode == "hierarchical_verification":
             req_ids = list(self.input_batch.req_ids[: sampler_output.sampled_token_ids.shape[0]])
             committed_lens: list[int] = []
@@ -3463,7 +3656,8 @@ class GPUModelRunner(
                 if committed > 0:
                     self._dit_debug_last_commit_token[req_id] = last_token
             self._dit_debug_assert(
-                all(
+                len(committed_lens) != len(bundle.num_draft_tokens)
+                or all(
                     committed_lens[b] <= bundle.num_draft_tokens[b] + 1
                     for b in range(len(committed_lens))
                 ),

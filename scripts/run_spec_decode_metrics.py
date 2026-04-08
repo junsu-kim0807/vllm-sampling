@@ -11,7 +11,8 @@ Each pair directory contains:
   - metrics.csv
   - metrics.jsonl
   - pair_info.json
-  - responses.jsonl (unless --no-responses): one JSON object per prompt (prompt_index, response, num_output_tokens).
+  - responses.jsonl (unless --no-responses): one JSON object per request.
+    For multi-turn datasets it also includes sample_id and turn_index.
 
 If multiple targets are provided, an aggregate CSV/JSONL is also written under
 results_root using --results-csv / --results-jsonl.
@@ -91,6 +92,33 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--topk_selection",
+        type=int,
+        default=5,
+        choices=[2, 5],
+        help=(
+            "When --method=pivot: first-token top-k expansion width "
+            "(default: 5; allowed: 2 or 5)."
+        ),
+    )
+    p.add_argument(
+        "--expansion_pct",
+        type=float,
+        default=0.2,
+        help=(
+            "When --method=pivot: fraction of low-confidence requests to expand "
+            "(default: 0.2)."
+        ),
+    )
+    p.add_argument(
+        "--spechive",
+        action="store_true",
+        help=(
+            "When --method=pivot: enable staged D=>I rounds before final D=>T "
+            "verification."
+        ),
+    )
+    p.add_argument(
         "--adaptive-spechive-mode",
         type=str,
         default="hierarchical_verification",
@@ -146,7 +174,19 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         type=str,
         default="aime25,codeelo",
-        help="Comma-separated keys: aime25, codeelo, gov_report, qmsum (LongBench).",
+        help=(
+            "Comma-separated keys: aime25, codeelo, gov_report, qmsum "
+            "(LongBench), spec_bench, alpaca, gsm8k, mt_bench, qa, humaneval, sum."
+        ),
+    )
+    p.add_argument(
+        "--repo-dir",
+        type=str,
+        default=str(Path(__file__).resolve().parents[1]),
+        help=(
+            "Repository root containing data/<dataset>/question.jsonl for "
+            "Spec-Bench split datasets."
+        ),
     )
     p.add_argument(
         "--batch-sizes",
@@ -212,6 +252,67 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap for LongBench qmsum.",
     )
+    p.add_argument(
+        "--spec-bench-jsonl",
+        type=str,
+        default=None,
+        help=(
+            "Path to Spec-Bench question.jsonl. Required when using "
+            "--datasets spec_bench."
+        ),
+    )
+    p.add_argument(
+        "--spec-bench-category",
+        type=str,
+        default=None,
+        help=(
+            "Optional Spec-Bench category filter (e.g. alpaca, mt_bench). "
+            "Comma-separated values are allowed."
+        ),
+    )
+    p.add_argument(
+        "--spec-bench-max-new-tokens",
+        type=int,
+        default=256,
+        help="Max new tokens for Spec-Bench.",
+    )
+    p.add_argument(
+        "--max-samples-spec-bench",
+        type=int,
+        default=None,
+        help="Optional cap for Spec-Bench samples after category filtering.",
+    )
+    p.add_argument(
+        "--mt-bench-dataset-path",
+        type=str,
+        default="philschmid/mt-bench",
+        help=(
+            "Hugging Face dataset path or local JSONL path for MT-Bench "
+            "(must contain a turns field)."
+        ),
+    )
+    p.add_argument(
+        "--mt-bench-max-new-tokens",
+        type=int,
+        default=256,
+        help="Max new tokens for MT-Bench.",
+    )
+    p.add_argument(
+        "--max-samples-mt-bench",
+        type=int,
+        default=None,
+        help="Optional cap for MT-Bench samples.",
+    )
+    p.add_argument("--alpaca-max-new-tokens", type=int, default=256)
+    p.add_argument("--gsm8k-max-new-tokens", type=int, default=256)
+    p.add_argument("--qa-max-new-tokens", type=int, default=256)
+    p.add_argument("--humaneval-max-new-tokens", type=int, default=512)
+    p.add_argument("--sum-max-new-tokens", type=int, default=512)
+    p.add_argument("--max-samples-alpaca", type=int, default=None)
+    p.add_argument("--max-samples-gsm8k", type=int, default=None)
+    p.add_argument("--max-samples-qa", type=int, default=None)
+    p.add_argument("--max-samples-humaneval", type=int, default=None)
+    p.add_argument("--max-samples-sum", type=int, default=None)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--top-k", type=int, default=-1)
@@ -242,7 +343,11 @@ def parse_args() -> argparse.Namespace:
         "--responses-jsonl",
         type=str,
         default=None,
-        help="Per-line JSON with only: prompt_index, response, num_output_tokens. Default: <pair_dir>/responses.jsonl.",
+        help=(
+            "Per-line JSONL responses. Single-turn records contain prompt_index; "
+            "multi-turn records also include sample_id and turn_index. "
+            "Default: <pair_dir>/responses.jsonl."
+        ),
     )
     p.add_argument(
         "--no-responses",
@@ -278,6 +383,101 @@ def parse_tp_map(raw: str) -> dict[str, int]:
 AIME25_REPO = "opencompass/AIME2025"
 CODEELO_REPO = "Qwen/CodeElo"
 LONGBENCH_REPO = "THUDM/LongBench"
+DEFAULT_MT_BENCH_REPO = "philschmid/mt-bench"
+SPEC_BENCH_DATASET_KEYS = (
+    "alpaca",
+    "gsm8k",
+    "mt_bench",
+    "qa",
+    "humaneval",
+    "sum",
+)
+
+
+def _load_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"Invalid JSON at {path}:{line_no}: {e}"
+                ) from e
+            if not isinstance(obj, dict):
+                raise RuntimeError(
+                    f"Expected JSON object at {path}:{line_no}, got {type(obj)}"
+                )
+            rows.append(obj)
+    return rows
+
+
+def _normalize_turns(raw_turns: Any) -> list[str]:
+    if not isinstance(raw_turns, list):
+        return []
+    turns = [str(x).strip() for x in raw_turns if str(x).strip()]
+    return turns
+
+
+def _resolve_repo_dataset_jsonl(repo_dir: str, dataset_key: str) -> Path:
+    return Path(repo_dir) / "data" / dataset_key / "question.jsonl"
+
+
+def _load_repo_dataset_conversations(
+    repo_dir: str, dataset_key: str, max_samples: int | None
+) -> list[list[str]]:
+    jsonl_path = _resolve_repo_dataset_jsonl(repo_dir, dataset_key)
+    if not jsonl_path.is_file():
+        raise FileNotFoundError(
+            f"Dataset file not found: {jsonl_path}. Expected REPO_DIR/data/{dataset_key}/question.jsonl"
+        )
+    rows = _load_jsonl_records(jsonl_path)
+    conversations: list[list[str]] = []
+    for row in rows:
+        turns = _normalize_turns(row.get("turns"))
+        if not turns:
+            continue
+        conversations.append(turns)
+        if max_samples is not None and len(conversations) >= max_samples:
+            break
+    if not conversations:
+        raise RuntimeError(
+            f"{dataset_key}: 0 valid rows with non-empty 'turns' in {jsonl_path}"
+        )
+    print(
+        f"[dataset] {dataset_key}: path={jsonl_path}, samples={len(conversations)}, mode=multi_turn"
+    )
+    return conversations
+
+
+def _load_mt_like_conversations(
+    dataset_path: str, max_samples: int | None
+) -> list[list[str]]:
+    rows: list[dict[str, Any]]
+    local_jsonl = Path(dataset_path)
+    if local_jsonl.is_file() and local_jsonl.suffix.lower() == ".jsonl":
+        rows = _load_jsonl_records(local_jsonl)
+        split_name = "jsonl"
+    else:
+        ds, split_name = load_dataset_split(dataset_path)
+        rows = list(ds)
+
+    conversations: list[list[str]] = []
+    for row in rows:
+        turns = _normalize_turns(row.get("turns"))
+        if not turns:
+            continue
+        conversations.append(turns)
+        if max_samples is not None and len(conversations) >= max_samples:
+            break
+    if not conversations:
+        raise RuntimeError(
+            f"MT-like dataset {dataset_path} split={split_name} produced 0 valid rows with turns."
+        )
+    return conversations
 
 
 def load_dataset_split(repo: str):
@@ -477,7 +677,7 @@ def _load_longbench(cfg: str, max_samples: int | None) -> list[dict[str, Any]]:
     return rows
 
 
-def get_dataset_prompts(dataset_key: str, args: argparse.Namespace) -> list[str]:
+def get_dataset_requests(dataset_key: str, args: argparse.Namespace) -> dict[str, Any]:
     if dataset_key == "aime25":
         ds, split = load_dataset_split(AIME25_REPO)
         rows = list(ds)
@@ -488,7 +688,7 @@ def get_dataset_prompts(dataset_key: str, args: argparse.Namespace) -> list[str]
             f"[dataset] {dataset_key}: repo={AIME25_REPO}, "
             f"split={split}, samples={len(prompts)}"
         )
-        return prompts
+        return {"mode": "single_turn", "prompts": prompts}
 
     if dataset_key == "codeelo":
         ds, split = load_dataset_split(CODEELO_REPO)
@@ -500,7 +700,7 @@ def get_dataset_prompts(dataset_key: str, args: argparse.Namespace) -> list[str]
             f"[dataset] {dataset_key}: repo={CODEELO_REPO}, "
             f"split={split}, samples={len(prompts)}"
         )
-        return prompts
+        return {"mode": "single_turn", "prompts": prompts}
 
     def _build_longbench_prompt_from_example(ex: dict[str, Any]) -> str:
         # LongBench JSON schemas vary slightly across forks/packaging.
@@ -551,7 +751,7 @@ def get_dataset_prompts(dataset_key: str, args: argparse.Namespace) -> list[str]
             f"[dataset] {dataset_key}: repo={LONGBENCH_REPO}/{cfg}, "
             f"split=test, samples={len(prompts)}"
         )
-        return prompts
+        return {"mode": "single_turn", "prompts": prompts}
 
     if dataset_key in ("qmsum", "longbench_qmsum"):
         cfg = "qmsum"
@@ -578,7 +778,64 @@ def get_dataset_prompts(dataset_key: str, args: argparse.Namespace) -> list[str]
             f"[dataset] {dataset_key}: repo={LONGBENCH_REPO}/{cfg}, "
             f"split=test, samples={len(prompts)}"
         )
-        return prompts
+        return {"mode": "single_turn", "prompts": prompts}
+
+    if dataset_key in SPEC_BENCH_DATASET_KEYS:
+        max_samples_map = {
+            "alpaca": args.max_samples_alpaca,
+            "gsm8k": args.max_samples_gsm8k,
+            "mt_bench": args.max_samples_mt_bench,
+            "qa": args.max_samples_qa,
+            "humaneval": args.max_samples_humaneval,
+            "sum": args.max_samples_sum,
+        }
+        conversations = _load_repo_dataset_conversations(
+            repo_dir=args.repo_dir,
+            dataset_key=dataset_key,
+            max_samples=max_samples_map[dataset_key],
+        )
+        return {"mode": "multi_turn", "conversations": conversations}
+
+    if dataset_key == "spec_bench":
+        if not args.spec_bench_jsonl:
+            raise ValueError(
+                "--spec-bench-jsonl is required when --datasets includes spec_bench."
+            )
+        jsonl_path = Path(args.spec_bench_jsonl)
+        if not jsonl_path.is_file():
+            raise FileNotFoundError(
+                f"--spec-bench-jsonl not found: {args.spec_bench_jsonl}"
+            )
+        rows = _load_jsonl_records(jsonl_path)
+        categories = set(parse_csv_list(args.spec_bench_category)) if args.spec_bench_category else None
+
+        conversations: list[list[str]] = []
+        for row in rows:
+            if categories is not None:
+                row_category = str(row.get("category", "")).strip()
+                if row_category not in categories:
+                    continue
+            turns = _normalize_turns(row.get("turns"))
+            if not turns:
+                continue
+            conversations.append(turns)
+            if (
+                args.max_samples_spec_bench is not None
+                and len(conversations) >= args.max_samples_spec_bench
+            ):
+                break
+
+        if not conversations:
+            raise RuntimeError(
+                "Spec-Bench produced 0 valid samples. Check --spec-bench-jsonl "
+                "and --spec-bench-category filters."
+            )
+        cat_label = ",".join(sorted(categories)) if categories else "ALL"
+        print(
+            f"[dataset] {dataset_key}: path={jsonl_path}, "
+            f"category={cat_label}, samples={len(conversations)}, mode=multi_turn"
+        )
+        return {"mode": "multi_turn", "conversations": conversations}
 
     raise ValueError(f"Unsupported dataset key: {dataset_key}")
 
@@ -592,6 +849,20 @@ def get_dataset_max_new_tokens(dataset_key: str, args: argparse.Namespace) -> in
         return args.gov_report_max_new_tokens
     if dataset_key in ("qmsum", "longbench_qmsum"):
         return args.qmsum_max_new_tokens
+    if dataset_key == "spec_bench":
+        return args.spec_bench_max_new_tokens
+    if dataset_key == "alpaca":
+        return args.alpaca_max_new_tokens
+    if dataset_key == "gsm8k":
+        return args.gsm8k_max_new_tokens
+    if dataset_key == "mt_bench":
+        return args.mt_bench_max_new_tokens
+    if dataset_key == "qa":
+        return args.qa_max_new_tokens
+    if dataset_key == "humaneval":
+        return args.humaneval_max_new_tokens
+    if dataset_key == "sum":
+        return args.sum_max_new_tokens
     raise ValueError(dataset_key)
 
 
@@ -650,9 +921,9 @@ SPEC_VERIFICATION_TIME = "vllm:spec_decode_verification_time_seconds_total"
 SPEC_REJECT_SAMPLE_TIME = "vllm:spec_decode_reject_sample_time_seconds_total"
 
 
-def chunked(prompts: list[str], batch_size: int):
-    for i in range(0, len(prompts), batch_size):
-        yield prompts[i : i + batch_size]
+def chunked(items: list[Any], batch_size: int):
+    for i in range(0, len(items), batch_size):
+        yield items[i : i + batch_size]
 
 
 def expand_prompts_for_batch(
@@ -674,15 +945,32 @@ def expand_prompts_for_batch(
     return tiled, n
 
 
+def expand_conversations_for_batch(
+    conversations: list[list[str]], batch_size: int
+) -> tuple[list[list[str]], int]:
+    n = len(conversations)
+    if n == 0 or batch_size < 1:
+        return list(conversations), n
+    if n >= 2 * batch_size:
+        return list(conversations), n
+    target = 2 * batch_size
+    tiled = [conversations[i % n] for i in range(target)]
+    return tiled, n
+
+
+def render_chat_prompt(tokenizer: Any, messages: list[dict[str, str]]) -> str:
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
 def apply_chat_template(tokenizer, prompts: list[str]) -> list[str]:
     out: list[str] = []
     for prompt in prompts:
         messages = [{"role": "user", "content": prompt}]
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        text = render_chat_prompt(tokenizer, messages)
         out.append(text)
     return out
 
@@ -949,6 +1237,176 @@ def measure_dataset(
     return result
 
 
+def measure_dataset_multi_turn(
+    llm: Any,
+    tokenizer: Any,
+    conversations: list[list[str]],
+    batch_size: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    profile_time: bool,
+    verbose: bool = False,
+    *,
+    collect_responses: bool = False,
+) -> dict[str, Any]:
+    from vllm import SamplingParams
+
+    conv_batches = [
+        list(batch) for batch in chunked(list(conversations), batch_size)
+    ]
+    sampling_params = SamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_tokens=max_new_tokens,
+    )
+
+    before = snapshot_metrics(llm)
+    total_output_tokens = 0
+    response_records: list[dict[str, Any]] = []
+    num_turns_total = 0
+    global_sample_offset = 0
+
+    maybe_cuda_sync()
+    t0 = time.perf_counter()
+
+    for batch_idx, conv_batch in enumerate(conv_batches, start=1):
+        # Keep per-sample chat history and append model-generated assistant
+        # outputs turn by turn.
+        histories: list[list[dict[str, str]]] = [[] for _ in conv_batch]
+        max_turns = max(len(conv) for conv in conv_batch)
+
+        for turn_idx in range(max_turns):
+            active_indices: list[int] = []
+            prompt_batch: list[str] = []
+
+            for sample_idx, turns in enumerate(conv_batch):
+                if turn_idx >= len(turns):
+                    continue
+                user_turn = turns[turn_idx]
+                histories[sample_idx].append({"role": "user", "content": user_turn})
+                prompt_batch.append(
+                    render_chat_prompt(tokenizer, histories[sample_idx])
+                )
+                active_indices.append(sample_idx)
+
+            if not prompt_batch:
+                continue
+
+            maybe_cuda_sync()
+            outputs = llm.generate(prompt_batch, sampling_params=sampling_params)
+            maybe_cuda_sync()
+
+            for local_i, req_out in enumerate(outputs):
+                sample_idx = active_indices[local_i]
+                comp = req_out.outputs[0]
+                output_tokens = len(comp.token_ids)
+                total_output_tokens += output_tokens
+                num_turns_total += 1
+                histories[sample_idx].append(
+                    {"role": "assistant", "content": comp.text}
+                )
+
+                if collect_responses:
+                    sample_id = global_sample_offset + sample_idx
+                    response_records.append(
+                        {
+                            "prompt_index": sample_id,
+                            "sample_id": sample_id,
+                            "turn_index": turn_idx,
+                            "response": comp.text,
+                            "num_output_tokens": output_tokens,
+                        }
+                    )
+
+            if verbose:
+                print(
+                    f"[measure:multi] batch={batch_idx}/{len(conv_batches)} "
+                    f"turn={turn_idx + 1}/{max_turns} active={len(prompt_batch)}"
+                )
+
+        global_sample_offset += len(conv_batch)
+
+    wall_time_s = time.perf_counter() - t0
+    after = snapshot_metrics(llm)
+
+    num_drafts = metric_delta(after, before, SPEC_NUM_DRAFTS)
+    num_draft_tokens = metric_delta(after, before, SPEC_NUM_DRAFT_TOKENS)
+    num_accepted_tokens = metric_delta(after, before, SPEC_NUM_ACCEPTED)
+    accepted_per_pos = vector_delta(after, before, SPEC_ACCEPTED_PER_POS)
+
+    num_drafts_val = int(num_drafts) if num_drafts is not None else 0
+    num_draft_tokens_val = int(num_draft_tokens) if num_draft_tokens is not None else 0
+    num_accepted_val = int(num_accepted_tokens) if num_accepted_tokens is not None else 0
+
+    avg_acceptance_rate = (
+        num_accepted_val / num_draft_tokens_val if num_draft_tokens_val > 0 else 0.0
+    )
+    avg_acceptance_length = (
+        1.0 + (num_accepted_val / num_drafts_val) if num_drafts_val > 0 else 1.0
+    )
+    acceptance_rate_per_pos = [
+        (v / num_drafts_val) if num_drafts_val > 0 else 0.0
+        for v in accepted_per_pos
+    ]
+
+    result: dict[str, Any] = {
+        "num_prompts": len(conversations),
+        "batch_size": batch_size,
+        "wall_time_s": wall_time_s,
+        "total_output_tokens": total_output_tokens,
+        "num_drafts": num_drafts_val,
+        "num_draft_tokens": num_draft_tokens_val,
+        "num_accepted_tokens": num_accepted_val,
+        "avg_acceptance_rate": avg_acceptance_rate,
+        "avg_acceptance_length": avg_acceptance_length,
+        "acceptance_rate_per_pos": acceptance_rate_per_pos,
+        "num_turns_total": num_turns_total,
+        "avg_turns_per_sample": (
+            (num_turns_total / len(conversations)) if conversations else 0.0
+        ),
+    }
+
+    if profile_time:
+        draft_time_s = metric_delta(after, before, SPEC_DRAFT_TIME)
+        verification_time_s = metric_delta(after, before, SPEC_VERIFICATION_TIME)
+        draft_time_s_val = float(draft_time_s) if draft_time_s is not None else None
+        verification_time_s_val = (
+            float(verification_time_s) if verification_time_s is not None else None
+        )
+        result["draft_time_s"] = draft_time_s_val
+        result["verification_time_s"] = verification_time_s_val
+        if num_drafts_val > 0:
+            result["avg_draft_time_s"] = (
+                draft_time_s_val / num_drafts_val if draft_time_s_val is not None else None
+            )
+            result["avg_verification_time_s"] = (
+                verification_time_s_val / num_drafts_val
+                if verification_time_s_val is not None
+                else None
+            )
+        else:
+            result["avg_draft_time_s"] = None
+            result["avg_verification_time_s"] = None
+
+        reject_sample_time = metric_delta(after, before, SPEC_REJECT_SAMPLE_TIME)
+        result["reject_sample_time_s"] = (
+            float(reject_sample_time) if reject_sample_time is not None else None
+        )
+        if num_drafts_val > 0 and result["reject_sample_time_s"] is not None:
+            result["avg_reject_sample_time_s"] = (
+                result["reject_sample_time_s"] / num_drafts_val
+            )
+        else:
+            result["avg_reject_sample_time_s"] = None
+
+    if collect_responses:
+        result["response_records"] = response_records
+    return result
+
+
 def free_llm(llm: Any) -> None:
     try:
         del llm
@@ -1102,7 +1560,7 @@ if __name__ == "__main__":
         raise ValueError(f"Missing --tp-map for: {missing_tp}")
 
     os.makedirs(args.results_root, exist_ok=True)
-    dataset_prompts = {key: get_dataset_prompts(key, args) for key in dataset_keys}
+    dataset_requests = {key: get_dataset_requests(key, args) for key in dataset_keys}
 
     from vllm import LLM
 
@@ -1151,6 +1609,10 @@ if __name__ == "__main__":
                 "model": args.draft_model,
                 "intermediate_model": args.intermediate_model,
                 "num_speculative_tokens": args.num_spec_tokens,
+                "pivot_topk_selection": args.topk_selection,
+                "pivot_expansion_pct": args.expansion_pct,
+                "pivot_spechive": args.spechive,
+                "pivot_spechive_num_rounds": args.round,
                 "max_model_len": args.max_model_len,
                 "enforce_eager": args.enforce_eager,
             }
@@ -1212,55 +1674,108 @@ if __name__ == "__main__":
         pair_response_records: list[dict[str, Any]] = []
 
         for dataset_key in dataset_keys:
-            prompts = dataset_prompts[dataset_key]
+            request_cfg = dataset_requests[dataset_key]
+            dataset_mode = str(request_cfg.get("mode", "single_turn"))
             max_new_tokens = get_dataset_max_new_tokens(dataset_key, args)
 
             for batch_size in batch_sizes:
-                prompts_run, n_dataset = expand_prompts_for_batch(prompts, batch_size)
-                if len(prompts_run) > n_dataset:
-                    print(
-                        f"[dataset] tiled {n_dataset} -> {len(prompts_run)} prompts "
-                        f"(batch_size={batch_size}, need >= 2*batch for small sets)"
+                if dataset_mode == "multi_turn":
+                    conversations = list(request_cfg["conversations"])
+                    conversations_run, n_dataset = expand_conversations_for_batch(
+                        conversations, batch_size
                     )
-                print("-" * 80)
-                print(
-                    f"[run] dataset={dataset_key} target={target_model} "
-                    f"batch_size={batch_size} num_prompts_dataset={n_dataset} "
-                    f"num_prompts_eval={len(prompts_run)} max_new_tokens={max_new_tokens}"
-                )
+                    if len(conversations_run) > n_dataset:
+                        print(
+                            f"[dataset] tiled {n_dataset} -> {len(conversations_run)} "
+                            f"conversations (batch_size={batch_size}, need >= 2*batch)"
+                        )
+                    print("-" * 80)
+                    print(
+                        f"[run] dataset={dataset_key} mode=multi_turn "
+                        f"target={target_model} batch_size={batch_size} "
+                        f"num_samples_dataset={n_dataset} "
+                        f"num_samples_eval={len(conversations_run)} "
+                        f"max_new_tokens={max_new_tokens}"
+                    )
+                    warmup_prompts = [conv[0] for conv in conversations_run if conv]
+                    run_warmup(
+                        llm=llm,
+                        tokenizer=tokenizer,
+                        prompts=warmup_prompts,
+                        batch_size=batch_size,
+                        warmup_iters=args.warmup_iters,
+                        warmup_max_tokens=args.warmup_max_tokens,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        top_k=args.top_k,
+                        method=args.method,
+                        num_spec_tokens=args.num_spec_tokens,
+                        profile_time=args.profile_time,
+                    )
+                    metrics = measure_dataset_multi_turn(
+                        llm=llm,
+                        tokenizer=tokenizer,
+                        conversations=conversations_run,
+                        batch_size=batch_size,
+                        max_new_tokens=max_new_tokens,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        top_k=args.top_k,
+                        profile_time=args.profile_time,
+                        verbose=args.verbose,
+                        collect_responses=bool(
+                            responses_jsonl_path and not args.no_responses
+                        ),
+                    )
+                else:
+                    prompts = list(request_cfg["prompts"])
+                    prompts_run, n_dataset = expand_prompts_for_batch(prompts, batch_size)
+                    if len(prompts_run) > n_dataset:
+                        print(
+                            f"[dataset] tiled {n_dataset} -> {len(prompts_run)} prompts "
+                            f"(batch_size={batch_size}, need >= 2*batch for small sets)"
+                        )
+                    print("-" * 80)
+                    print(
+                        f"[run] dataset={dataset_key} mode=single_turn target={target_model} "
+                        f"batch_size={batch_size} num_prompts_dataset={n_dataset} "
+                        f"num_prompts_eval={len(prompts_run)} max_new_tokens={max_new_tokens}"
+                    )
+                    run_warmup(
+                        llm=llm,
+                        tokenizer=tokenizer,
+                        prompts=prompts_run,
+                        batch_size=batch_size,
+                        warmup_iters=args.warmup_iters,
+                        warmup_max_tokens=args.warmup_max_tokens,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        top_k=args.top_k,
+                        method=args.method,
+                        num_spec_tokens=args.num_spec_tokens,
+                        profile_time=args.profile_time,
+                    )
 
-                run_warmup(
-                    llm=llm,
-                    tokenizer=tokenizer,
-                    prompts=prompts_run,
-                    batch_size=batch_size,
-                    warmup_iters=args.warmup_iters,
-                    warmup_max_tokens=args.warmup_max_tokens,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    top_k=args.top_k,
-                    method=args.method,
-                    num_spec_tokens=args.num_spec_tokens,
-                    profile_time=args.profile_time,
-                )
+                    metrics = measure_dataset(
+                        llm=llm,
+                        tokenizer=tokenizer,
+                        prompts=prompts_run,
+                        batch_size=batch_size,
+                        max_new_tokens=max_new_tokens,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        top_k=args.top_k,
+                        profile_time=args.profile_time,
+                        verbose=args.verbose,
+                        draft_model=args.draft_model,
+                        target_model=target_model,
+                        dataset=dataset_key,
+                        collect_responses=bool(
+                            responses_jsonl_path and not args.no_responses
+                        ),
+                        num_prompts_source=n_dataset,
+                    )
 
-                metrics = measure_dataset(
-                    llm=llm,
-                    tokenizer=tokenizer,
-                    prompts=prompts_run,
-                    batch_size=batch_size,
-                    max_new_tokens=max_new_tokens,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    top_k=args.top_k,
-                    profile_time=args.profile_time,
-                    verbose=args.verbose,
-                    draft_model=args.draft_model,
-                    target_model=target_model,
-                    dataset=dataset_key,
-                    collect_responses=bool(responses_jsonl_path and not args.no_responses),
-                    num_prompts_source=n_dataset,
-                )
                 if responses_jsonl_path and metrics.get("response_records"):
                     pair_response_records.extend(metrics["response_records"])
 
@@ -1269,10 +1784,13 @@ if __name__ == "__main__":
                     "target_model": target_model,
                     "tensor_parallel_size": tp,
                     "dataset": dataset_key,
+                    "mode": dataset_mode,
                     "batch_size": batch_size,
                     "num_speculative_tokens": args.num_spec_tokens,
                     "num_prompts_dataset": n_dataset,
                     "num_prompts": metrics["num_prompts"],
+                    "num_turns_total": metrics.get("num_turns_total", metrics["num_prompts"]),
+                    "avg_turns_per_sample": metrics.get("avg_turns_per_sample", 1.0),
                     "wall_time_s": metrics["wall_time_s"],
                     "total_output_tokens": metrics["total_output_tokens"],
                     "num_drafts": metrics["num_drafts"],

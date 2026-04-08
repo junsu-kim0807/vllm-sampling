@@ -11,10 +11,101 @@ import torch
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
 from vllm.v1.sample.sampler import Sampler, _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.spec_decode.spec_stage_runtime import HybridProposalBundle
+from vllm.v1.spec_decode.spec_stage_runtime import (
+    HybridProposalBundle,
+    PivotExpansionPlan,
+)
+
+
+def get_accepted_draft_lens_from_sampled_tokens(
+    sampled_token_ids: torch.Tensor,
+    *,
+    placeholder_token_id: int,
+) -> list[int]:
+    """Count non-placeholder entries per row (emitted width; may include bonus slot)."""
+    return [
+        int((row != placeholder_token_id).sum().item())
+        for row in sampled_token_ids
+    ]
+
+
+def get_target_verification_accepted_draft_prefix_lens(
+    sampled_token_ids: torch.Tensor,
+    num_draft_tokens: list[int],
+    *,
+    placeholder_token_id: int,
+) -> list[int]:
+    """Accepted draft-prefix length per row, ignoring bonus/recovery past num_draft."""
+    out: list[int] = []
+    for r, n_draft in enumerate(num_draft_tokens):
+        row = sampled_token_ids[r]
+        cnt = 0
+        for j in range(min(int(n_draft), int(row.shape[0]))):
+            if int(row[j].item()) == placeholder_token_id:
+                break
+            cnt += 1
+        out.append(cnt)
+    return out
+
+
+def collapse_pivot_expanded_sampled_to_origin(
+    sampled_token_ids: torch.Tensor,
+    expansion_plan: PivotExpansionPlan,
+    *,
+    num_draft_tokens: list[int] | None = None,
+) -> torch.Tensor:
+    """Map expanded verification rows (B') back to one row per origin request (B)."""
+    if sampled_token_ids.shape[0] < expansion_plan.expanded_batch_size:
+        return sampled_token_ids
+    if not expansion_plan.expanded_to_origin:
+        return sampled_token_ids
+    if (
+        num_draft_tokens is not None
+        and len(num_draft_tokens) == expansion_plan.expanded_batch_size
+    ):
+        accepted_lens = get_target_verification_accepted_draft_prefix_lens(
+            sampled_token_ids,
+            num_draft_tokens,
+            placeholder_token_id=PLACEHOLDER_TOKEN_ID,
+        )
+    else:
+        accepted_lens = get_accepted_draft_lens_from_sampled_tokens(
+            sampled_token_ids,
+            placeholder_token_id=PLACEHOLDER_TOKEN_ID,
+        )
+    b_origin = max(expansion_plan.expanded_to_origin) + 1
+    origin_to_family = {fam.origin_row: fam for fam in expansion_plan.families}
+    selected_rows: list[int] = []
+    for o in range(b_origin):
+        fam = origin_to_family.get(o)
+        if fam is None:
+            j = next(
+                idx
+                for idx, orig in enumerate(expansion_plan.expanded_to_origin)
+                if orig == o
+            )
+        else:
+            best_row = fam.expanded_rows[0]
+            best_key = (-1, float("-inf"), 10**9)
+            for local_idx, row_idx in enumerate(fam.expanded_rows):
+                if row_idx >= len(accepted_lens):
+                    continue
+                key = (
+                    accepted_lens[row_idx],
+                    fam.first_token_probs[local_idx],
+                    -fam.candidate_ranks[local_idx],
+                )
+                if key > best_key:
+                    best_key = key
+                    best_row = row_idx
+            j = best_row
+        selected_rows.append(j)
+    device = sampled_token_ids.device
+    idx = torch.tensor(selected_rows, device=device, dtype=torch.long)
+    return sampled_token_ids.index_select(0, idx)
 
 
 @dataclass(frozen=True)
@@ -247,6 +338,14 @@ def sanitize_hybrid_bundle_for_metadata(
         source_stage = sanitized.source_stage
         if source_stage.ndim != 1 or source_stage.shape[0] != expected_total:
             sanitized = replace(sanitized, source_stage=None)
+    if sanitized.expansion_plan is not None:
+        plan = sanitized.expansion_plan
+        if (
+            plan.expanded_batch_size < 0
+            or len(plan.expanded_to_origin) != plan.expanded_batch_size
+            or len(plan.families) == 0
+        ):
+            sanitized = replace(sanitized, expansion_plan=None)
     if sanitized.max_spec_len != runner_num_spec_tokens:
         # Keep bundle usable; width mismatch is informational only.
         return sanitized, (

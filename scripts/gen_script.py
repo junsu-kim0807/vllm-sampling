@@ -43,6 +43,9 @@ if USER_NAME == "junsuk87":
 elif USER_NAME == "jhwoo36":
     REPO_DIR = "/home/jhwoo36/scratch/vllm-sampling"
     VENV_DIR = "/home/jhwoo36/scratch/venvs/vllm"
+else:
+    REPO_DIR = str(REPO_ROOT)
+    VENV_DIR = str(REPO_ROOT / ".venv")
 
 @dataclass(frozen=True)
 class PairConfig:
@@ -414,6 +417,12 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(name="codeelo", max_new_tokens=1024),
     DatasetConfig(name="gov_report", max_new_tokens=512),
     DatasetConfig(name="qmsum", max_new_tokens=512),
+    DatasetConfig(name="alpaca", max_new_tokens=256),
+    DatasetConfig(name="gsm8k", max_new_tokens=256),
+    DatasetConfig(name="mt_bench", max_new_tokens=256),
+    DatasetConfig(name="qa", max_new_tokens=256),
+    DatasetConfig(name="humaneval", max_new_tokens=512),
+    DatasetConfig(name="sum", max_new_tokens=512),
 ]
 
 DEFAULT_TEST_PAIR_IDS = frozenset({"llama32_1b_to_llama31_8b"})
@@ -486,6 +495,14 @@ def time_limit_for_dataset(
         if size_b is not None and size_b >= 30.0:
             return "08:00:00"
         return "04:00:00"
+
+    if dataset.name in ("alpaca", "gsm8k", "mt_bench", "qa", "humaneval", "sum"):
+        size_b = infer_target_size_b(pair.target_model)
+        if size_b is not None and size_b >= 60.0:
+            return "08:00:00"
+        if size_b is not None and size_b >= 30.0:
+            return "05:00:00"
+        return "03:00:00"
 
     if dataset.name == "codeelo":
         size_b = infer_target_size_b(pair.target_model)
@@ -565,8 +582,15 @@ def build_python_command(
     adaptive_spechive_intermediate_model: str | None = None,
     adaptive_spechive_mode: str = "hierarchical_verification",
     adaptive_spechive_rounds: int = 1,
+    pivot_topk_selection: int = 5,
+    pivot_expansion_pct: float = 0.2,
+    pivot_spechive: bool = False,
     tetris_extra_proposals: int = 0,
     tetris_turn_on_batch_size: int | None = None,
+    repo_dir: str | None = None,
+    spec_bench_jsonl: str | None = None,
+    spec_bench_category: str | None = None,
+    mt_bench_dataset_path: str | None = None,
     results_subdir: Path | None = None,
 ) -> str:
     tag = batch_tag(batch_sizes)
@@ -580,6 +604,7 @@ def build_python_command(
         f"--target-models {shquote(pair.target_model)}",
         f"--tp-map {shquote(f'{pair.target_model}={pair.tp_size}')}",
         f"--datasets {dataset.name}",
+        f"--repo-dir {shquote(repo_dir if repo_dir is not None else str(REPO_ROOT))}",
         f"--batch-sizes {batch_sizes}",
         f"--num-spec-tokens {num_spec_tokens}",
         f"--gpu-memory-utilization {gpu_mem_util:.2f}",
@@ -623,32 +648,60 @@ def build_python_command(
             parts.append(
                 f"--round {adaptive_spechive_rounds}"
             )
+        else:
+            parts.append(f"--topk_selection {pivot_topk_selection}")
+            parts.append(f"--expansion_pct {pivot_expansion_pct}")
+            parts.append(f"--round {adaptive_spechive_rounds}")
+            if pivot_spechive:
+                parts.append("--spechive")
     elif method == "tetris":
         if tetris_extra_proposals:
             parts.append(f"--tetris-extra-proposals {tetris_extra_proposals}")
         if tetris_turn_on_batch_size is not None:
             parts.append(f"--tetris-turn-on-batch-size {tetris_turn_on_batch_size}")
 
-    if dataset.name == "aime25":
-        parts.append(f"--aime-max-new-tokens {dataset.max_new_tokens}")
-        parts.append("--codeelo-max-new-tokens 1024")
-        parts.append("--gov-report-max-new-tokens 512")
-        parts.append("--qmsum-max-new-tokens 512")
-    elif dataset.name == "codeelo":
-        parts.append("--aime-max-new-tokens 256")
-        parts.append(f"--codeelo-max-new-tokens {dataset.max_new_tokens}")
-        parts.append("--gov-report-max-new-tokens 512")
-        parts.append("--qmsum-max-new-tokens 512")
-    elif dataset.name == "gov_report":
-        parts.append("--aime-max-new-tokens 256")
-        parts.append("--codeelo-max-new-tokens 1024")
-        parts.append(f"--gov-report-max-new-tokens {dataset.max_new_tokens}")
-        parts.append("--qmsum-max-new-tokens 512")
-    else:
-        parts.append("--aime-max-new-tokens 256")
-        parts.append("--codeelo-max-new-tokens 1024")
-        parts.append("--gov-report-max-new-tokens 512")
-        parts.append(f"--qmsum-max-new-tokens {dataset.max_new_tokens}")
+    max_tokens_by_dataset = {
+        "aime25": 256,
+        "codeelo": 1024,
+        "gov_report": 512,
+        "qmsum": 512,
+        "spec_bench": 256,
+        "alpaca": 256,
+        "gsm8k": 256,
+        "mt_bench": 256,
+        "qa": 256,
+        "humaneval": 512,
+        "sum": 512,
+    }
+    if dataset.name not in max_tokens_by_dataset:
+        raise SystemExit(f"Unsupported dataset in generator: {dataset.name}")
+    max_tokens_by_dataset[dataset.name] = dataset.max_new_tokens
+    parts.extend(
+        [
+            f"--aime-max-new-tokens {max_tokens_by_dataset['aime25']}",
+            f"--codeelo-max-new-tokens {max_tokens_by_dataset['codeelo']}",
+            f"--gov-report-max-new-tokens {max_tokens_by_dataset['gov_report']}",
+            f"--qmsum-max-new-tokens {max_tokens_by_dataset['qmsum']}",
+            f"--spec-bench-max-new-tokens {max_tokens_by_dataset['spec_bench']}",
+            f"--alpaca-max-new-tokens {max_tokens_by_dataset['alpaca']}",
+            f"--gsm8k-max-new-tokens {max_tokens_by_dataset['gsm8k']}",
+            f"--mt-bench-max-new-tokens {max_tokens_by_dataset['mt_bench']}",
+            f"--qa-max-new-tokens {max_tokens_by_dataset['qa']}",
+            f"--humaneval-max-new-tokens {max_tokens_by_dataset['humaneval']}",
+            f"--sum-max-new-tokens {max_tokens_by_dataset['sum']}",
+        ]
+    )
+
+    if dataset.name == "spec_bench":
+        if not spec_bench_jsonl:
+            raise SystemExit(
+                "--datasets spec_bench requires --spec-bench-jsonl in generator."
+            )
+        parts.append(f"--spec-bench-jsonl {shquote(spec_bench_jsonl)}")
+        if spec_bench_category:
+            parts.append(f"--spec-bench-category {shquote(spec_bench_category)}")
+    if mt_bench_dataset_path:
+        parts.append(f"--mt-bench-dataset-path {shquote(mt_bench_dataset_path)}")
 
     if test:
         ts = test_samples
@@ -656,6 +709,13 @@ def build_python_command(
         parts.append(f"--max-samples-codeelo {ts}")
         parts.append(f"--max-samples-gov-report {ts}")
         parts.append(f"--max-samples-qmsum {ts}")
+        parts.append(f"--max-samples-spec-bench {ts}")
+        parts.append(f"--max-samples-alpaca {ts}")
+        parts.append(f"--max-samples-gsm8k {ts}")
+        parts.append(f"--max-samples-mt-bench {ts}")
+        parts.append(f"--max-samples-qa {ts}")
+        parts.append(f"--max-samples-humaneval {ts}")
+        parts.append(f"--max-samples-sum {ts}")
 
     if verbose:
         parts.append("--verbose")
@@ -689,8 +749,15 @@ def render_job_script(
     adaptive_spechive_intermediate_model: str | None = None,
     adaptive_spechive_mode: str = "hierarchical_verification",
     adaptive_spechive_rounds: int = 1,
+    pivot_topk_selection: int = 5,
+    pivot_expansion_pct: float = 0.2,
+    pivot_spechive: bool = False,
     tetris_extra_proposals: int = 0,
     tetris_turn_on_batch_size: int | None = None,
+    repo_dir: str | None = None,
+    spec_bench_jsonl: str | None = None,
+    spec_bench_category: str | None = None,
+    mt_bench_dataset_path: str | None = None,
     time_limit_override: str | None = None,
     jobs_subdir: Path | None = None,
     results_subdir: Path | None = None,
@@ -754,8 +821,15 @@ def render_job_script(
         adaptive_spechive_intermediate_model=adaptive_spechive_intermediate_model,
         adaptive_spechive_mode=adaptive_spechive_mode,
         adaptive_spechive_rounds=adaptive_spechive_rounds,
+        pivot_topk_selection=pivot_topk_selection,
+        pivot_expansion_pct=pivot_expansion_pct,
+        pivot_spechive=pivot_spechive,
         tetris_extra_proposals=tetris_extra_proposals,
         tetris_turn_on_batch_size=tetris_turn_on_batch_size,
+        repo_dir=repo_dir,
+        spec_bench_jsonl=spec_bench_jsonl,
+        spec_bench_category=spec_bench_category,
+        mt_bench_dataset_path=mt_bench_dataset_path,
         results_subdir=results_subdir,
     )
 
@@ -870,6 +944,42 @@ def add_submit_script(submit_path: Path, scripts: list[Path]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--datasets", nargs="*", default=[], help="Subset of dataset names")
+    parser.add_argument(
+        "--repo-dir",
+        type=str,
+        default=str(REPO_ROOT),
+        help=(
+            "Repository root passed to run_spec_decode_metrics.py for loading "
+            "data/<dataset>/question.jsonl."
+        ),
+    )
+    parser.add_argument(
+        "--spec-bench-jsonl",
+        type=str,
+        default=None,
+        help=(
+            "Path to Spec-Bench question.jsonl. Required when --datasets "
+            "includes spec_bench."
+        ),
+    )
+    parser.add_argument(
+        "--spec-bench-category",
+        type=str,
+        default=None,
+        help=(
+            "Optional Spec-Bench category filter (e.g. alpaca, mt_bench). "
+            "Passed through to run_spec_decode_metrics.py."
+        ),
+    )
+    parser.add_argument(
+        "--mt-bench-dataset-path",
+        type=str,
+        default="philschmid/mt-bench",
+        help=(
+            "Hugging Face dataset path or local JSONL path for MT-Bench. "
+            "Passed through to run_spec_decode_metrics.py."
+        ),
+    )
     parser.add_argument("--pairs", nargs="*", default=[], help="Subset of pair_id values")
     parser.add_argument("--batch-sizes", default="1")
 
@@ -937,6 +1047,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of adaptive_spechive hierarchical verification rounds.",
+    )
+    parser.add_argument(
+        "--topk-selection",
+        type=int,
+        default=5,
+        choices=[2, 5],
+        help="When --spec-method=pivot: first-token top-k expansion width.",
+    )
+    parser.add_argument(
+        "--expansion-pct",
+        type=float,
+        default=0.2,
+        help="When --spec-method=pivot: fraction of low-confidence requests to expand.",
+    )
+    parser.add_argument(
+        "--pivot-spechive",
+        action="store_true",
+        help="When --spec-method=pivot: enable staged D=>I rounds before D=>T verification.",
     )
     parser.add_argument(
         "--spec-method",
@@ -1364,8 +1492,15 @@ def main() -> None:
                     adaptive_spechive_intermediate_model=im_model,
                     adaptive_spechive_mode=args.adaptive_spechive_mode,
                     adaptive_spechive_rounds=rounds,
+                    pivot_topk_selection=args.topk_selection,
+                    pivot_expansion_pct=args.expansion_pct,
+                    pivot_spechive=args.pivot_spechive,
                     tetris_extra_proposals=tetris_extra_proposals,
                     tetris_turn_on_batch_size=tetris_turn_on_batch_size,
+                    repo_dir=args.repo_dir,
+                    spec_bench_jsonl=args.spec_bench_jsonl,
+                    spec_bench_category=args.spec_bench_category,
+                    mt_bench_dataset_path=args.mt_bench_dataset_path,
                     time_limit_override=time_limit_override,
                     jobs_subdir=batch_dir,
                     results_subdir=result_subdir,
@@ -1510,8 +1645,15 @@ def main() -> None:
                             adaptive_spechive_intermediate_model=im_model,
                             adaptive_spechive_mode=args.adaptive_spechive_mode,
                             adaptive_spechive_rounds=rounds,
+                            pivot_topk_selection=args.topk_selection,
+                            pivot_expansion_pct=args.expansion_pct,
+                            pivot_spechive=args.pivot_spechive,
                             tetris_extra_proposals=args.tetris_extra_proposals,
                             tetris_turn_on_batch_size=args.tetris_turn_on_batch_size,
+                            repo_dir=args.repo_dir,
+                            spec_bench_jsonl=args.spec_bench_jsonl,
+                            spec_bench_category=args.spec_bench_category,
+                            mt_bench_dataset_path=args.mt_bench_dataset_path,
                             jobs_subdir=pair_subdir,
                             results_subdir=results_subdir,
                             job_name_suffix=suffix,
@@ -1583,8 +1725,15 @@ def main() -> None:
                             adaptive_spechive_intermediate_model=im_model,
                             adaptive_spechive_mode=args.adaptive_spechive_mode,
                             adaptive_spechive_rounds=rounds,
+                            pivot_topk_selection=args.topk_selection,
+                            pivot_expansion_pct=args.expansion_pct,
+                            pivot_spechive=args.pivot_spechive,
                             tetris_extra_proposals=args.tetris_extra_proposals,
                             tetris_turn_on_batch_size=args.tetris_turn_on_batch_size,
+                            repo_dir=args.repo_dir,
+                            spec_bench_jsonl=args.spec_bench_jsonl,
+                            spec_bench_category=args.spec_bench_category,
+                            mt_bench_dataset_path=args.mt_bench_dataset_path,
                             jobs_subdir=pair_subdir,
                             results_subdir=results_subdir,
                             job_name_suffix=suffix,
@@ -1670,8 +1819,15 @@ def main() -> None:
                     adaptive_spechive_intermediate_model=im_model,
                     adaptive_spechive_mode=args.adaptive_spechive_mode,
                     adaptive_spechive_rounds=rounds,
+                    pivot_topk_selection=args.topk_selection,
+                    pivot_expansion_pct=args.expansion_pct,
+                    pivot_spechive=args.pivot_spechive,
                     tetris_extra_proposals=args.tetris_extra_proposals,
                     tetris_turn_on_batch_size=args.tetris_turn_on_batch_size,
+                    repo_dir=args.repo_dir,
+                    spec_bench_jsonl=args.spec_bench_jsonl,
+                    spec_bench_category=args.spec_bench_category,
+                    mt_bench_dataset_path=args.mt_bench_dataset_path,
                     jobs_subdir=pair_subdir,
                     results_subdir=results_subdir,
                     job_name_suffix=suffix,

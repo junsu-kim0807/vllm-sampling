@@ -229,6 +229,14 @@ class SpeculativeConfig:
     """Must be True when adaptive_spechive_mode is ``inter_verification``."""
     adaptive_spechive_enable_hierarchical_verification: bool = True
     """Must be True when adaptive_spechive_mode is ``hierarchical_verification``."""
+    pivot_topk_selection: int = Field(default=5)
+    """Pivot first-token expansion width; supported values are 2 or 5."""
+    pivot_expansion_pct: float = Field(default=0.2, gt=0.0, le=1.0)
+    """Fraction of requests expanded with top-k first-token proposals."""
+    pivot_spechive: bool = False
+    """Enable pivot staged D=>I rounds followed by authoritative D=>T verification."""
+    pivot_spechive_num_rounds: int = Field(default=1, ge=1)
+    """Number of intermediate D=>I rounds per outer pivot_spechive iteration."""
 
     # MagicDec: optional draft-only attention metadata rewrite (see
     # vllm/v1/attention/magicdec_streaming_attention.py).
@@ -271,6 +279,10 @@ class SpeculativeConfig:
             factors.append(self.adaptive_spechive_enable_hierarchical_verification)
         elif self.method == "pivot":
             factors.append(self.intermediate_model)
+            factors.append(self.pivot_topk_selection)
+            factors.append(self.pivot_expansion_pct)
+            factors.append(self.pivot_spechive)
+            factors.append(self.pivot_spechive_num_rounds)
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
@@ -971,6 +983,22 @@ class SpeculativeConfig:
                 )
         if self.method == "pivot" and self.parallel_drafting:
             raise ValueError("parallel_drafting is not supported with pivot.")
+        if self.method == "pivot":
+            if self.pivot_topk_selection not in (2, 5):
+                raise ValueError(
+                    "pivot_topk_selection must be one of {2, 5}."
+                )
+            if self.pivot_spechive:
+                chunk_len = self.num_speculative_tokens
+                rounds = self.pivot_spechive_num_rounds
+                outer_upper = chunk_len + rounds * (chunk_len + 1)
+                if outer_upper > _ADAPTIVE_CASCADE_MAX_SPEC_LEN:
+                    raise ValueError(
+                        f"pivot_spechive: implied max outer verify length "
+                        f"{outer_upper} = chunk_len + rounds * (chunk_len + 1) "
+                        f"exceeds {_ADAPTIVE_CASCADE_MAX_SPEC_LEN} (sampler limit). "
+                        "Reduce num_speculative_tokens or pivot_spechive_num_rounds."
+                    )
 
         aux_hidden_states_supported = [
             "llama",
@@ -1086,6 +1114,10 @@ class SpeculativeConfig:
             chunk_len = self.num_speculative_tokens
             rounds = self.adaptive_spechive_num_rounds
             return chunk_len + rounds * (chunk_len + 1)
+        if self.method == "pivot" and self.pivot_spechive:
+            chunk_len = self.num_speculative_tokens
+            rounds = self.pivot_spechive_num_rounds
+            return chunk_len + rounds * (chunk_len + 1)
         return self.num_speculative_tokens
 
     def use_eagle(self) -> bool:
@@ -1112,5 +1144,13 @@ class SpeculativeConfig:
             return f"SpeculativeConfig({method=}, {model=}, {im=}, {acm=}, {num_spec_tokens=}, {rounds=})"
         if method == "pivot":
             im = self.intermediate_model
-            return f"SpeculativeConfig({method=}, {model=}, {im=}, {num_spec_tokens=})"
+            topk = self.pivot_topk_selection
+            pct = self.pivot_expansion_pct
+            psp = self.pivot_spechive
+            rounds = self.pivot_spechive_num_rounds
+            return (
+                "SpeculativeConfig("
+                f"{method=}, {model=}, {im=}, {num_spec_tokens=}, "
+                f"{topk=}, {pct=}, {psp=}, {rounds=})"
+            )
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"

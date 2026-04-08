@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
@@ -15,6 +15,26 @@ SpecStageMode = Literal[
     "hierarchical_verification",
     "pivot",
 ]
+
+
+@dataclass
+class PivotExpansionFamily:
+    """Expanded top-k candidate family for one origin request row."""
+
+    origin_row: int
+    expanded_rows: list[int]
+    candidate_ranks: list[int]
+    first_token_ids: list[int]
+    first_token_probs: list[float]
+
+
+@dataclass
+class PivotExpansionPlan:
+    """Runtime mapping between expanded pivot rows and origin rows."""
+
+    expanded_to_origin: list[int]
+    families: list[PivotExpansionFamily]
+    expanded_batch_size: int
 
 
 @dataclass
@@ -33,6 +53,8 @@ class HybridProposalBundle:
     mode: SpecStageMode
     # Optional stage tag per token: 0 = I-equivalent prefix, 1 = D tail.
     source_stage: torch.Tensor | None = None
+    # Optional pivot top-k expansion mapping.
+    expansion_plan: PivotExpansionPlan | None = None
 
 
 @dataclass
@@ -85,6 +107,8 @@ class DitRoundProposal:
     tokens: torch.Tensor
     # [B, L, vocab] or None
     probs: torch.Tensor | None = None
+    # Optional expanded-row mapping.
+    expansion_plan: PivotExpansionPlan | None = None
 
 
 @dataclass
@@ -129,3 +153,122 @@ class DitRoundState:
     prefix_rows: list[list[int]]
     prefix_prob_rows: list[list[torch.Tensor]]
     prefix_source_rows: list[list[int]]
+
+
+def _split_flat_tokens_by_lengths(
+    flat: torch.Tensor, lengths: list[int]
+) -> list[torch.Tensor]:
+    rows: list[torch.Tensor] = []
+    s = 0
+    for l in lengths:
+        li = int(l)
+        if li > 0:
+            rows.append(flat[s : s + li].clone())
+            s += li
+        else:
+            rows.append(flat.new_empty((0,), dtype=flat.dtype, device=flat.device))
+    return rows
+
+
+def _split_probs_by_lengths(
+    flat: torch.Tensor, lengths: list[int]
+) -> list[torch.Tensor]:
+    rows: list[torch.Tensor] = []
+    s = 0
+    for l in lengths:
+        li = int(l)
+        if li > 0:
+            rows.append(flat[s : s + li].clone())
+            s += li
+        else:
+            rows.append(
+                flat.new_empty((0, flat.shape[-1]), dtype=flat.dtype, device=flat.device)
+            )
+    return rows
+
+
+def expand_hybrid_bundle_for_pivot_expansion(
+    bundle: HybridProposalBundle,
+) -> HybridProposalBundle:
+    """Duplicate per-origin draft rows into expanded_batch_size rows (pivot top-k).
+
+    Each expanded row reuses the origin draft tail; the first pivot token is
+    taken from :class:`PivotExpansionFamily` when applicable.
+    """
+    plan = bundle.expansion_plan
+    if plan is None or plan.expanded_batch_size <= 0:
+        return bundle
+    if len(plan.expanded_to_origin) != plan.expanded_batch_size:
+        return bundle
+    origin_b = len(bundle.num_draft_tokens)
+    if origin_b == plan.expanded_batch_size:
+        return bundle
+    if origin_b == 0 or origin_b > plan.expanded_batch_size:
+        return bundle
+
+    tok_rows = _split_flat_tokens_by_lengths(
+        bundle.draft_token_ids, bundle.num_draft_tokens
+    )
+    prob_rows: list[torch.Tensor] | None = None
+    if bundle.draft_probs is not None and bundle.draft_probs.shape[0] == int(
+        bundle.draft_token_ids.shape[0]
+    ):
+        prob_rows = _split_probs_by_lengths(bundle.draft_probs, bundle.num_draft_tokens)
+    src_rows: list[torch.Tensor] | None = None
+    if bundle.source_stage is not None and bundle.source_stage.shape[0] == int(
+        bundle.draft_token_ids.shape[0]
+    ):
+        src_rows = _split_flat_tokens_by_lengths(
+            bundle.source_stage, bundle.num_draft_tokens
+        )
+
+    new_lengths: list[int] = []
+    new_tok: list[torch.Tensor] = []
+    new_prob: list[torch.Tensor] = []
+    new_src: list[torch.Tensor] = []
+
+    for j, o in enumerate(plan.expanded_to_origin):
+        if o < 0 or o >= origin_b:
+            return bundle
+        row_t = tok_rows[o].clone()
+        for fam in plan.families:
+            if j in fam.expanded_rows:
+                li = fam.expanded_rows.index(j)
+                row_t[0] = int(fam.first_token_ids[li])
+                break
+        new_lengths.append(int(row_t.shape[0]))
+        new_tok.append(row_t)
+        if prob_rows is not None:
+            pr = prob_rows[o].clone()
+            for fam in plan.families:
+                if j in fam.expanded_rows:
+                    li = fam.expanded_rows.index(j)
+                    tid = int(fam.first_token_ids[li])
+                    fp = float(fam.first_token_probs[li])
+                    if pr.shape[0] > 0:
+                        pr[0].zero_()
+                        if 0 <= tid < pr.shape[-1]:
+                            pr[0, tid] = fp
+                    break
+            new_prob.append(pr)
+        if src_rows is not None:
+            new_src.append(src_rows[o].clone())
+
+    draft_token_ids = torch.cat(new_tok, dim=0).to(torch.int32)
+    device = draft_token_ids.device
+    cu = torch.cumsum(
+        torch.tensor(new_lengths, dtype=torch.int32, device=device), dim=0
+    )
+    draft_probs = torch.cat(new_prob, dim=0) if new_prob else None
+    source_stage = torch.cat(new_src, dim=0).to(torch.int32) if new_src else None
+    max_spec_len = max(new_lengths) if new_lengths else bundle.max_spec_len
+
+    return replace(
+        bundle,
+        draft_token_ids=draft_token_ids,
+        draft_probs=draft_probs,
+        num_draft_tokens=new_lengths,
+        cu_num_draft_tokens=cu,
+        max_spec_len=max_spec_len,
+        source_stage=source_stage,
+    )

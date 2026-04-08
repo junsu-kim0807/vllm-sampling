@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from vllm.v1.spec_decode.spec_stage_runtime import PivotExpansionPlan
+
 
 @dataclass
 class SpecDecodeMetadata:
@@ -22,6 +24,11 @@ class SpecDecodeMetadata:
     bonus_logits_indices: torch.Tensor
     # [num_tokens + batch_size]
     logits_indices: torch.Tensor
+    # Optional pivot expanded-row mapping: when set, num_draft_tokens,
+    # cu_num_draft_tokens, and draft_token_ids follow expanded-row order (B'),
+    # not origin request order (B). Used for plain pivot and pivot_spechive
+    # target verification.
+    expansion_plan: PivotExpansionPlan | None = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
@@ -63,4 +70,5 @@ class SpecDecodeMetadata:
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+            expansion_plan=None,
         )
