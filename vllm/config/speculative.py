@@ -636,11 +636,22 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("adaptive_spechive", "pivot"):
+                if self.method == "adaptive_spechive":
                     if not self.intermediate_model:
                         raise ValueError(
-                            f"{self.method} requires `intermediate_model` "
-                            "(pivot/intermediate I) in addition to `model` (draft D)."
+                            "adaptive_spechive requires `intermediate_model` "
+                            "(intermediate I) in addition to `model` (draft D)."
+                        )
+                elif self.method == "pivot":
+                    mode = self.get_pivot_runtime_mode()
+                    needs_intermediate = mode.verification_pipeline in (
+                        "intermediate_then_target",
+                        "intermediate_tree_then_target_tree",
+                    )
+                    if needs_intermediate and not self.intermediate_model:
+                        raise ValueError(
+                            "pivot intermediate* pipeline requires `intermediate_model` "
+                            "in addition to `model` (draft D)."
                         )
                 elif self.method in ("eagle", "eagle3"):
                     pass
@@ -767,7 +778,7 @@ class SpeculativeConfig:
                     )
                 )
 
-                if self.method in ("adaptive_spechive", "pivot"):
+                if self.method == "adaptive_spechive":
                     assert self.intermediate_model is not None
                     int_rev = (
                         self.intermediate_revision
@@ -818,6 +829,62 @@ class SpeculativeConfig:
                             self.intermediate_tensor_parallel_size,
                         )
                     )
+                elif self.method == "pivot" and self.intermediate_model is not None:
+                    # target_only pivot uses draft top-k expansion only; ignore
+                    # intermediate_model unless verification uses an I stage.
+                    if self.get_pivot_runtime_mode().verification_pipeline in (
+                        "intermediate_then_target",
+                        "intermediate_tree_then_target_tree",
+                    ):
+                        int_rev = (
+                            self.intermediate_revision
+                            if self.intermediate_revision is not None
+                            else self.revision
+                        )
+                        self.intermediate_model_config = ModelConfig(
+                            model=self.intermediate_model,
+                            runner="draft",
+                            tokenizer=self.target_model_config.tokenizer,
+                            tokenizer_mode=self.target_model_config.tokenizer_mode,
+                            trust_remote_code=self.target_model_config.trust_remote_code,
+                            allowed_local_media_path=self.target_model_config.allowed_local_media_path,
+                            allowed_media_domains=self.target_model_config.allowed_media_domains,
+                            dtype=self.target_model_config.dtype,
+                            seed=self.target_model_config.seed,
+                            revision=int_rev,
+                            code_revision=self.code_revision,
+                            tokenizer_revision=self.target_model_config.tokenizer_revision,
+                            spec_target_max_model_len=self.target_model_config.max_model_len,
+                            quantization=self.quantization,
+                            enforce_eager=self.target_model_config.enforce_eager,
+                            max_logprobs=self.target_model_config.max_logprobs,
+                            hf_overrides=SpeculativeConfig.hf_config_override,
+                            config_format=self.target_model_config.config_format,
+                        )
+                        int_tp = (
+                            self.intermediate_tensor_parallel_size
+                            or self.draft_tensor_parallel_size
+                        )
+                        self.intermediate_tensor_parallel_size = (
+                            SpeculativeConfig._verify_and_get_draft_tp(
+                                self.target_parallel_config,
+                                int_tp,
+                                self.intermediate_model_config.hf_config,
+                            )
+                        )
+                        self.intermediate_model_config.max_model_len = (
+                            SpeculativeConfig._maybe_override_draft_max_model_len(
+                                self.max_model_len,
+                                self.intermediate_model_config.max_model_len,
+                                self.target_model_config.max_model_len,
+                            )
+                        )
+                        self.intermediate_parallel_config = (
+                            SpeculativeConfig.create_draft_parallel_config(
+                                self.target_parallel_config,
+                                self.intermediate_tensor_parallel_size,
+                            )
+                        )
         return self
 
     def _validate_suffix_decoding(self):

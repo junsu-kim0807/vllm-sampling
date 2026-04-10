@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--tetris-extra-proposals",
         type=int,
-        default=0,
+        default=2,
         help=(
             "When --method=tetris: extra verification slots beyond "
             "batch_size * num_spec_tokens (default: 0)."
@@ -1608,12 +1608,14 @@ if __name__ == "__main__":
                 "enforce_eager": args.enforce_eager,
             }
         elif args.method == "pivot":
+            # `intermediate_model` may be set for bookkeeping; only
+            # `pivot_spechive` (--spechive) enables the I-stage pipeline.
+            # For target-only pivot, vLLM ignores intermediate_model when building
+            # the intermediate verifier (draft top-k expansion still runs).
             speculative_config = {
                 "method": "pivot",
                 "model": args.draft_model,
-                "intermediate_model": (
-                    args.intermediate_model if args.spechive else None
-                ),
+                "intermediate_model": args.intermediate_model,
                 "num_speculative_tokens": args.num_spec_tokens,
                 "pivot_topk_selection": args.topk_selection,
                 "pivot_expansion_pct": args.expansion_pct,

@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace as dataclass_replace
-
 import torch
 import torch.nn as nn
 from typing_extensions import override
 
-from vllm.config import VllmConfig, replace
+from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
+from vllm.logger import init_logger
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models import supports_multimodal
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
@@ -57,6 +59,8 @@ from vllm.v1.spec_decode.staged_delegate_factory import (
 )
 from vllm.v1.spec_decode.spec_stage_utils import slice_sampling_metadata_for_subbatch
 from vllm.v1.spec_decode.utils import create_vllm_config_for_draft_model
+
+logger = init_logger(__name__)
 
 
 def _chain_spec_token_tree(num_tokens: int) -> str:
@@ -121,6 +125,27 @@ def _vllm_as_eagle_head(
     return replace(base, speculative_config=new_spec)
 
 
+def _vllm_target_as_draft_chunk(base: VllmConfig, *, length: int) -> VllmConfig:
+    """VllmConfig slice for DIT prefix verification on the target model (no extra load)."""
+    spec = base.speculative_config
+    assert spec is not None
+    assert spec.target_model_config is not None
+    assert spec.target_parallel_config is not None
+    tp = spec.target_parallel_config.tensor_parallel_size
+    new_spec = replace(
+        spec,
+        method="draft_model",
+        draft_model_config=spec.target_model_config,
+        draft_parallel_config=spec.target_parallel_config,
+        draft_tensor_parallel_size=tp,
+        num_speculative_tokens=length,
+        speculative_token_tree=_chain_spec_token_tree(length),
+        prompt_lookup_min=1,
+        prompt_lookup_max=1,
+    )
+    return replace(base, speculative_config=new_spec)
+
+
 def _collapse_draft_rows_for_scheduler(
     out_exp: torch.Tensor,
     plan: PivotExpansionPlan | None,
@@ -156,6 +181,92 @@ class IntermediatePivotModelProposer(DraftModelProposer):
                 vllm_config=temp_vllm_config,
                 prefix="intermediate_model",
             )
+
+
+class PivotTargetDitVerifierProposer(DraftModelProposer):
+    """DIT inner verification on the target module (alias `load_model(target)`).
+
+    For ``target_only`` pivot there is no intermediate model; hierarchical
+    verification still runs prefix-conditioned forwards that must use target
+    hidden sizes and the same attention layers as the main model. We avoid a
+    second full target load by binding ``self.model`` to the runner's target.
+    """
+
+    @override
+    def load_model(self, target_model: nn.Module) -> None:
+        target_attn_layer_names = set(
+            get_layers_from_vllm_config(
+                self.vllm_config,
+                AttentionLayerBase,  # type: ignore[type-abstract]
+            ).keys()
+        )
+        self.model = target_model
+        # Parent logic subtracts "target" registry from post-draft registry; with no
+        # second load that set is empty — use all target attention layers instead.
+        self._draft_attn_layer_names = set(target_attn_layer_names)
+
+        if self.supports_mm_inputs:
+            try:
+                dummy_input_ids = torch.tensor([[1]], device=self.input_ids.device)
+                self.model.embed_input_ids(dummy_input_ids, multimodal_embeddings=None)
+            except (NotImplementedError, AttributeError, TypeError):
+                logger.warning(
+                    "Target DIT verifier does not support multimodal embed probe; "
+                    "falling back to text-only mode"
+                )
+                self.supports_mm_inputs = False
+
+        if supports_multimodal(target_model):
+            assert hasattr(target_model, "config")
+            if self.get_model_name(target_model) in [
+                "Qwen2_5_VLForConditionalGeneration",
+                "Qwen3VLForConditionalGeneration",
+                "Qwen3VLMoeForConditionalGeneration",
+                "HunYuanVLForConditionalGeneration",
+                "GlmOcrForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            ]:
+                self.model.config.image_token_index = target_model.config.image_token_id
+            elif self.get_model_name(target_model) == "PixtralForConditionalGeneration":
+                self.model.config.image_token_index = (
+                    target_model.config.vision_config.image_token_id
+                )
+            else:
+                self.model.config.image_token_index = (
+                    target_model.config.image_token_index
+                )
+        # Skip _maybe_share_embeddings / _maybe_share_lm_head: self.model is target.
+
+        if self.parallel_drafting and self.pass_hidden_states_to_model:
+            assert self.parallel_drafting_hidden_state_tensor is not None
+            self.parallel_drafting_hidden_state_tensor.copy_(
+                self.model.combine_hidden_states(
+                    self.model.mask_hidden.view(3 * self.hidden_size)
+                )
+                if self.eagle3_use_aux_hidden_state
+                else self.model.mask_hidden.view(self.hidden_size)
+            )
+
+        if self.use_local_argmax_reduction:
+            if not hasattr(self.model, "get_top_tokens"):
+                raise ValueError(
+                    "use_local_argmax_reduction is enabled but target verifier "
+                    f"{self.model.__class__.__name__} does not implement get_top_tokens()."
+                )
+            if (
+                hasattr(self.model, "draft_id_to_target_id")
+                and self.model.draft_id_to_target_id is not None
+            ):
+                logger.warning(
+                    "use_local_argmax_reduction is enabled but model uses "
+                    "draft_id_to_target_id vocab remapping; falling back to full logits."
+                )
+            else:
+                logger.info(
+                    "Using local argmax reduction for draft token generation "
+                    "(communication: O(2*tp_size) vs O(vocab_size))."
+                )
 
 
 class PivotProposer:
@@ -203,14 +314,24 @@ class PivotProposer:
                 device,
                 runner,
             )
-        self._intermediate = IntermediatePivotModelProposer(
-            _vllm_intermediate_as_draft(vllm_config, length=1),
-            device,
-            runner,
-        )
+        if mode.verification_pipeline in (
+            "intermediate_then_target",
+            "intermediate_tree_then_target_tree",
+        ):
+            self._intermediate = IntermediatePivotModelProposer(
+                _vllm_intermediate_as_draft(vllm_config, length=1),
+                device,
+                runner,
+            )
+        else:
+            self._intermediate = PivotTargetDitVerifierProposer(
+                _vllm_target_as_draft_chunk(vllm_config, length=1),
+                device,
+                runner,
+            )
         # Keep parity with AdaptiveSpechiveProposer contract used by
         # run_hierarchical_verification_rounds().
-        self._inter_dit: IntermediatePivotModelProposer = self._intermediate
+        self._inter_dit: DraftModelProposer = self._intermediate
         self._pending_hybrid_bundle: HybridProposalBundle | None = None
         self._pending_tree_plan: PivotExpandedTreePlan | None = None
         self._active_pivot_expansion_plan: PivotExpansionPlan | None = None
