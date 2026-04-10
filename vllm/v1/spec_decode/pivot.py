@@ -545,15 +545,17 @@ class PivotProposer:
         self,
         *,
         initial_pivots: torch.Tensor,
-        pivot_probs: torch.Tensor,
+        pivot_probs: torch.Tensor | None,
         enable_topk_expansion: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None, PivotExpansionPlan | None]:
         """Build B' pivot rows and per-row first-step probs (same q(·) as origin)."""
         batch_size = int(initial_pivots.shape[0])
+        # Missing q(·) (e.g. parallel drafting fast path): skip expansion safely.
         if (
             not enable_topk_expansion
             or self._topk_selection <= 1
             or batch_size == 0
+            or pivot_probs is None
         ):
             ep = initial_pivots.to(torch.int32)
             eprob = (

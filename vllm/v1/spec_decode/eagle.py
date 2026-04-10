@@ -124,7 +124,7 @@ class SpecDecodeBaseProposer:
         # adjust_cudagraph_sizes_for_spec_decode is called.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
 
-        # Filled during draft_model propose when use_draft_probs_in_rejection is set.
+        # Filled during propose when rejection sampling or pivot top-k expansion needs q(·).
         self.last_draft_probs_flat: torch.Tensor | None = None
 
         # persistent buffers for cuda graph
@@ -447,6 +447,18 @@ class SpecDecodeBaseProposer:
             and not sampling_metadata.all_greedy
         )
 
+    def _should_collect_draft_step_probs(self, sampling_metadata: SamplingMetadata) -> bool:
+        """Whether to run processed-logits softmax and set last_draft_probs_flat.
+
+        Pivot top-k expansion reads per-step draft distributions even when the
+        target uses greedy decoding (all_greedy); plain draft_model speculative
+        decoding only needs probs when use_draft_probs_in_rejection and not greedy.
+        """
+        if self._use_draft_probs_in_rejection(sampling_metadata):
+            return True
+        sc = self.speculative_config
+        return self.method == "pivot" and int(sc.pivot_topk_selection) > 1
+
     @staticmethod
     def _with_provisional_draft_prefix(
         sampling_metadata: SamplingMetadata,
@@ -590,7 +602,7 @@ class SpecDecodeBaseProposer:
             draft_token_ids = self._greedy_sample(sample_hidden_states)
             return draft_token_ids.view(-1, self.num_speculative_tokens)
         if self.num_speculative_tokens == 1:
-            if self._use_draft_probs_in_rejection(sampling_metadata):
+            if self._should_collect_draft_step_probs(sampling_metadata):
                 logits0 = self.model.compute_logits(sample_hidden_states)
                 draft_token_ids, probs0 = sample_next_token_and_probs_processed(
                     runner_sampler,
@@ -635,7 +647,7 @@ class SpecDecodeBaseProposer:
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
 
-        track_probs = self._use_draft_probs_in_rejection(sampling_metadata)
+        track_probs = self._should_collect_draft_step_probs(sampling_metadata)
         probs_per_step: list[torch.Tensor] = []
         if track_probs:
             logits0 = self.model.compute_logits(sample_hidden_states)

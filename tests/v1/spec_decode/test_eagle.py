@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -1148,3 +1149,27 @@ def test_propose_tree(spec_token_tree):
 
     # Verify that the draft tokens match our expectations.
     assert torch.equal(result, expected_tokens)
+
+
+def test_should_collect_draft_step_probs_pivot_with_topk_even_when_greedy() -> None:
+    proposer = object.__new__(EagleProposer)
+    proposer.method = "pivot"
+    proposer.speculative_config = SimpleNamespace(
+        method="pivot",
+        pivot_topk_selection=5,
+        use_draft_probs_in_rejection=False,
+    )
+    greedy_sm = SimpleNamespace(all_greedy=True)
+    assert proposer._should_collect_draft_step_probs(greedy_sm)
+
+
+def test_should_collect_draft_step_probs_draft_model_greedy_skips_without_flag() -> None:
+    proposer = object.__new__(EagleProposer)
+    proposer.method = "draft_model"
+    proposer.speculative_config = SimpleNamespace(
+        method="draft_model",
+        pivot_topk_selection=5,
+        use_draft_probs_in_rejection=True,
+    )
+    greedy_sm = SimpleNamespace(all_greedy=True)
+    assert not proposer._should_collect_draft_step_probs(greedy_sm)

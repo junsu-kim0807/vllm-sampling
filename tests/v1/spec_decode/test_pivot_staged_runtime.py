@@ -62,6 +62,21 @@ def test_get_unselected_cleanup_rows_returns_unselected_family_rows() -> None:
     assert get_unselected_cleanup_rows(expansion_plan=plan, selected_rows=[1]) == [0]
 
 
+def test_build_pivot_expansion_plan_skips_when_probs_missing_but_topk_enabled() -> None:
+    """If pivot step probs are unavailable, skip expansion without crashing."""
+    proposer = object.__new__(PivotProposer)
+    proposer._topk_selection = 5
+    initial = torch.tensor([[42], [43]], dtype=torch.int32)
+    ep, eprob, plan = proposer._build_pivot_expansion_plan(
+        initial_pivots=initial,
+        pivot_probs=None,
+        enable_topk_expansion=True,
+    )
+    assert torch.equal(ep, initial)
+    assert eprob is None
+    assert plan is None
+
+
 def test_pivot_bootstrap_hidden_source_uses_provider_in_intermediate_mode() -> None:
     proposer = object.__new__(PivotProposer)
     called = {"value": False}
