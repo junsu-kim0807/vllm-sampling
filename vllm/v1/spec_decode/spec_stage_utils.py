@@ -56,11 +56,20 @@ def slice_sampling_metadata_for_subbatch(
             return None
         return x.index_select(0, idx)
 
-    output_token_ids = [sm.output_token_ids[i] for i in idxs]
+    # Greedy + no-penalty batches omit output_token_ids in InputBatch; staged
+    # pivot/spec paths still slice per logical row — synthesize empty histories.
+    if sm.output_token_ids:
+        output_token_ids = [sm.output_token_ids[i] for i in idxs]
+    else:
+        output_token_ids = [[] for _ in idxs]
+
     if provisional_prefix_rows is not None:
         spec_token_ids = provisional_prefix_rows
     elif sm.spec_token_ids is not None:
-        spec_token_ids = [sm.spec_token_ids[i] for i in idxs]
+        if sm.spec_token_ids:
+            spec_token_ids = [sm.spec_token_ids[i] for i in idxs]
+        else:
+            spec_token_ids = [[] for _ in idxs]
     else:
         spec_token_ids = None
 
