@@ -11,6 +11,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.spec_decode.profiler_types import SpecDecodeProfileTransport
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
@@ -267,6 +268,8 @@ class ModelRunnerOutput:
 
     # Staged speculative verification cost breakdown per batch.
     spec_decode_cost_breakdown: SpecDecodeCostBreakdown | None = None
+    # Unified speculative profiling transport.
+    spec_decode_profile_transport: SpecDecodeProfileTransport | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

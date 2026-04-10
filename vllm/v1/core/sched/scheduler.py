@@ -59,6 +59,11 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.spec_decode.profiler import create_spec_decode_profiler
+from vllm.v1.spec_decode.profiler_types import (
+    SpecDecodeCostBreakdownRecord,
+    SpecDecodeRequestMetadataRecord,
+)
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -101,6 +106,11 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
+        self.spec_profile_step_counter: int = 0
+        self.spec_decode_profiler = create_spec_decode_profiler(
+            vllm_config=vllm_config,
+            role="scheduler",
+        )
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -876,6 +886,7 @@ class Scheduler(SchedulerInterface):
             if self.needs_kv_cache_zeroing
             else None
         )
+        self.spec_profile_step_counter += 1
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -893,6 +904,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            spec_profile_step_id=self.spec_profile_step_counter,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1279,9 +1291,12 @@ class Scheduler(SchedulerInterface):
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
+        self.spec_decode_profiler.begin_step(scheduler_output.spec_profile_step_id)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
+        spec_cost_record: SpecDecodeCostBreakdownRecord | None = None
+        batch_cost_applied = False
         kv_connector_stats: KVConnectorStats | None = (
             kv_connector_output.kv_connector_stats if kv_connector_output else None
         )
@@ -1304,6 +1319,9 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        transport = getattr(model_runner_output, "spec_decode_profile_transport", None)
+        if transport is not None:
+            spec_cost_record = transport.cost_breakdown
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
@@ -1324,11 +1342,14 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            spec_request_meta: dict[str, Any] | None = None
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
             if scheduled_spec_token_ids and generated_token_ids:
+                num_computed_tokens_before = request.num_computed_tokens
+                num_output_placeholders_before = request.num_output_placeholders
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
@@ -1343,18 +1364,61 @@ class Scheduler(SchedulerInterface):
                 # the scheduled spec tokens count and so is similarly adjusted.
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
-                cost_breakdown = getattr(
+                num_invalid = 0
+                if scheduler_output.num_invalid_spec_tokens:
+                    num_invalid = scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+                num_partial: int | None = None
+                num_inter_verified: int | None = None
+                num_inter_accepted: int | None = None
+                staged_depth: int | None = None
+                staged_used: bool | None = None
+                if spec_cost_record is not None:
+                    partials = spec_cost_record.num_partial_accepted_per_req
+                    if partials is not None and req_index < len(partials):
+                        num_partial = partials[req_index]
+                    iv = spec_cost_record.num_intermediate_verified_tokens_per_req
+                    if iv is not None and req_index < len(iv):
+                        num_inter_verified = iv[req_index]
+                    ia = spec_cost_record.num_intermediate_accepted_per_req
+                    if ia is not None and req_index < len(ia):
+                        num_inter_accepted = ia[req_index]
+                    staged_depth = spec_cost_record.staged_verification_depth
+                    staged_used = spec_cost_record.staged_verification_used
+                spec_request_meta = {
+                    "num_draft_tokens": num_draft_tokens,
+                    "num_accepted": num_accepted,
+                    "num_rejected": num_rejected,
+                    "num_invalid": num_invalid,
+                    "num_partial": num_partial,
+                    "num_inter_verified": num_inter_verified,
+                    "num_inter_accepted": num_inter_accepted,
+                    "staged_depth": staged_depth,
+                    "staged_used": staged_used,
+                    "num_computed_tokens_before": num_computed_tokens_before,
+                    "num_computed_tokens_after": request.num_computed_tokens,
+                    "num_output_placeholders_before": num_output_placeholders_before,
+                    "num_output_placeholders_after": request.num_output_placeholders,
+                }
+                legacy_cost_breakdown = getattr(
                     model_runner_output, "spec_decode_cost_breakdown", None
                 )
-                spec_decoding_stats = self.make_spec_decoding_stats(
-                    spec_decoding_stats,
-                    num_draft_tokens=num_draft_tokens,
-                    num_accepted_tokens=num_accepted,
-                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
-                    request_id=req_id,
-                    cost_breakdown=cost_breakdown,
-                    req_index=req_index,
-                )
+                if self.observability_config.spec_decode_profile_emit_scheduler_bridge:
+                    spec_decoding_stats = self.make_spec_decoding_stats(
+                        spec_decoding_stats,
+                        num_draft_tokens=num_draft_tokens,
+                        num_accepted_tokens=num_accepted,
+                        num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+                        request_id=req_id,
+                        cost_breakdown=legacy_cost_breakdown,
+                        cost_breakdown_record=spec_cost_record,
+                        req_index=req_index,
+                        add_batch_cost=not batch_cost_applied,
+                    )
+                    if not batch_cost_applied and (
+                        spec_cost_record is not None
+                        or legacy_cost_breakdown is not None
+                    ):
+                        batch_cost_applied = True
 
             stopped = False
             new_logprobs = None
@@ -1412,6 +1476,50 @@ class Scheduler(SchedulerInterface):
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
+
+            if spec_request_meta is not None:
+                self.spec_decode_profiler.emit_scheduler_request_metadata(
+                    SpecDecodeRequestMetadataRecord(
+                        profile_writer_role=self.spec_decode_profiler.profile_writer_role,
+                        profile_writer_id=self.spec_decode_profiler.profile_writer_id,
+                        profile_writer_pid=self.spec_decode_profiler.profile_writer_pid,
+                        profile_writer_host=self.spec_decode_profiler.profile_writer_host,
+                        spec_profile_step_id=scheduler_output.spec_profile_step_id,
+                        req_id=req_id,
+                        req_index=req_index,
+                        num_draft_tokens=spec_request_meta["num_draft_tokens"],
+                        num_accepted_tokens=spec_request_meta["num_accepted"],
+                        num_rejected_tokens=spec_request_meta["num_rejected"],
+                        num_invalid_spec_tokens=spec_request_meta["num_invalid"],
+                        num_partial_accepted_tokens=spec_request_meta["num_partial"],
+                        num_intermediate_verified_tokens=spec_request_meta[
+                            "num_inter_verified"
+                        ],
+                        num_intermediate_accepted_tokens=spec_request_meta[
+                            "num_inter_accepted"
+                        ],
+                        staged_verification_depth=spec_request_meta["staged_depth"],
+                        staged_verification_used=spec_request_meta["staged_used"],
+                        num_computed_tokens_before=spec_request_meta[
+                            "num_computed_tokens_before"
+                        ],
+                        num_computed_tokens_after=spec_request_meta[
+                            "num_computed_tokens_after"
+                        ],
+                        num_output_placeholders_before=spec_request_meta[
+                            "num_output_placeholders_before"
+                        ],
+                        num_output_placeholders_after=spec_request_meta[
+                            "num_output_placeholders_after"
+                        ],
+                        finish_reason=finish_reason,
+                        stop_reason=request.stop_reason,
+                        output_placeholder_adjustment=(
+                            spec_request_meta["num_output_placeholders_after"]
+                            - spec_request_meta["num_output_placeholders_before"]
+                        ),
+                    )
+                )
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
@@ -1917,7 +2025,9 @@ class Scheduler(SchedulerInterface):
         num_invalid_spec_tokens: dict[str, int] | None,
         request_id: str,
         cost_breakdown: SpecDecodeCostBreakdown | None = None,
+        cost_breakdown_record: SpecDecodeCostBreakdownRecord | None = None,
         req_index: int | None = None,
+        add_batch_cost: bool = False,
     ) -> SpecDecodingStats | None:
         if not self.log_stats or not num_draft_tokens:
             return None
@@ -1925,35 +2035,39 @@ class Scheduler(SchedulerInterface):
             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
         if num_invalid_spec_tokens:
             num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
-        if cost_breakdown is not None and req_index is not None:
-            num_partial = (
-                cost_breakdown.num_partial_accepted_per_req[req_index]
-                if req_index < len(cost_breakdown.num_partial_accepted_per_req)
-                else 0
+        if (
+            (cost_breakdown is not None or cost_breakdown_record is not None)
+            and req_index is not None
+        ):
+            num_partial = 0
+            if cost_breakdown_record is not None:
+                rec_partials = cost_breakdown_record.num_partial_accepted_per_req
+                if rec_partials is not None and req_index < len(rec_partials):
+                    num_partial = rec_partials[req_index]
+            elif cost_breakdown is not None and req_index < len(
+                cost_breakdown.num_partial_accepted_per_req
+            ):
+                num_partial = cost_breakdown.num_partial_accepted_per_req[req_index]
+            (
+                draft_time_sec,
+                compression_time_sec,
+                partial_verification_time_sec,
+                full_verification_time_sec,
+                reject_sample_time_sec,
+            ) = self._fold_batch_cost_breakdown(
+                cost_breakdown=cost_breakdown,
+                cost_breakdown_record=cost_breakdown_record,
+                add_batch_cost=add_batch_cost,
             )
-            # Add batch-level times only for the first request in this batch.
-            is_first_spec_req = spec_decoding_stats.num_drafts == 0
             spec_decoding_stats.observe_draft_with_cost_breakdown(
                 num_draft_tokens=num_draft_tokens,
                 num_accepted_tokens=num_accepted_tokens,
-                draft_time_sec=cost_breakdown.draft_time_sec if is_first_spec_req else 0,
-                compression_time_sec=(
-                    cost_breakdown.compression_time_sec if is_first_spec_req else 0
-                ),
-                partial_verification_time_sec=(
-                    cost_breakdown.partial_verification_time_sec
-                    if is_first_spec_req
-                    else 0
-                ),
+                draft_time_sec=draft_time_sec,
+                compression_time_sec=compression_time_sec,
+                partial_verification_time_sec=partial_verification_time_sec,
                 num_partial_accepted_tokens=num_partial,
-                full_verification_time_sec=(
-                    cost_breakdown.full_verification_time_sec if is_first_spec_req else 0
-                ),
-                reject_sample_time_sec=(
-                    cost_breakdown.reject_sample_time_sec
-                    if is_first_spec_req
-                    else 0.0
-                ),
+                full_verification_time_sec=full_verification_time_sec,
+                reject_sample_time_sec=reject_sample_time_sec,
             )
         else:
             spec_decoding_stats.observe_draft(
@@ -1962,7 +2076,36 @@ class Scheduler(SchedulerInterface):
             )
         return spec_decoding_stats
 
+    def _fold_batch_cost_breakdown(
+        self,
+        cost_breakdown: SpecDecodeCostBreakdown | None,
+        cost_breakdown_record: SpecDecodeCostBreakdownRecord | None,
+        add_batch_cost: bool,
+    ) -> tuple[float, float, float, float, float]:
+        if not add_batch_cost:
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+        if cost_breakdown_record is not None:
+            # Transitional path: new compact transport batch-level record.
+            return (
+                cost_breakdown_record.draft_forward_time_ms / 1000.0,
+                0.0,
+                cost_breakdown_record.partial_verification_time_ms / 1000.0,
+                cost_breakdown_record.target_forward_time_ms / 1000.0,
+                cost_breakdown_record.reject_sample_time_ms / 1000.0,
+            )
+        if cost_breakdown is None:
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+        # Legacy path: old SpecDecodeCostBreakdown payload.
+        return (
+            cost_breakdown.draft_time_sec,
+            cost_breakdown.compression_time_sec,
+            cost_breakdown.partial_verification_time_sec,
+            cost_breakdown.full_verification_time_sec,
+            cost_breakdown.reject_sample_time_sec,
+        )
+
     def shutdown(self) -> None:
+        self.spec_decode_profiler.close()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

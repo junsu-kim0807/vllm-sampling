@@ -227,6 +227,9 @@ class SchedulerOutput:
     # Used for adjusting acceptance rate calculation.
     num_invalid_spec_tokens: dict[str, int] | None = None
 
+    # Writer-local monotonic speculative profiling step id.
+    spec_profile_step_id: int = 0
+
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None
 

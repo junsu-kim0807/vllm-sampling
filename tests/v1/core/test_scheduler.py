@@ -33,6 +33,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.spec_decode.profiler_types import (
+    SpecDecodeCostBreakdownRecord,
+    SpecDecodeProfileTransport,
+)
 from vllm.v1.structured_output import StructuredOutputManager
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
@@ -882,6 +886,66 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
         assert stats.num_draft_tokens == expected[1]
         assert stats.num_accepted_tokens == expected[2]
         assert stats.num_accepted_tokens_per_pos == expected[3]
+
+
+def test_schedule_sets_monotonic_spec_profile_step_id():
+    scheduler = create_scheduler()
+    req = create_requests(num_requests=1, num_tokens=1)[0]
+    scheduler.add_request(req)
+    out1 = scheduler.schedule()
+    out2 = scheduler.schedule()
+    assert out1.spec_profile_step_id >= 1
+    assert out2.spec_profile_step_id == out1.spec_profile_step_id + 1
+
+
+def test_spec_profile_transport_cost_bridge_applies_batch_cost_once():
+    scheduler = create_scheduler(num_speculative_tokens=2)
+    requests = create_requests(num_requests=2, num_tokens=1)
+    req_ids = [r.request_id for r in requests]
+    for req in requests:
+        scheduler.add_request(req)
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+            sampled_token_ids=[[0], [0]],
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids=req_ids, draft_token_ids=[[1, 2], [3, 4]])
+    )
+    verify_out = scheduler.schedule()
+    mro = ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        sampled_token_ids=[[1, 9], [3, 10]],
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        spec_decode_profile_transport=SpecDecodeProfileTransport(
+            spec_profile_step_id=verify_out.spec_profile_step_id,
+            cost_breakdown=SpecDecodeCostBreakdownRecord(
+                profile_writer_role="worker",
+                profile_writer_id="worker.dp0.pp0.tp0",
+                profile_writer_pid=1,
+                profile_writer_host="localhost",
+                spec_profile_step_id=verify_out.spec_profile_step_id,
+                target_forward_time_ms=4.0,
+                draft_forward_time_ms=2.0,
+                partial_verification_time_ms=6.0,
+                intermediate_verification_time_ms=50.0,
+            ),
+        ),
+    )
+    eco = scheduler.update_from_output(verify_out, mro)
+    stats = eco[0].scheduler_stats.spec_decoding_stats
+    assert stats is not None
+    assert stats.full_verification_time_sec == pytest.approx(0.004)
+    assert stats.draft_time_sec == pytest.approx(0.002)
+    assert stats.partial_verification_time_sec == pytest.approx(0.006)
 
 
 def test_spec_decoding_stats_empty_output():

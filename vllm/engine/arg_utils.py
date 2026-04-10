@@ -547,6 +547,31 @@ class EngineArgs:
     enable_logging_iteration_details: bool = (
         ObservabilityConfig.enable_logging_iteration_details
     )
+    spec_decode_profile_mode: str = ObservabilityConfig.spec_decode_profile_mode
+    spec_decode_profile_output_dir: str | None = (
+        ObservabilityConfig.spec_decode_profile_output_dir
+    )
+    spec_decode_profile_timing_backend: str = (
+        ObservabilityConfig.spec_decode_profile_timing_backend
+    )
+    spec_decode_profile_emit_scheduler_bridge: bool = (
+        ObservabilityConfig.spec_decode_profile_emit_scheduler_bridge
+    )
+    spec_decode_profile_include_token_ids: bool = (
+        ObservabilityConfig.spec_decode_profile_include_token_ids
+    )
+    spec_decode_profile_request_sample_rate: float = get_field(
+        ObservabilityConfig, "spec_decode_profile_request_sample_rate"
+    )
+    spec_decode_profile_max_reqs_per_step_record: int | None = get_field(
+        ObservabilityConfig, "spec_decode_profile_max_reqs_per_step_record"
+    )
+    spec_decode_profile_flush_interval: int = get_field(
+        ObservabilityConfig, "spec_decode_profile_flush_interval"
+    )
+    spec_decode_profile_max_steps: int | None = get_field(
+        ObservabilityConfig, "spec_decode_profile_max_steps"
+    )
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
@@ -1147,6 +1172,42 @@ class EngineArgs:
         observability_group.add_argument(
             "--enable-logging-iteration-details",
             **observability_kwargs["enable_logging_iteration_details"],
+        )
+        observability_group.add_argument(
+            "--spec-decode-profile-mode",
+            **observability_kwargs["spec_decode_profile_mode"],
+        )
+        observability_group.add_argument(
+            "--spec-decode-profile-output-dir",
+            **observability_kwargs["spec_decode_profile_output_dir"],
+        )
+        observability_group.add_argument(
+            "--spec-decode-profile-timing-backend",
+            **observability_kwargs["spec_decode_profile_timing_backend"],
+        )
+        observability_group.add_argument(
+            "--spec-decode-profile-emit-scheduler-bridge",
+            **observability_kwargs["spec_decode_profile_emit_scheduler_bridge"],
+        )
+        observability_group.add_argument(
+            "--spec-decode-profile-include-token-ids",
+            **observability_kwargs["spec_decode_profile_include_token_ids"],
+        )
+        observability_group.add_argument(
+            "--spec-decode-profile-request-sample-rate",
+            **observability_kwargs["spec_decode_profile_request_sample_rate"],
+        )
+        observability_group.add_argument(
+            "--spec-decode-profile-max-reqs-per-step-record",
+            **observability_kwargs["spec_decode_profile_max_reqs_per_step_record"],
+        )
+        observability_group.add_argument(
+            "--spec-decode-profile-flush-interval",
+            **observability_kwargs["spec_decode_profile_flush_interval"],
+        )
+        observability_group.add_argument(
+            "--spec-decode-profile-max-steps",
+            **observability_kwargs["spec_decode_profile_max_steps"],
         )
 
         # Scheduler arguments
@@ -1852,6 +1913,25 @@ class EngineArgs:
             enable_mfu_metrics=self.enable_mfu_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,
             enable_logging_iteration_details=self.enable_logging_iteration_details,
+            spec_decode_profile_mode=self.spec_decode_profile_mode,
+            spec_decode_profile_output_dir=self.spec_decode_profile_output_dir,
+            spec_decode_profile_timing_backend=(
+                self.spec_decode_profile_timing_backend
+            ),
+            spec_decode_profile_emit_scheduler_bridge=(
+                self.spec_decode_profile_emit_scheduler_bridge
+            ),
+            spec_decode_profile_include_token_ids=(
+                self.spec_decode_profile_include_token_ids
+            ),
+            spec_decode_profile_request_sample_rate=(
+                self.spec_decode_profile_request_sample_rate
+            ),
+            spec_decode_profile_max_reqs_per_step_record=(
+                self.spec_decode_profile_max_reqs_per_step_record
+            ),
+            spec_decode_profile_flush_interval=self.spec_decode_profile_flush_interval,
+            spec_decode_profile_max_steps=self.spec_decode_profile_max_steps,
         )
 
         # Compilation config overrides

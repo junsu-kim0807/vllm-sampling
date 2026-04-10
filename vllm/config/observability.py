@@ -12,6 +12,8 @@ from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 
 DetailedTraceModules = Literal["model", "worker", "all"]
+SpecDecodeProfileMode = Literal["disabled", "cost_breakdown", "metadata", "all"]
+SpecDecodeProfileTimingBackend = Literal["cuda_event", "device_sync"]
 
 
 @config
@@ -75,6 +77,35 @@ class ObservabilityConfig:
     If set, vllm EngineCore will log iteration details
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
+
+    spec_decode_profile_mode: SpecDecodeProfileMode = "disabled"
+    """Unified speculative profiling mode."""
+
+    spec_decode_profile_output_dir: str | None = None
+    """Directory for speculative profiling JSONL outputs."""
+
+    spec_decode_profile_timing_backend: SpecDecodeProfileTimingBackend = "cuda_event"
+    """Timing backend for speculative cost profiling."""
+
+    spec_decode_profile_emit_scheduler_bridge: bool = True
+    """If true, fold compact speculative transport into scheduler stats bridge."""
+
+    spec_decode_profile_include_token_ids: bool = False
+    """Include token-id-heavy metadata fields in profiler output."""
+
+    spec_decode_profile_request_sample_rate: float = Field(default=1.0, gt=0.0, le=1.0)
+    """Sampling rate for scheduler request metadata records."""
+
+    spec_decode_profile_max_reqs_per_step_record: int | None = Field(
+        default=None, ge=1
+    )
+    """Optional per-step cap on emitted request metadata rows."""
+
+    spec_decode_profile_flush_interval: int = Field(default=100, ge=1)
+    """Buffered record flush interval for JSONL writer."""
+
+    spec_decode_profile_max_steps: int | None = Field(default=None, ge=1)
+    """Optional maximum steps to profile before turning no-op."""
 
     @cached_property
     def collect_model_forward_time(self) -> bool:
