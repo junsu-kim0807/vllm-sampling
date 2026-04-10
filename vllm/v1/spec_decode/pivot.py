@@ -66,11 +66,14 @@ def _chain_spec_token_tree(num_tokens: int) -> str:
 def _vllm_as_plain_draft(base: VllmConfig, *, length: int) -> VllmConfig:
     spec = base.speculative_config
     assert spec is not None
+    # Pivot __post_init__ sets prompt_lookup_* to 0; pydantic rejects 0 on replace().
     new_spec = replace(
         spec,
         method="draft_model",
         num_speculative_tokens=length,
         speculative_token_tree=_chain_spec_token_tree(length),
+        prompt_lookup_min=1,
+        prompt_lookup_max=1,
     )
     return replace(base, speculative_config=new_spec)
 
@@ -89,6 +92,8 @@ def _vllm_intermediate_as_draft(base: VllmConfig, *, length: int) -> VllmConfig:
         draft_tensor_parallel_size=spec.intermediate_tensor_parallel_size,
         num_speculative_tokens=length,
         speculative_token_tree=_chain_spec_token_tree(length),
+        prompt_lookup_min=1,
+        prompt_lookup_max=1,
     )
     return replace(base, speculative_config=new_spec)
 
@@ -110,6 +115,8 @@ def _vllm_as_eagle_head(
             if use_eagle_tree and spec.speculative_token_tree is not None
             else _chain_spec_token_tree(length)
         ),
+        prompt_lookup_min=1,
+        prompt_lookup_max=1,
     )
     return replace(base, speculative_config=new_spec)
 
