@@ -1510,9 +1510,13 @@ def write_pair_info(
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.method in ("adaptive_spechive", "pivot") and not args.intermediate_model:
+    if args.method == "adaptive_spechive" and not args.intermediate_model:
         raise SystemExit(
             f"--method={args.method} requires --intermediate-model"
+        )
+    if args.method == "pivot" and args.spechive and not args.intermediate_model:
+        raise SystemExit(
+            "--method=pivot with --spechive requires --intermediate-model"
         )
     random.seed(args.seed)
 
@@ -1607,7 +1611,9 @@ if __name__ == "__main__":
             speculative_config = {
                 "method": "pivot",
                 "model": args.draft_model,
-                "intermediate_model": args.intermediate_model,
+                "intermediate_model": (
+                    args.intermediate_model if args.spechive else None
+                ),
                 "num_speculative_tokens": args.num_spec_tokens,
                 "pivot_topk_selection": args.topk_selection,
                 "pivot_expansion_pct": args.expansion_pct,

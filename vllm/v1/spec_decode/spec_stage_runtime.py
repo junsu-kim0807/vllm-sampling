@@ -37,6 +37,68 @@ class PivotExpansionPlan:
     expanded_batch_size: int
 
 
+@dataclass(frozen=True)
+class PivotTreeFamily:
+    """One expanded root candidate that belongs to an origin request row."""
+
+    origin_row: int
+    family_id: int
+    root_rank: int
+    root_token_id: int
+    # Flat verification span [start, end) for this family.
+    node_row_start: int
+    node_row_end: int
+
+
+@dataclass(frozen=True)
+class EagleTreeTemplate:
+    """Shared Eagle tree topology used across expanded families."""
+
+    parent_ids: list[int]
+    node_depths: list[int]
+    node_order: list[int]
+    leaf_ids: list[int]
+    num_nodes: int
+
+
+@dataclass(frozen=True)
+class PivotExpandedTreePlan:
+    """Family-expanded plan + flat remap metadata for verifier contract."""
+
+    families: list[PivotTreeFamily]
+    template: EagleTreeTemplate
+    # family-major mapping used by both intermediate and target verification.
+    flat_to_family_ids: list[int]
+    flat_to_node_ids: list[int]
+    # [family_id] -> (start, end) in flat order.
+    family_flat_spans: list[tuple[int, int]]
+    expanded_to_origin: list[int]
+    origin_batch_size: int
+
+
+@dataclass
+class FamilyTreeBundle:
+    """Family-major tree tokens flattened for generic verifier contracts."""
+
+    plan: PivotExpandedTreePlan
+    # [num_flat_nodes]
+    token_ids: torch.Tensor
+    # [num_flat_nodes, vocab] or None.
+    proposal_probs: torch.Tensor | None = None
+    # Optional interpreted accepted path per family for iterative rounds.
+    reduced_prefix_rows: list[list[int]] | None = None
+
+
+@dataclass
+class FamilyTreeReduceResult:
+    """Interpreted verifier output reconstructed back to family semantics."""
+
+    accepted_rows: list[list[int]]
+    accepted_lens: list[int]
+    chosen_leaf_ids: list[int]
+    recovery_token_ids: list[int]
+
+
 @dataclass
 class HybridProposalBundle:
     """Proposal payload passed from proposer/controller to target verification."""
@@ -55,6 +117,8 @@ class HybridProposalBundle:
     source_stage: torch.Tensor | None = None
     # Optional pivot top-k expansion mapping.
     expansion_plan: PivotExpansionPlan | None = None
+    # Optional tree-family flatten/reconstruction contract.
+    tree_plan: PivotExpandedTreePlan | None = None
 
 
 @dataclass
@@ -109,6 +173,8 @@ class DitRoundProposal:
     probs: torch.Tensor | None = None
     # Optional expanded-row mapping.
     expansion_plan: PivotExpansionPlan | None = None
+    # Optional tree-family flatten/reconstruction contract.
+    tree_plan: PivotExpandedTreePlan | None = None
 
 
 @dataclass
@@ -155,6 +221,37 @@ class DitRoundState:
     prefix_source_rows: list[list[int]]
 
 
+@dataclass(frozen=True)
+class StagedHiddenStateBundle:
+    """Hidden-state bundle owned by staged intermediate frontier."""
+
+    hidden_states: torch.Tensor
+    aux_hidden_states: torch.Tensor | None
+    batch_size: int
+    # Provisional KV frontier ownership marker.
+    owns_provisional_frontier: bool = True
+
+
+@dataclass
+class IntermediateRoundState:
+    """Mutable staged round state for intermediate frontier advancement."""
+
+    hidden_bundle: StagedHiddenStateBundle | None = None
+    verification_metadata: dict[str, object] | None = None
+    # Copy-on-write block-table frontier metadata per expanded row.
+    frontier_metadata: list[dict[str, object]] | None = None
+    bootstrap_complete: bool = False
+
+
+@dataclass(frozen=True)
+class StagedVerificationResult:
+    """Verification result with optional cleanup bookkeeping."""
+
+    accepted_rows: list[list[int]]
+    rejected_rows: list[list[int]]
+    needs_cleanup_rows: list[int]
+
+
 def _split_flat_tokens_by_lengths(
     flat: torch.Tensor, lengths: list[int]
 ) -> list[torch.Tensor]:
@@ -198,6 +295,11 @@ def expand_hybrid_bundle_for_pivot_expansion(
     plan = bundle.expansion_plan
     if plan is None or plan.expanded_batch_size <= 0:
         return bundle
+    if bundle.draft_probs is not None and plan.families:
+        # Pivot top-k expansion currently reuses origin q(.) for multiple branches.
+        # Disable stochastic proposal probs for expanded families until branch-
+        # conditioned proposal math is implemented.
+        bundle = replace(bundle, draft_probs=None)
     if len(plan.expanded_to_origin) != plan.expanded_batch_size:
         return bundle
     origin_b = len(bundle.num_draft_tokens)

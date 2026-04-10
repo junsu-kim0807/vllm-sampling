@@ -72,6 +72,17 @@ class ModelSpec:
     note: str = ""
 
 
+@dataclass(frozen=True)
+class BatchSpecPairConfig:
+    pair_id: str
+    draft_key: str
+    target_key: str
+    tp_size: int
+    gpu_count: int
+    note: str = ""
+    pivot_intermediate_key: str | None = None
+
+
 MODEL_SPECS: dict[str, ModelSpec] = {
     "llama32_1b": ModelSpec(
         key="llama32_1b",
@@ -218,6 +229,27 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         gpu_count=1,
         note="Qwen3.5 9B",
     ),
+    "vicuna_68m": ModelSpec(
+        key="vicuna_68m",
+        model_name="double7/vicuna-68m",
+        tp_size=1,
+        gpu_count=1,
+        note="Vicuna 68M",
+    ),
+    "vicuna_7b_v13": ModelSpec(
+        key="vicuna_7b_v13",
+        model_name="lmsys/vicuna-7b-v1.3",
+        tp_size=1,
+        gpu_count=1,
+        note="Vicuna 7B v1.3",
+    ),
+    "vicuna_13b_v13": ModelSpec(
+        key="vicuna_13b_v13",
+        model_name="lmsys/vicuna-13b-v1.3",
+        tp_size=1,
+        gpu_count=1,
+        note="Vicuna 13B v1.3",
+    ),
 }
 
 
@@ -287,6 +319,35 @@ def build_chain_pairs(
                 )
             )
     return pairs
+
+
+def build_batch_spec_pairs(
+    pair_defs: list[BatchSpecPairConfig],
+) -> tuple[list[PairConfig], dict[str, str]]:
+    pairs: list[PairConfig] = []
+    pivot_intermediate_by_pair_id: dict[str, str] = {}
+    for spec in pair_defs:
+        validate_model_keys([spec.draft_key], arg_name="batch draft key")
+        validate_model_keys([spec.target_key], arg_name="batch target key")
+        pairs.append(
+            make_pair_config(
+                spec.draft_key,
+                spec.target_key,
+                pair_id=spec.pair_id,
+                tp_size=spec.tp_size,
+                gpu_count=spec.gpu_count,
+                note=spec.note,
+            )
+        )
+        if spec.pivot_intermediate_key is not None:
+            validate_model_keys(
+                [spec.pivot_intermediate_key],
+                arg_name="batch pivot intermediate key",
+            )
+            pivot_intermediate_by_pair_id[spec.pair_id] = MODEL_SPECS[
+                spec.pivot_intermediate_key
+            ].model_name
+    return pairs, pivot_intermediate_by_pair_id
 
 
 PAIRS: list[PairConfig] = [
@@ -410,6 +471,27 @@ PAIRS: list[PairConfig] = [
     #     gpu_count=4,
     #     note="Qwen3 8B draft -> 30B-A3B target",
     # ),
+]
+
+BATCH_SPEC_PAIR_CONFIGS: list[BatchSpecPairConfig] = [
+    BatchSpecPairConfig(
+        pair_id="llama32_1b_to_llama33_70b",
+        draft_key="llama32_1b",
+        target_key="llama33_70b",
+        tp_size=4,
+        gpu_count=4,
+        note="Llama 3.2 1B draft -> Llama 3.3 70B target",
+        pivot_intermediate_key="llama31_8b",
+    ),
+    BatchSpecPairConfig(
+        pair_id="vicuna_68m_to_vicuna_13b_v13",
+        draft_key="vicuna_68m",
+        target_key="vicuna_13b_v13",
+        tp_size=1,
+        gpu_count=1,
+        note="Vicuna 68M draft -> Vicuna 13B v1.3 target",
+        pivot_intermediate_key="vicuna_7b_v13",
+    ),
 ]
 
 DATASETS: list[DatasetConfig] = [
@@ -634,7 +716,7 @@ def build_python_command(
     elif method == "magicdec":
         parts.append(f"--magicdec-method {shquote(magicdec_method)}")
         parts.append(f"--magicdec-kv-budget {magicdec_kv_budget}")
-    elif method in ("adaptive_spechive", "pivot"):
+    elif method == "adaptive_spechive":
         if not adaptive_spechive_intermediate_model:
             raise SystemExit(
                 f"--method={method} requires intermediate model in generator "
@@ -643,19 +725,27 @@ def build_python_command(
         parts.append(
             f"--intermediate-model {shquote(adaptive_spechive_intermediate_model)}"
         )
-        if method == "adaptive_spechive":
-            parts.append(
-                f"--adaptive-spechive-mode {shquote(adaptive_spechive_mode)}"
+        parts.append(
+            f"--adaptive-spechive-mode {shquote(adaptive_spechive_mode)}"
+        )
+        parts.append(
+            f"--round {adaptive_spechive_rounds}"
+        )
+    elif method == "pivot":
+        if pivot_spechive and not adaptive_spechive_intermediate_model:
+            raise SystemExit(
+                "--method=pivot with --spechive requires intermediate model in "
+                "generator (pass --adaptive-spechive-intermediate-model)."
             )
+        if adaptive_spechive_intermediate_model:
             parts.append(
-                f"--round {adaptive_spechive_rounds}"
+                f"--intermediate-model {shquote(adaptive_spechive_intermediate_model)}"
             )
-        else:
-            parts.append(f"--topk_selection {pivot_topk_selection}")
-            parts.append(f"--expansion_pct {pivot_expansion_pct}")
-            parts.append(f"--round {adaptive_spechive_rounds}")
-            if pivot_spechive:
-                parts.append("--spechive")
+        parts.append(f"--topk_selection {pivot_topk_selection}")
+        parts.append(f"--expansion_pct {pivot_expansion_pct}")
+        parts.append(f"--round {adaptive_spechive_rounds}")
+        if pivot_spechive:
+            parts.append("--spechive")
     elif method == "tetris":
         if tetris_extra_proposals:
             parts.append(f"--tetris-extra-proposals {tetris_extra_proposals}")
@@ -1200,10 +1290,20 @@ def main() -> None:
             ("meta-llama/Llama-3.2-3B-Instruct", 3, "im_llama32_3b_r3"),
             ("meta-llama/Meta-Llama-3.1-8B-Instruct", 3, "im_llama31_8b_r3"),
         ]
-    else:
+    elif args.spec_method == "adaptive_spechive":
         if not args.adaptive_spechive_intermediate_model:
             raise SystemExit(
                 f"--spec-method={args.spec_method} requires "
+                "--adaptive-spechive-intermediate-model"
+            )
+        spechive_variants = [
+            (args.adaptive_spechive_intermediate_model, args.round, "")
+        ]
+    else:
+        # --spec-method=pivot
+        if args.pivot_spechive and not args.adaptive_spechive_intermediate_model:
+            raise SystemExit(
+                "--spec-method=pivot with --pivot-spechive requires "
                 "--adaptive-spechive-intermediate-model"
             )
         spechive_variants = [
@@ -1426,6 +1526,16 @@ def main() -> None:
                 # ),
             ]
         )
+        configured_pairs, configured_pivot_intermediate = build_batch_spec_pairs(
+            BATCH_SPEC_PAIR_CONFIGS
+        )
+        speculative_by_id: dict[str, PairConfig] = {
+            pair.pair_id: pair for pair in speculative_pairs
+        }
+        for pair in configured_pairs:
+            speculative_by_id[pair.pair_id] = pair
+        speculative_pairs = list(speculative_by_id.values())
+        pivot_intermediate_by_pair_id = configured_pivot_intermediate
 
         test = False
         test_samples = 5
@@ -1446,19 +1556,34 @@ def main() -> None:
             eagle_draft_tp: int | None = None,
             magicdec_method: str = "streaming",
             magicdec_kv_budget: int = 256,
+            pivot_spechive: bool | None = None,
+            adaptive_spechive_intermediate_model: str | None = None,
             tetris_extra_proposals: int = 0,
             tetris_turn_on_batch_size: int | None = None,
             time_limit_override: str,
         ) -> None:
             batch_sizes_str = str(bs)
             ktag = spec_token_tag(num_spec)
-            base_batch_dir = Path(method) / f"b{bs}" / ktag / pair.pair_id
-            base_result_subdir = Path(ktag)
-            variants = (
-                spechive_variants
-                if method in ("adaptive_spechive", "pivot")
-                else [(None, args.round, "")]
-            )
+            pivot_mode_tag = ""
+            if method == "pivot" and pivot_spechive is not None:
+                pivot_mode_tag = "pivot_spechive" if pivot_spechive else "pivot"
+
+            method_dir = Path(method) / pivot_mode_tag if pivot_mode_tag else Path(method)
+            base_batch_dir = method_dir / f"b{bs}" / ktag / pair.pair_id
+            base_result_subdir = Path(ktag) / pivot_mode_tag if pivot_mode_tag else Path(ktag)
+            if method == "adaptive_spechive":
+                variants = spechive_variants
+            elif method == "pivot" and pivot_spechive:
+                im_model = (
+                    adaptive_spechive_intermediate_model
+                    if adaptive_spechive_intermediate_model is not None
+                    else args.adaptive_spechive_intermediate_model
+                )
+                variants = [
+                    (im_model, args.round, "")
+                ]
+            else:
+                variants = [(None, args.round, "")]
             for im_model, rounds, variant_tag in variants:
                 batch_dir = (
                     base_batch_dir / variant_tag if variant_tag else base_batch_dir
@@ -1469,7 +1594,12 @@ def main() -> None:
                     else base_result_subdir
                 )
                 script_path = JOBS_ROOT / batch_dir / f"{dataset.name}.slurm"
-                suffix = f"_{ktag}" + (f"_{variant_tag}" if variant_tag else "")
+                suffix_parts = [ktag]
+                if pivot_mode_tag:
+                    suffix_parts.append(pivot_mode_tag)
+                if variant_tag:
+                    suffix_parts.append(variant_tag)
+                suffix = "_" + "_".join(suffix_parts)
 
                 script_text = render_job_script(
                     pair=pair,
@@ -1496,7 +1626,11 @@ def main() -> None:
                     adaptive_spechive_rounds=rounds,
                     pivot_topk_selection=args.topk_selection,
                     pivot_expansion_pct=args.expansion_pct,
-                    pivot_spechive=args.pivot_spechive,
+                    pivot_spechive=(
+                        args.pivot_spechive
+                        if pivot_spechive is None
+                        else pivot_spechive
+                    ),
                     tetris_extra_proposals=tetris_extra_proposals,
                     tetris_turn_on_batch_size=tetris_turn_on_batch_size,
                     repo_dir=args.repo_dir,
@@ -1511,18 +1645,39 @@ def main() -> None:
                 write_job_script(script_path, script_text)
                 written_scripts.append(script_path)
 
+        def resolve_pivot_intermediate(pair_id: str) -> str | None:
+            pair_specific = pivot_intermediate_by_pair_id.get(pair_id)
+            if pair_specific is not None:
+                return pair_specific
+            return args.adaptive_spechive_intermediate_model
+
+        include_pivot_spechive_batch = any(
+            resolve_pivot_intermediate(pair.pair_id) is not None
+            for pair in speculative_pairs
+        )
+        if (
+            args.spec_method == "pivot"
+            and args.pivot_spechive
+            and not include_pivot_spechive_batch
+        ):
+            raise SystemExit(
+                "--batch with --spec-method=pivot --pivot-spechive requires "
+                "--adaptive-spechive-intermediate-model"
+            )
+
         for bs in batch_sizes_list:
             tl = time_limit_for_batch(bs)
             for dataset in datasets:
-                for pair in speculative_pairs:
-                    _write_one(
-                        pair=pair,
-                        dataset=dataset,
-                        bs=bs,
-                        method=args.spec_method,
-                        eagle_model=None,
-                        time_limit_override=tl,
-                    )
+                if args.spec_method != "pivot":
+                    for pair in speculative_pairs:
+                        _write_one(
+                            pair=pair,
+                            dataset=dataset,
+                            bs=bs,
+                            method=args.spec_method,
+                            eagle_model=None,
+                            time_limit_override=tl,
+                        )
 
 
                 # MagicDec
@@ -1550,6 +1705,35 @@ def main() -> None:
                         tetris_turn_on_batch_size=args.tetris_turn_on_batch_size,
                         time_limit_override=tl,
                     )
+
+                # PIVOT (always)
+                for pair in speculative_pairs:
+                    _write_one(
+                        pair=pair,
+                        dataset=dataset,
+                        bs=bs,
+                        method="pivot",
+                        eagle_model=None,
+                        pivot_spechive=False,
+                        time_limit_override=tl,
+                    )
+
+                # PIVOT+SpecHive (only when intermediate model is available)
+                if include_pivot_spechive_batch:
+                    for pair in speculative_pairs:
+                        pivot_intermediate = resolve_pivot_intermediate(pair.pair_id)
+                        if pivot_intermediate is None:
+                            continue
+                        _write_one(
+                            pair=pair,
+                            dataset=dataset,
+                            bs=bs,
+                            method="pivot",
+                            eagle_model=None,
+                            pivot_spechive=True,
+                            adaptive_spechive_intermediate_model=pivot_intermediate,
+                            time_limit_override=tl,
+                        )
 
                 # Enable these if you want AR and EAGLE3 jobs as well.
                 # for pair in ar_pairs:

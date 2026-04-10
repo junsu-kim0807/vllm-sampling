@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.spec_stage_ops import sample_next_token_and_probs_processed
+from vllm.v1.spec_decode.spec_stage_runtime import EagleTreeTemplate
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
@@ -270,6 +271,67 @@ class SpecDecodeBaseProposer:
         self.tree_draft_pos_offsets = torch.arange(
             1, len(self.tree_choices) + 1, device=device, dtype=torch.int32
         ).repeat(max_batch_size, 1)
+
+    def get_tree_template(self) -> EagleTreeTemplate:
+        """Return the shared Eagle tree topology template."""
+        tree_choices = list(self.tree_choices)
+        node_order = list(range(len(tree_choices)))
+        node_index = {node: idx for idx, node in enumerate(tree_choices)}
+        parent_ids: list[int] = []
+        node_depths: list[int] = []
+        for node in tree_choices:
+            node_depths.append(len(node))
+            if len(node) <= 1:
+                parent_ids.append(-1)
+            else:
+                parent_ids.append(node_index.get(node[:-1], -1))
+        child_counts = [0] * len(tree_choices)
+        for parent_id in parent_ids:
+            if 0 <= parent_id < len(child_counts):
+                child_counts[parent_id] += 1
+        leaf_ids = [idx for idx, count in enumerate(child_counts) if count == 0]
+        return EagleTreeTemplate(
+            parent_ids=parent_ids,
+            node_depths=node_depths,
+            node_order=node_order,
+            leaf_ids=leaf_ids,
+            num_nodes=len(tree_choices),
+        )
+
+    def propose_tree_from_prefix(
+        self,
+        *,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata: SamplingMetadata,
+        prefix_rows: list[list[int]] | None = None,
+        root_token_override: torch.Tensor | None = None,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Draft a tree candidate layout from a prefix-conditioned frontier.
+
+        NOTE: Prefix conditioning should be prepared by caller using existing
+        staged prefix utilities. This API intentionally keeps flatten ordering
+        decisions outside Eagle.
+        """
+        del prefix_rows
+        drafted = self.propose(
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            token_indices_to_sample=None,
+            common_attn_metadata=common_attn_metadata,
+            sampling_metadata=sampling_metadata,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        )
+        if root_token_override is not None and drafted.numel() > 0:
+            drafted = drafted.to(torch.int32).clone()
+            drafted[:, 0] = root_token_override.to(torch.int32).view(-1)
+        return drafted.to(torch.int32)
 
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:

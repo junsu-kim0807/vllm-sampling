@@ -176,11 +176,16 @@ from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.pivot import PivotProposer
 from vllm.v1.spec_decode.spec_stage_ops import (
+    collapse_family_paths_to_origin,
+    collapse_family_tree_sampled_to_family_paths,
     collapse_pivot_expanded_sampled_to_origin,
+    get_unselected_cleanup_rows,
     sanitize_hybrid_bundle_for_metadata,
+    validate_root_only_pivot_expansion,
 )
 from vllm.v1.spec_decode.spec_stage_runtime import (
     HybridProposalBundle,
+    PivotExpandedTreePlan,
     PivotExpansionPlan,
     expand_hybrid_bundle_for_pivot_expansion,
 )
@@ -572,6 +577,13 @@ class GPUModelRunner(
                     device=self.device,
                     runner=self,
                 )
+                if self.speculative_config.requires_aux_hidden_state_outputs():
+                    aux_from_delegate = getattr(
+                        self.drafter._main_delegate(),  # type: ignore[attr-defined]
+                        "eagle3_use_aux_hidden_state",
+                        False,
+                    )
+                    self.use_aux_hidden_state_outputs = bool(aux_from_delegate)
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
                     vllm_config=self.vllm_config,
@@ -1836,6 +1848,11 @@ class GPUModelRunner(
                 assert pb.expansion_plan is pivot_plan, (
                     "pending bundle expansion_plan must match pending pivot plan"
                 )
+                if pb.tree_plan is not None:
+                    self._dit_debug_assert(
+                        len(pb.num_draft_tokens) == len(pb.tree_plan.families),
+                        "pivot_tree_prepare_inputs_family_count_match",
+                    )
                 assert int(pb.draft_token_ids.shape[0]) == int(
                     pb.cu_num_draft_tokens[-1].item()
                 ), "bundle flat draft rows must match cu_num_draft_tokens tail"
@@ -2081,8 +2098,9 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, EagleProposer):
-                    if self.drafter.kv_cache_gid == kv_cache_gid:
+                drafter_kv_gid = getattr(self.drafter, "kv_cache_gid", None)
+                if drafter_kv_gid is not None:
+                    if int(drafter_kv_gid) == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
@@ -3242,6 +3260,15 @@ class GPUModelRunner(
                 sampling_metadata=round_sm,
                 use_draft_probs=use_draft_probs,
             )
+            root_only_check = validate_root_only_pivot_expansion(
+                prefix_rows=prefix_rows,
+                expansion_plan=proposal.expansion_plan,
+            )
+            self._dit_debug_assert(
+                root_only_check.ok,
+                root_only_check.code,
+                detail=f"round={round_idx}, {root_only_check.detail}",
+            )
             if proposal.expansion_plan is not None and pivot_expansion_plan is None:
                 pivot_expansion_plan = proposal.expansion_plan
             eff_bs = int(proposal.tokens.shape[0])
@@ -3349,7 +3376,7 @@ class GPUModelRunner(
         )
 
         remaining_cap = max(
-            (max(0, cap - len(prefix_rows[b])) for b in range(batch_size)),
+            (max(0, cap - len(prefix_rows[b])) for b in range(len(prefix_rows))),
             default=0,
         )
         tail_len = min(L, remaining_cap)
@@ -3493,6 +3520,59 @@ class GPUModelRunner(
         )
         return out, bundle
 
+    def run_hierarchical_tree_verification_rounds(
+        self,
+        *,
+        drafter: AdaptiveSpechiveProposer,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata: SamplingMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, HybridProposalBundle]:
+        """Tree-family Pivot path reusing flat verifier contracts."""
+        out, bundle = self.run_hierarchical_verification_rounds(
+            drafter=drafter,
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            token_indices_to_sample=token_indices_to_sample,
+            common_attn_metadata=common_attn_metadata,
+            sampling_metadata=sampling_metadata,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        )
+        tree_plan: PivotExpandedTreePlan | None = None
+        flatten_fn = getattr(drafter, "_flatten_family_trees_for_verification", None)
+        if callable(flatten_fn) and bundle.expansion_plan is not None:
+            # Reconstruct expanded-row tensor from bundle, not scheduler-collapsed out.
+            eff_rows = len(bundle.num_draft_tokens)
+            cap = int(bundle.max_spec_len)
+            out_exp = torch.full(
+                (eff_rows, cap),
+                PLACEHOLDER_TOKEN_ID,
+                dtype=torch.int32,
+                device=target_token_ids.device,
+            )
+            offset = 0
+            for b, row_len in enumerate(bundle.num_draft_tokens):
+                valid = min(cap, int(row_len))
+                if valid > 0:
+                    out_exp[b, :valid] = bundle.draft_token_ids[offset : offset + valid].to(
+                        torch.int32
+                    )
+                offset += int(row_len)
+            _, tree_plan = flatten_fn(
+                proposal_tokens=out_exp,
+                expansion_plan=bundle.expansion_plan,
+            )
+        if tree_plan is not None:
+            bundle = dataclass_replace(bundle, tree_plan=tree_plan)
+        return out, bundle
+
     def _validate_hybrid_spec_bundle(
         self,
         bundle: HybridProposalBundle,
@@ -3526,6 +3606,17 @@ class GPUModelRunner(
             "spechive_bundle_sanitize",
             {**pre, **post, "info": info},
         )
+        if sanitized is not None and sanitized.tree_plan is not None:
+            tree_nodes = int(sanitized.tree_plan.template.num_nodes)
+            self._dit_debug_assert(
+                len(sanitized.num_draft_tokens) == len(sanitized.tree_plan.families),
+                "pivot_tree_bundle_family_batch_match",
+            )
+            self._dit_debug_assert(
+                all(int(n) == tree_nodes for n in sanitized.num_draft_tokens),
+                "pivot_tree_bundle_uniform_num_nodes",
+                detail=f"num_nodes={tree_nodes}, lens={sanitized.num_draft_tokens}",
+            )
         if sanitized is None:
             logger.warning("Dropping hybrid bundle: %s.", info)
             return None
@@ -3622,8 +3713,10 @@ class GPUModelRunner(
             verity_sm,
         )
         expansion_plan: PivotExpansionPlan | None = None
+        tree_plan: PivotExpandedTreePlan | None = None
         if bundle is not None:
             expansion_plan = bundle.expansion_plan
+            tree_plan = bundle.tree_plan
         if expansion_plan is None:
             expansion_plan = self.pending_pivot_expansion_plan
         if expansion_plan is None and spec_decode_metadata is not None:
@@ -3633,7 +3726,43 @@ class GPUModelRunner(
             if spec_decode_metadata is not None
             else None
         )
-        if expansion_plan is not None:
+        if tree_plan is not None:
+            reduced = collapse_family_tree_sampled_to_family_paths(
+                sampler_output.sampled_token_ids,
+                plan=tree_plan,
+                num_draft_tokens=num_draft_for_collapse,
+            )
+            sampler_output.sampled_token_ids, selected_rows = collapse_family_paths_to_origin(
+                sampler_output.sampled_token_ids,
+                plan=tree_plan,
+                reduced=reduced,
+            )
+            if expansion_plan is not None:
+                selected = set(int(r) for r in selected_rows)
+                cleanup = set(
+                    get_unselected_cleanup_rows(
+                        expansion_plan=expansion_plan,
+                        selected_rows=selected_rows,
+                    )
+                )
+                all_rows = {
+                    int(r)
+                    for fam in expansion_plan.families
+                    for r in fam.expanded_rows
+                }
+                self._dit_debug_assert(
+                    selected.isdisjoint(cleanup),
+                    "pivot_tree_selected_cleanup_disjoint",
+                )
+                self._dit_debug_assert(
+                    selected | cleanup == all_rows,
+                    "pivot_tree_selected_cleanup_partition",
+                    detail=(
+                        f"selected={sorted(selected)}, "
+                        f"cleanup={sorted(cleanup)}, all={sorted(all_rows)}"
+                    ),
+                )
+        elif expansion_plan is not None:
             sampler_output.sampled_token_ids = collapse_pivot_expanded_sampled_to_origin(
                 sampler_output.sampled_token_ids,
                 expansion_plan,
@@ -4542,9 +4671,7 @@ class GPUModelRunner(
                 <= self.effective_drafter_max_model_len
             )
             use_gpu_toks = (
-                spec_config.use_eagle()
-                or spec_config.uses_draft_model()
-                or spec_config.uses_extract_hidden_states()
+                spec_config.uses_gpu_sampled_tokens_for_drafting()
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
@@ -4920,7 +5047,7 @@ class GPUModelRunner(
                 next_token_ids, valid_sampled_tokens_count
             )
 
-        elif spec_config.use_eagle() or spec_config.uses_draft_model():
+        elif spec_config.uses_model_based_drafter():
             assert isinstance(
                 self.drafter,
                 EagleProposer | DraftModelProposer | AdaptiveSpechiveProposer | PivotProposer,
@@ -5830,8 +5957,7 @@ class GPUModelRunner(
                 hidden_states = outputs
 
             if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
+                self.speculative_config.uses_model_based_drafter()
                 or self.speculative_config.uses_extract_hidden_states()
             ):
                 assert isinstance(
@@ -6396,10 +6522,7 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
-        ):
+        if self.speculative_config and self.speculative_config.uses_model_based_drafter():
             assert isinstance(
                 self.drafter,
                 EagleProposer | DraftModelProposer | AdaptiveSpechiveProposer | PivotProposer,
@@ -6559,10 +6682,17 @@ class GPUModelRunner(
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
         if self.speculative_config and (
-            self.speculative_config.use_eagle()
+            self.speculative_config.uses_model_based_drafter()
             or self.speculative_config.uses_extract_hidden_states()
         ):
-            assert isinstance(self.drafter, EagleProposer | ExtractHiddenStatesProposer)
+            assert isinstance(
+                self.drafter,
+                EagleProposer
+                | DraftModelProposer
+                | AdaptiveSpechiveProposer
+                | PivotProposer
+                | ExtractHiddenStatesProposer,
+            )
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
     def calculate_reorder_batch_threshold(self) -> None:

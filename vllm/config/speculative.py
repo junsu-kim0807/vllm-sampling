@@ -3,6 +3,7 @@
 
 import ast
 import copy
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 MagicDecMethod = Literal["streaming"]
@@ -11,6 +12,13 @@ AdaptiveSpechiveMode = Literal[
     "inter_verification",
     "hierarchical_verification",
 ]
+PivotProposalEngine = Literal["draft_model", "eagle3_head"]
+PivotVerificationPipeline = Literal[
+    "target_only",
+    "intermediate_then_target",
+    "intermediate_tree_then_target_tree",
+]
+PivotHiddenStateSource = Literal["target", "intermediate"]
 
 from pydantic import Field, SkipValidation, model_validator
 from typing_extensions import Self
@@ -67,6 +75,10 @@ SpeculativeMethod = Literal[
 
 # Must stay aligned with vllm.v1.sample.rejection_sampler.MAX_SPEC_LEN
 _ADAPTIVE_CASCADE_MAX_SPEC_LEN = 128
+
+
+def _chain_spec_token_tree(num_tokens: int) -> str:
+    return str([(i + 1) * (0,) for i in range(num_tokens)])
 
 
 @config
@@ -237,6 +249,16 @@ class SpeculativeConfig:
     """Enable pivot staged D=>I rounds followed by authoritative D=>T verification."""
     pivot_spechive_num_rounds: int = Field(default=1, ge=1)
     """Number of intermediate D=>I rounds per outer pivot_spechive iteration."""
+    pivot_proposal_engine: PivotProposalEngine | None = None
+    """Optional explicit proposal engine override for pivot runtime."""
+    pivot_verification_pipeline: PivotVerificationPipeline | None = None
+    """Optional explicit verification pipeline override for pivot runtime."""
+    pivot_hidden_state_source: PivotHiddenStateSource | None = None
+    """Optional hidden-state source for pivot eagle3-head proposal engine."""
+    pivot_use_eagle_tree: bool = False
+    """Enable root-expanded Pivot families with Eagle tree layout contracts."""
+    pivot_family_collapse_policy: Literal["max_accept_len"] = "max_accept_len"
+    """Policy used when collapsing expanded families back to origin rows."""
 
     # MagicDec: optional draft-only attention metadata rewrite (see
     # vllm/v1/attention/magicdec_streaming_attention.py).
@@ -260,9 +282,9 @@ class SpeculativeConfig:
         the final hidden states.
         """
         factors: list[Any] = []
-        # Eagle3 and extract_hidden_states affect the computation graph because
-        # they return intermediate hidden states in addition to the final hidden state.
-        uses_aux_hidden_states = self.method in ("eagle3", "extract_hidden_states")
+        # Aux-hidden outputs affect model graph shape for eagle3/extract-hidden and
+        # pivot modes that route proposal through eagle3_head.
+        uses_aux_hidden_states = self.requires_aux_hidden_state_outputs()
         factors.append(uses_aux_hidden_states)
 
         factors.append(self.magicdec)
@@ -278,11 +300,17 @@ class SpeculativeConfig:
             factors.append(self.adaptive_spechive_enable_inter_verification)
             factors.append(self.adaptive_spechive_enable_hierarchical_verification)
         elif self.method == "pivot":
+            mode = self.get_pivot_runtime_mode()
             factors.append(self.intermediate_model)
             factors.append(self.pivot_topk_selection)
             factors.append(self.pivot_expansion_pct)
             factors.append(self.pivot_spechive)
             factors.append(self.pivot_spechive_num_rounds)
+            factors.append(self.pivot_use_eagle_tree)
+            factors.append(self.pivot_family_collapse_policy)
+            factors.append(mode.proposal_engine)
+            factors.append(mode.verification_pipeline)
+            factors.append(mode.hidden_state_source)
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
@@ -297,6 +325,52 @@ class SpeculativeConfig:
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
+
+    @dataclass(frozen=True)
+    class PivotRuntimeMode:
+        proposal_engine: PivotProposalEngine
+        verification_pipeline: PivotVerificationPipeline
+        hidden_state_source: PivotHiddenStateSource | None
+
+    def get_pivot_runtime_mode(self) -> PivotRuntimeMode:
+        """Return normalized pivot runtime mode (proposal × verification)."""
+        if self.method != "pivot":
+            raise ValueError("get_pivot_runtime_mode is only valid for method='pivot'.")
+
+        proposal_engine = self.pivot_proposal_engine
+        if proposal_engine is None:
+            if self.draft_model_config is not None and (
+                getattr(self.draft_model_config.hf_config, "method", None) == "eagle3"
+                or "eagle3" in str(self.draft_model_config.model).lower()
+            ):
+                proposal_engine = "eagle3_head"
+            else:
+                proposal_engine = "draft_model"
+
+        verification_pipeline = self.pivot_verification_pipeline
+        if verification_pipeline is None:
+            if self.pivot_use_eagle_tree and self.pivot_spechive:
+                verification_pipeline = "intermediate_tree_then_target_tree"
+            else:
+                verification_pipeline = (
+                    "intermediate_then_target" if self.pivot_spechive else "target_only"
+                )
+
+        hidden_state_source = self.pivot_hidden_state_source
+        if proposal_engine == "draft_model":
+            hidden_state_source = None
+        elif hidden_state_source is None:
+            hidden_state_source = (
+                "intermediate"
+                if verification_pipeline == "intermediate_then_target"
+                else "target"
+            )
+
+        return SpeculativeConfig.PivotRuntimeMode(
+            proposal_engine=proposal_engine,
+            verification_pipeline=verification_pipeline,
+            hidden_state_source=hidden_state_source,
+        )
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
@@ -984,11 +1058,15 @@ class SpeculativeConfig:
         if self.method == "pivot" and self.parallel_drafting:
             raise ValueError("parallel_drafting is not supported with pivot.")
         if self.method == "pivot":
+            mode = self.get_pivot_runtime_mode()
             if self.pivot_topk_selection not in (2, 5):
                 raise ValueError(
                     "pivot_topk_selection must be one of {2, 5}."
                 )
-            if self.pivot_spechive:
+            if (
+                mode.verification_pipeline == "intermediate_then_target"
+                or mode.verification_pipeline == "intermediate_tree_then_target_tree"
+            ):
                 chunk_len = self.num_speculative_tokens
                 rounds = self.pivot_spechive_num_rounds
                 outer_upper = chunk_len + rounds * (chunk_len + 1)
@@ -999,6 +1077,76 @@ class SpeculativeConfig:
                         f"exceeds {_ADAPTIVE_CASCADE_MAX_SPEC_LEN} (sampler limit). "
                         "Reduce num_speculative_tokens or pivot_spechive_num_rounds."
                     )
+            if (
+                (
+                    mode.verification_pipeline == "intermediate_then_target"
+                    or mode.verification_pipeline == "intermediate_tree_then_target_tree"
+                )
+                and self.intermediate_model_config is None
+            ):
+                raise ValueError(
+                    "pivot intermediate* pipeline requires intermediate_model."
+                )
+            if (
+                self.pivot_use_eagle_tree
+                and mode.proposal_engine != "eagle3_head"
+            ):
+                raise ValueError(
+                    "pivot_use_eagle_tree=True requires pivot_proposal_engine='eagle3_head'."
+                )
+            if (
+                not self.pivot_use_eagle_tree
+                and mode.verification_pipeline == "intermediate_tree_then_target_tree"
+            ):
+                raise ValueError(
+                    "intermediate_tree_then_target_tree is only valid when "
+                    "pivot_use_eagle_tree=True."
+                )
+            if (
+                mode.proposal_engine == "eagle3_head"
+                and (
+                    mode.verification_pipeline == "intermediate_then_target"
+                    or mode.verification_pipeline == "intermediate_tree_then_target_tree"
+                )
+                and mode.hidden_state_source != "intermediate"
+            ):
+                raise ValueError(
+                    "pivot eagle3_head + intermediate* pipeline requires "
+                    "pivot_hidden_state_source='intermediate'."
+                )
+            if (
+                mode.proposal_engine == "eagle3_head"
+                and mode.verification_pipeline == "target_only"
+                and mode.hidden_state_source != "target"
+            ):
+                raise ValueError(
+                    "pivot eagle3_head + target_only requires "
+                    "pivot_hidden_state_source='target'."
+                )
+            if (
+                not self.pivot_use_eagle_tree
+                and self.speculative_token_tree is not None
+                and self.speculative_token_tree != _chain_spec_token_tree(self.num_speculative_tokens)
+            ):
+                raise ValueError(
+                    "linear pivot only supports root-only expansion with chain semantics "
+                    "after root; non-chain speculative_token_tree is not supported."
+                )
+            if (
+                self.pivot_family_collapse_policy != "max_accept_len"
+            ):
+                raise ValueError(
+                    "Unsupported pivot_family_collapse_policy. "
+                    "Only 'max_accept_len' is supported."
+                )
+            if (
+                mode.proposal_engine == "eagle3_head"
+                and self.disable_padded_drafter_batch
+            ):
+                raise ValueError(
+                    "pivot + eagle3_head currently requires padded drafter batch "
+                    "(disable_padded_drafter_batch=False)."
+                )
 
         aux_hidden_states_supported = [
             "llama",
@@ -1038,9 +1186,25 @@ class SpeculativeConfig:
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
-            self.method in ("draft_model", "adaptive_spechive", "pivot")
+            self.method in ("draft_model", "adaptive_spechive")
             and self.target_model_config is not None
             and self.draft_model_config is not None
+        ):
+            target_vocab_size = self.target_model_config.get_vocab_size()
+            draft_vocab_size = self.draft_model_config.get_vocab_size()
+            if target_vocab_size != draft_vocab_size:
+                raise ValueError(
+                    f"Target and draft model should have the same vocabulary size. "
+                    f"Target model vocab_size={target_vocab_size}. "
+                    f"Draft model vocab_size={draft_vocab_size}. "
+                    f"Using models with different tokenizers can cause out-of-bounds "
+                    f"errors during speculative decoding."
+                )
+        if (
+            self.method == "pivot"
+            and self.target_model_config is not None
+            and self.draft_model_config is not None
+            and self.get_pivot_runtime_mode().proposal_engine == "draft_model"
         ):
             target_vocab_size = self.target_model_config.get_vocab_size()
             draft_vocab_size = self.draft_model_config.get_vocab_size()
@@ -1099,7 +1263,7 @@ class SpeculativeConfig:
         if self.parallel_drafting:
             # For parallel drafting, we need one new slot per 'masked' token
             slots_per_req = self.num_speculative_tokens - 1
-        if self.uses_draft_model():
+        if self.uses_model_based_drafter():
             # For draft model-based speculation, we need one new slot per request
             # Since we do not slice the draft tokens
             slots_per_req += 1
@@ -1114,7 +1278,11 @@ class SpeculativeConfig:
             chunk_len = self.num_speculative_tokens
             rounds = self.adaptive_spechive_num_rounds
             return chunk_len + rounds * (chunk_len + 1)
-        if self.method == "pivot" and self.pivot_spechive:
+        if (
+            self.method == "pivot"
+            and self.get_pivot_runtime_mode().verification_pipeline
+            in ("intermediate_then_target", "intermediate_tree_then_target_tree")
+        ):
             chunk_len = self.num_speculative_tokens
             rounds = self.pivot_spechive_num_rounds
             return chunk_len + rounds * (chunk_len + 1)
@@ -1124,10 +1292,33 @@ class SpeculativeConfig:
         return self.method in ("eagle", "eagle3", "mtp")
 
     def uses_draft_model(self) -> bool:
-        return self.method in ("draft_model", "adaptive_spechive", "pivot")
+        if self.method == "pivot":
+            return self.get_pivot_runtime_mode().proposal_engine == "draft_model"
+        return self.method in ("draft_model", "adaptive_spechive")
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"
+
+    def uses_model_based_drafter(self) -> bool:
+        if self.method == "pivot":
+            return True
+        return self.use_eagle() or self.uses_draft_model()
+
+    def uses_gpu_sampled_tokens_for_drafting(self) -> bool:
+        if self.method == "pivot":
+            return True
+        return (
+            self.use_eagle()
+            or self.uses_draft_model()
+            or self.uses_extract_hidden_states()
+        )
+
+    def requires_aux_hidden_state_outputs(self) -> bool:
+        if self.method in ("eagle3", "extract_hidden_states"):
+            return True
+        if self.method == "pivot":
+            return self.get_pivot_runtime_mode().proposal_engine == "eagle3_head"
+        return False
 
     def __repr__(self) -> str:
         method = self.method
@@ -1143,14 +1334,19 @@ class SpeculativeConfig:
             rounds = self.adaptive_spechive_num_rounds
             return f"SpeculativeConfig({method=}, {model=}, {im=}, {acm=}, {num_spec_tokens=}, {rounds=})"
         if method == "pivot":
+            mode = self.get_pivot_runtime_mode()
             im = self.intermediate_model
             topk = self.pivot_topk_selection
             pct = self.pivot_expansion_pct
             psp = self.pivot_spechive
             rounds = self.pivot_spechive_num_rounds
+            use_tree = self.pivot_use_eagle_tree
             return (
                 "SpeculativeConfig("
                 f"{method=}, {model=}, {im=}, {num_spec_tokens=}, "
-                f"{topk=}, {pct=}, {psp=}, {rounds=})"
+                f"{topk=}, {pct=}, {psp=}, {rounds=}, {use_tree=}, "
+                f"proposal_engine={mode.proposal_engine}, "
+                f"verification_pipeline={mode.verification_pipeline}, "
+                f"hidden_state_source={mode.hidden_state_source})"
             )
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"

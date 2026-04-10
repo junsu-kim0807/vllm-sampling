@@ -15,8 +15,13 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSamp
 from vllm.v1.sample.sampler import Sampler, _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.spec_stage_runtime import (
+    EagleTreeTemplate,
+    FamilyTreeReduceResult,
+    IntermediateRoundState,
     HybridProposalBundle,
+    PivotExpandedTreePlan,
     PivotExpansionPlan,
+    PivotTreeFamily,
 )
 
 
@@ -49,6 +54,257 @@ def get_target_verification_accepted_draft_prefix_lens(
             cnt += 1
         out.append(cnt)
     return out
+
+
+def build_family_flatten_order(
+    *,
+    families: list[PivotTreeFamily],
+    template: EagleTreeTemplate,
+    origin_batch_size: int,
+) -> PivotExpandedTreePlan:
+    """Build family-major flat ordering metadata (single source of truth)."""
+    sorted_families = sorted(families, key=lambda fam: fam.family_id)
+    flat_to_family_ids: list[int] = []
+    flat_to_node_ids: list[int] = []
+    family_flat_spans: list[tuple[int, int]] = []
+    expanded_to_origin: list[int] = []
+    start = 0
+    for fam in sorted_families:
+        end = start + int(template.num_nodes)
+        family_flat_spans.append((start, end))
+        expanded_to_origin.append(int(fam.origin_row))
+        flat_to_family_ids.extend([int(fam.family_id)] * int(template.num_nodes))
+        flat_to_node_ids.extend(list(template.node_order))
+        start = end
+    plan = PivotExpandedTreePlan(
+        families=sorted_families,
+        template=template,
+        flat_to_family_ids=flat_to_family_ids,
+        flat_to_node_ids=flat_to_node_ids,
+        family_flat_spans=family_flat_spans,
+        expanded_to_origin=expanded_to_origin,
+        origin_batch_size=int(origin_batch_size),
+    )
+    for fam_idx, (s, e) in enumerate(plan.family_flat_spans):
+        assert int(e - s) == int(plan.template.num_nodes), (
+            "pivot_tree_family_span_width "
+            f"fam={fam_idx}, span=({s},{e}), num_nodes={plan.template.num_nodes}"
+        )
+        assert all(fid == fam_idx for fid in plan.flat_to_family_ids[s:e]), (
+            "pivot_tree_family_major_ids "
+            f"fam={fam_idx}"
+        )
+        assert plan.flat_to_node_ids[s:e] == plan.template.node_order, (
+            "pivot_tree_node_order_match "
+            f"fam={fam_idx}"
+        )
+    return plan
+
+
+def _is_ancestor_chain_accepted(
+    node_id: int,
+    *,
+    accepted_mask: list[bool],
+    template: EagleTreeTemplate,
+) -> bool:
+    cur = int(node_id)
+    while cur >= 0:
+        if cur >= len(accepted_mask) or not accepted_mask[cur]:
+            return False
+        if cur >= len(template.parent_ids):
+            return False
+        cur = int(template.parent_ids[cur])
+    return True
+
+
+def _infer_chosen_leaf_id(
+    *,
+    accepted_mask: list[bool],
+    template: EagleTreeTemplate,
+) -> int:
+    chosen_leaf = -1
+    chosen_depth = -1
+    for leaf_id in template.leaf_ids:
+        leaf = int(leaf_id)
+        if not _is_ancestor_chain_accepted(
+            leaf, accepted_mask=accepted_mask, template=template
+        ):
+            continue
+        depth = (
+            int(template.node_depths[leaf])
+            if 0 <= leaf < len(template.node_depths)
+            else -1
+        )
+        if depth > chosen_depth:
+            chosen_leaf = leaf
+            chosen_depth = depth
+    if chosen_leaf >= 0:
+        return chosen_leaf
+    # Fallback: deepest accepted node that has accepted ancestor chain.
+    best = -1
+    best_depth = -1
+    for node_id, is_acc in enumerate(accepted_mask):
+        if not is_acc:
+            continue
+        if not _is_ancestor_chain_accepted(
+            node_id, accepted_mask=accepted_mask, template=template
+        ):
+            continue
+        depth = (
+            int(template.node_depths[node_id])
+            if node_id < len(template.node_depths)
+            else -1
+        )
+        if depth > best_depth:
+            best = int(node_id)
+            best_depth = depth
+    return best
+
+
+def _reconstruct_node_path(
+    *,
+    leaf_id: int,
+    template: EagleTreeTemplate,
+    accepted_mask: list[bool],
+) -> list[int]:
+    if leaf_id < 0:
+        return []
+    path_rev: list[int] = []
+    cur = int(leaf_id)
+    while cur >= 0:
+        if cur >= len(accepted_mask) or not accepted_mask[cur]:
+            break
+        path_rev.append(cur)
+        if cur >= len(template.parent_ids):
+            break
+        cur = int(template.parent_ids[cur])
+    return list(reversed(path_rev))
+
+
+def collapse_family_tree_sampled_to_family_paths(
+    sampled_token_ids: torch.Tensor,
+    *,
+    plan: PivotExpandedTreePlan,
+    num_draft_tokens: list[int] | None = None,
+) -> FamilyTreeReduceResult:
+    """Interpret flat verifier outputs back into per-family tree-path semantics."""
+    num_families = len(plan.families)
+    if num_families == 0:
+        return FamilyTreeReduceResult(
+            accepted_rows=[],
+            accepted_lens=[],
+            chosen_leaf_ids=[],
+            recovery_token_ids=[],
+        )
+    if sampled_token_ids.shape[0] < num_families:
+        return FamilyTreeReduceResult(
+            accepted_rows=[],
+            accepted_lens=[],
+            chosen_leaf_ids=[],
+            recovery_token_ids=[],
+        )
+    if num_draft_tokens is None or len(num_draft_tokens) != num_families:
+        num_draft_tokens = [int(plan.template.num_nodes)] * num_families
+    accepted_lens = get_target_verification_accepted_draft_prefix_lens(
+        sampled_token_ids[:num_families],
+        num_draft_tokens,
+        placeholder_token_id=PLACEHOLDER_TOKEN_ID,
+    )
+    accepted_rows: list[list[int]] = []
+    chosen_leaf_ids: list[int] = []
+    recovery_token_ids: list[int] = []
+    reconstructed_lens: list[int] = []
+    for fam_idx in range(num_families):
+        row = sampled_token_ids[fam_idx]
+        accepted_len_raw = int(accepted_lens[fam_idx])
+        span_start, span_end = plan.family_flat_spans[fam_idx]
+        node_order = plan.flat_to_node_ids[span_start:span_end]
+        node_to_pos = {int(node_id): pos for pos, node_id in enumerate(node_order)}
+        accepted_mask = [False] * int(plan.template.num_nodes)
+        max_local = min(accepted_len_raw, len(node_order))
+        for local_pos in range(max_local):
+            node_id = int(node_order[local_pos])
+            if 0 <= node_id < len(accepted_mask):
+                accepted_mask[node_id] = True
+        chosen_leaf = _infer_chosen_leaf_id(
+            accepted_mask=accepted_mask,
+            template=plan.template,
+        )
+        chosen_leaf_ids.append(chosen_leaf)
+        path_node_ids = _reconstruct_node_path(
+            leaf_id=chosen_leaf,
+            template=plan.template,
+            accepted_mask=accepted_mask,
+        )
+        path_tokens: list[int] = []
+        for node_id in path_node_ids:
+            if node_id not in node_to_pos:
+                continue
+            pos = int(node_to_pos[node_id])
+            if pos < row.shape[0]:
+                tok = int(row[pos].item())
+                if tok != PLACEHOLDER_TOKEN_ID:
+                    path_tokens.append(tok)
+        accepted_rows.append(path_tokens)
+        reconstructed_lens.append(len(path_tokens))
+        assert reconstructed_lens[fam_idx] <= accepted_len_raw, (
+            "pivot_tree_reconstructed_len_le_raw "
+            f"fam={fam_idx}, raw={accepted_len_raw}, recon={reconstructed_lens[fam_idx]}"
+        )
+        assert all(tok != PLACEHOLDER_TOKEN_ID for tok in accepted_rows[fam_idx]), (
+            "pivot_tree_reconstructed_no_placeholder "
+            f"fam={fam_idx}"
+        )
+        assert chosen_leaf_ids[fam_idx] < 0 or len(path_node_ids) == reconstructed_lens[fam_idx], (
+            "pivot_tree_path_token_count_match "
+            f"fam={fam_idx}, leaf={chosen_leaf_ids[fam_idx]}"
+        )
+        recovery_idx = min(accepted_len_raw, int(row.shape[0]) - 1)
+        rec = int(row[recovery_idx].item()) if recovery_idx >= 0 else PLACEHOLDER_TOKEN_ID
+        recovery_token_ids.append(rec)
+    return FamilyTreeReduceResult(
+        accepted_rows=accepted_rows,
+        accepted_lens=reconstructed_lens,
+        chosen_leaf_ids=chosen_leaf_ids,
+        recovery_token_ids=recovery_token_ids,
+    )
+
+
+def collapse_family_paths_to_origin(
+    sampled_token_ids: torch.Tensor,
+    *,
+    plan: PivotExpandedTreePlan,
+    reduced: FamilyTreeReduceResult,
+) -> tuple[torch.Tensor, list[int]]:
+    """Collapse families to origin rows by max accepted length then root rank."""
+    if sampled_token_ids.shape[0] < len(plan.families):
+        return sampled_token_ids, list(range(int(sampled_token_ids.shape[0])))
+    selected_family_rows: list[int] = []
+    by_origin: dict[int, list[PivotTreeFamily]] = {}
+    for fam in plan.families:
+        by_origin.setdefault(int(fam.origin_row), []).append(fam)
+    for origin_row in range(int(plan.origin_batch_size)):
+        fams = by_origin.get(origin_row, [])
+        if not fams:
+            fallback_row = next(
+                (idx for idx, org in enumerate(plan.expanded_to_origin) if org == origin_row),
+                0,
+            )
+            selected_family_rows.append(int(fallback_row))
+            continue
+        # Max accepted length, then lower root rank.
+        best = min(
+            fams,
+            key=lambda fam: (
+                -int(reduced.accepted_lens[fam.family_id]),
+                int(fam.root_rank),
+                int(fam.family_id),
+            ),
+        )
+        selected_family_rows.append(int(best.family_id))
+    device = sampled_token_ids.device
+    idx = torch.tensor(selected_family_rows, device=device, dtype=torch.long)
+    return sampled_token_ids.index_select(0, idx), selected_family_rows
 
 
 def collapse_pivot_expanded_sampled_to_origin(
@@ -106,6 +362,54 @@ def collapse_pivot_expanded_sampled_to_origin(
     device = sampled_token_ids.device
     idx = torch.tensor(selected_rows, device=device, dtype=torch.long)
     return sampled_token_ids.index_select(0, idx)
+
+
+def validate_root_only_pivot_expansion(
+    *,
+    prefix_rows: list[list[int]],
+    expansion_plan: PivotExpansionPlan | None,
+) -> DitDebugCheckResult:
+    has_only_root_prefix = all(len(row) == 0 for row in prefix_rows)
+    if expansion_plan is None:
+        return DitDebugCheckResult(
+            code="check_root_only_pivot_expansion",
+            ok=True,
+            detail="no expansion plan",
+        )
+    return DitDebugCheckResult(
+        code="check_root_only_pivot_expansion",
+        ok=has_only_root_prefix,
+        detail=f"has_only_root_prefix={has_only_root_prefix}",
+    )
+
+
+def expand_intermediate_state_for_pivot_plan(
+    state: IntermediateRoundState,
+    plan: PivotExpansionPlan,
+) -> IntermediateRoundState:
+    """Expand provisional frontier metadata according to pivot expansion plan."""
+    if state.frontier_metadata is None:
+        return state
+    if len(state.frontier_metadata) == plan.expanded_batch_size:
+        return state
+    expanded_frontier = [state.frontier_metadata[o] for o in plan.expanded_to_origin]
+    state.frontier_metadata = [dict(item) for item in expanded_frontier]
+    return state
+
+
+def get_unselected_cleanup_rows(
+    *,
+    expansion_plan: PivotExpansionPlan,
+    selected_rows: list[int],
+) -> list[int]:
+    """Return expanded rows that must be cleaned after target collapse."""
+    selected = set(int(r) for r in selected_rows)
+    cleanup: list[int] = []
+    for fam in expansion_plan.families:
+        for row_idx in fam.expanded_rows:
+            if row_idx not in selected:
+                cleanup.append(int(row_idx))
+    return cleanup
 
 
 @dataclass(frozen=True)
