@@ -180,6 +180,8 @@ from vllm.v1.spec_decode.spec_stage_ops import (
     collapse_family_paths_to_origin,
     collapse_family_tree_sampled_to_family_paths,
     collapse_pivot_expanded_sampled_to_origin,
+    get_accepted_draft_lens_from_sampled_tokens,
+    get_target_verification_accepted_draft_prefix_lens,
     get_unselected_cleanup_rows,
     remap_hybrid_bundle_rows_for_metadata,
     sanitize_hybrid_bundle_for_metadata,
@@ -231,6 +233,84 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 logger = init_logger(__name__)
+
+
+def _pivot_origin_row_num_draft_tokens(
+    expansion_plan: PivotExpansionPlan,
+    spec_decode_metadata: SpecDecodeMetadata,
+) -> list[int]:
+    """Per-origin draft widths for post-collapse rows (one row per origin request)."""
+    meta_nd = spec_decode_metadata.num_draft_tokens
+    b_origin = (
+        int(expansion_plan.origin_batch_size)
+        if expansion_plan.origin_batch_size > 0
+        else max(expansion_plan.expanded_to_origin) + 1
+    )
+    out: list[int] = []
+    for o in range(b_origin):
+        if (
+            expansion_plan.origin_to_base_row is not None
+            and o < len(expansion_plan.origin_to_base_row)
+            and int(expansion_plan.origin_to_base_row[o]) >= 0
+        ):
+            j = int(expansion_plan.origin_to_base_row[o])
+        else:
+            j = next(
+                idx
+                for idx, org in enumerate(expansion_plan.expanded_to_origin)
+                if org == o
+            )
+        out.append(int(meta_nd[j]))
+    return out
+
+
+def _post_collapse_num_draft_per_origin(
+    expansion_plan: PivotExpansionPlan | None,
+    tree_plan: PivotExpandedTreePlan | None,
+    spec_decode_metadata: SpecDecodeMetadata,
+) -> list[int] | None:
+    """Per-origin ``num_draft_tokens`` for rows after family collapse (batch size B)."""
+    if expansion_plan is not None:
+        return _pivot_origin_row_num_draft_tokens(
+            expansion_plan, spec_decode_metadata
+        )
+    if tree_plan is not None:
+        meta_nd = spec_decode_metadata.num_draft_tokens
+        b = int(tree_plan.origin_batch_size)
+        out: list[int] = []
+        for o in range(b):
+            j = next(
+                idx
+                for idx, org in enumerate(tree_plan.expanded_to_origin)
+                if org == o
+            )
+            if j >= len(meta_nd):
+                return None
+            out.append(int(meta_nd[j]))
+        return out
+    return None
+
+
+def _pivot_mean_accepted_prefix_len(
+    sampled_token_ids: torch.Tensor,
+    num_draft_tokens: list[int] | None,
+) -> tuple[float, int]:
+    """Mean accepted draft-prefix length per row (``get_target_verification_...`` when aligned)."""
+    nrows = int(sampled_token_ids.shape[0])
+    if nrows == 0:
+        return 0.0, 0
+    if num_draft_tokens is not None and len(num_draft_tokens) == nrows:
+        lens = get_target_verification_accepted_draft_prefix_lens(
+            sampled_token_ids,
+            num_draft_tokens,
+            placeholder_token_id=PLACEHOLDER_TOKEN_ID,
+        )
+    else:
+        lens = get_accepted_draft_lens_from_sampled_tokens(
+            sampled_token_ids,
+            placeholder_token_id=PLACEHOLDER_TOKEN_ID,
+        )
+    return (sum(lens) / len(lens), nrows)
 
 
 def _pivot_plan_sm_indices(plan: PivotExpansionPlan) -> list[int]:
@@ -4007,6 +4087,24 @@ class GPUModelRunner(
             if spec_decode_metadata is not None
             else None
         )
+        log_pivot_accept_len = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "pivot"
+            and spec_decode_metadata is not None
+            and (tree_plan is not None or expansion_plan is not None)
+            and num_draft_for_collapse is not None
+            and len(num_draft_for_collapse)
+            == int(sampler_output.sampled_token_ids.shape[0])
+        )
+        pre_collapse_accept_mean: float | None = None
+        pre_collapse_accept_rows: int | None = None
+        if log_pivot_accept_len:
+            pre_collapse_accept_mean, pre_collapse_accept_rows = (
+                _pivot_mean_accepted_prefix_len(
+                    sampler_output.sampled_token_ids,
+                    num_draft_for_collapse,
+                )
+            )
         if tree_plan is not None:
             reduced = collapse_family_tree_sampled_to_family_paths(
                 sampler_output.sampled_token_ids,
@@ -4048,6 +4146,41 @@ class GPUModelRunner(
                 sampler_output.sampled_token_ids,
                 expansion_plan,
                 num_draft_tokens=num_draft_for_collapse,
+            )
+        if log_pivot_accept_len and pre_collapse_accept_mean is not None:
+            post_nd = _post_collapse_num_draft_per_origin(
+                expansion_plan,
+                tree_plan,
+                spec_decode_metadata,
+            )
+            post_sampled = sampler_output.sampled_token_ids
+            post_b = int(post_sampled.shape[0])
+            post_nd_use = (
+                post_nd
+                if post_nd is not None and len(post_nd) == post_b
+                else None
+            )
+            post_mean, post_n = _pivot_mean_accepted_prefix_len(
+                post_sampled,
+                post_nd_use,
+            )
+            origin_b = -1
+            if expansion_plan is not None and int(expansion_plan.origin_batch_size) > 0:
+                origin_b = int(expansion_plan.origin_batch_size)
+            elif tree_plan is not None:
+                origin_b = int(tree_plan.origin_batch_size)
+            logger.warning(
+                "PIVOT_DEBUG accept_len: pre_collapse_mean=%.4f pre_rows=%d "
+                "post_collapse_mean=%.4f post_rows=%d origin_batch=%d "
+                "expanded_batch=%d tree=%s post_nd_aligned=%s",
+                pre_collapse_accept_mean,
+                int(pre_collapse_accept_rows or 0),
+                post_mean,
+                post_n,
+                origin_b,
+                len(num_draft_for_collapse or []),
+                tree_plan is not None,
+                post_nd_use is not None,
             )
         self.pending_pivot_expansion_plan = None
         if bundle is not None and bundle.mode == "hierarchical_verification":
