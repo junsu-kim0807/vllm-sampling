@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import os
 from dataclasses import replace
 from importlib.util import find_spec
 from typing import cast
@@ -53,6 +54,10 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+# Set to 1 to log _draft_attn_layer_names vs per_layer_attn_metadata keys in propose().
+_DRAFT_ATTN_METADATA_DEBUG_ENV = "VLLM_DEBUG_DRAFT_ATTN_METADATA"
+
 
 class SpecDecodeBaseProposer:
     def __init__(
@@ -416,21 +421,64 @@ class SpecDecodeBaseProposer:
         view = self._slot_mapping_buffer[:num_tokens]
         return {name: view for name in self._draft_attn_layer_names}
 
+    def _log_draft_attn_metadata_debug(
+        self,
+        per_layer_attn_metadata: dict[str, object],
+        tag: str,
+    ) -> None:
+        if os.environ.get(_DRAFT_ATTN_METADATA_DEBUG_ENV, "0") != "1":
+            return
+        expected = getattr(self, "_draft_attn_layer_names", None) or set()
+        logger.warning(
+            "%s DRAFT_ATTN_LAYER_NAMES sample=%s",
+            tag,
+            sorted(expected)[:8],
+        )
+        logger.warning(
+            "%s PER_LAYER_ATTN_METADATA_KEYS sample=%s",
+            tag,
+            sorted(per_layer_attn_metadata.keys())[:8],
+        )
+
     def _check_per_layer_attn_metadata_contract(
         self,
         per_layer_attn_metadata: dict[str, object],
     ) -> None:
         """Fail fast when forward context lacks metadata for any draft layer."""
-        expected = getattr(self, "_draft_attn_layer_names", None)
-        if not expected:
-            return
+        expected = set(getattr(self, "_draft_attn_layer_names", None) or ())
+        grouped = {ln for g in self.draft_attn_groups for ln in g.layer_names}
         actual = set(per_layer_attn_metadata.keys())
-        missing = set(expected) - actual
-        if missing:
+
+        if not per_layer_attn_metadata:
+            if expected:
+                raise RuntimeError(
+                    "No per-layer attention metadata was built, but "
+                    "_draft_attn_layer_names is non-empty "
+                    f"(sample={sorted(expected)[:8]}). "
+                    "Likely draft_attn_groups is empty: check initialize_attn_backend "
+                    "and KV cache group membership for this proposer."
+                )
+            if grouped:
+                raise RuntimeError(
+                    "per_layer_attn_metadata is empty but draft_attn_groups "
+                    "lists layer names; metadata rebuild loop did not populate keys."
+                )
+            return
+
+        missing_expected = expected - actual
+        if missing_expected:
             raise RuntimeError(
                 "Missing per-layer attention metadata for draft forward "
                 f"(forward will call attention/KV ops without context). "
-                f"Missing layer names (sample): {sorted(missing)[:32]}"
+                f"Missing layer names (sample): {sorted(missing_expected)[:32]}"
+            )
+
+        missing_grouped = grouped - actual
+        if missing_grouped:
+            raise RuntimeError(
+                "per_layer_attn_metadata is missing keys for layers listed in "
+                "draft_attn_groups "
+                f"(sample): {sorted(missing_grouped)[:32]}"
             )
 
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -602,6 +650,9 @@ class SpecDecodeBaseProposer:
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
+        self._log_draft_attn_metadata_debug(
+            per_layer_attn_metadata, "eagle.propose:after_first_metadata_loop"
+        )
         self._check_per_layer_attn_metadata_contract(per_layer_attn_metadata)
 
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
@@ -630,6 +681,11 @@ class SpecDecodeBaseProposer:
         }
         if self.pass_hidden_states_to_model:
             model_kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+
+        self._log_draft_attn_metadata_debug(
+            per_layer_attn_metadata, "eagle.propose:before_first_set_forward_context"
+        )
+        self._check_per_layer_attn_metadata_contract(per_layer_attn_metadata)
 
         with set_forward_context(
             per_layer_attn_metadata,
@@ -848,6 +904,12 @@ class SpecDecodeBaseProposer:
                 for layer_name in attn_group.layer_names:
                     per_layer_attn_metadata[layer_name] = attn_metadata
 
+            self._log_draft_attn_metadata_debug(
+                per_layer_attn_metadata,
+                f"eagle.propose:after_inner_metadata_loop:step={token_index}",
+            )
+            self._check_per_layer_attn_metadata_contract(per_layer_attn_metadata)
+
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
             self._set_positions(batch_size, clamped_positions)
@@ -869,6 +931,12 @@ class SpecDecodeBaseProposer:
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+
+            self._log_draft_attn_metadata_debug(
+                per_layer_attn_metadata,
+                f"eagle.propose:before_inner_set_forward_context:step={token_index}",
+            )
+            self._check_per_layer_attn_metadata_contract(per_layer_attn_metadata)
 
             with set_forward_context(
                 per_layer_attn_metadata,
