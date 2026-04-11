@@ -220,7 +220,10 @@ class IntermediatePivotModelProposer(DraftModelProposer):
     def _get_model(self) -> nn.Module:
         from vllm.compilation.backends import set_model_tag
 
-        temp_vllm_config = create_vllm_config_for_draft_model(self.vllm_config)
+        temp_vllm_config = create_vllm_config_for_draft_model(
+            self.vllm_config,
+            compile_cache_namespace="intermediate_model",
+        )
         with set_model_tag("intermediate_model"):
             return get_model(
                 vllm_config=temp_vllm_config,

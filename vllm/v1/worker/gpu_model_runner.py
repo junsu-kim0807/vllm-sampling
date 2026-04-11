@@ -5623,20 +5623,22 @@ class GPUModelRunner(
                 ),
             )
         elif isinstance(draft_token_ids, torch.Tensor):
-            if spec_config is not None and getattr(spec_config, "tetris", False):
-                logger.warning_once(
-                    "TETRIS is enabled but draft logprobs are missing "
-                    "(drafter.last_draft_logprobs is None); using full draft "
-                    "tensor rows without TETRIS. Typical causes: "
-                    "parallel_drafting, use_local_argmax_reduction, or a proposer "
-                    "path that does not record per-step draft logprobs.",
-                    scope="local",
-                )
             num_spec = (
                 spec_config.num_speculative_tokens
                 if spec_config is not None
                 else draft_token_ids.shape[1]
             )
+            if spec_config is not None and getattr(spec_config, "tetris", False):
+                logger.warning_once(
+                    "TETRIS is enabled but draft logprobs are missing "
+                    "(drafter.last_draft_logprobs is None); falling back "
+                    "to base_k tokens without TETRIS. Typical causes: "
+                    "parallel_drafting, use_local_argmax_reduction, or a "
+                    "proposer path that does not record per-step logprobs.",
+                    scope="local",
+                )
+                extra = getattr(spec_config, "tetris_extra_proposals", 0)
+                num_spec = max(1, num_spec - extra)
             draft_token_ids = [
                 draft_token_ids[i, :num_spec].tolist()
                 for i in range(draft_token_ids.shape[0])

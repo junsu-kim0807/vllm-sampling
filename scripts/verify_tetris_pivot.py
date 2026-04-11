@@ -74,25 +74,52 @@ def smoke_tetris() -> bool:
         return True
 
     device = torch.device("cpu")
-    b, k = 3, 4
-    logp = torch.randn(b, k, device=device)
-    out = select_proposals(capacity=b * k, draft_token_logprobs=logp, num_draft_tokens=[k] * b)
-    assert len(out) == b, out
-    assert all(0 <= x <= k for x in out), out
+    b, K, extra = 3, 5, 2
+    base_k = K - extra  # 3
+    logp = torch.randn(b, K, device=device)
 
-    tok = torch.randint(0, 1000, (b, k), device=device)
+    # select_proposals with sub-full capacity
+    cap = base_k * b
+    out = select_proposals(capacity=cap, draft_token_logprobs=logp, num_draft_tokens=[K] * b)
+    assert len(out) == b, out
+    assert all(0 <= x <= K for x in out), out
+
+    tok = torch.randint(0, 1000, (b, K), device=device)
+
+    # apply_tetris with extra_proposals > 0 (capacity = base_k * B < B*K)
     trimmed = apply_tetris(
         tok,
         logp,
-        num_speculative_tokens=k,
-        extra_proposals=0,
+        num_speculative_tokens=K,
+        extra_proposals=extra,
         turn_on_batch_size=None,
     )
     assert len(trimmed) == b
     for i, row in enumerate(trimmed):
-        assert len(row) <= k
+        assert len(row) <= K
         if row:
             assert row == tok[i, : len(row)].tolist()
+
+    # apply_tetris with extra=0 → full grid → all K (no-op)
+    trimmed_noop = apply_tetris(
+        tok,
+        logp,
+        num_speculative_tokens=K,
+        extra_proposals=0,
+        turn_on_batch_size=None,
+    )
+    assert all(len(r) == K for r in trimmed_noop), trimmed_noop
+
+    # Fallback: batch < turn_on → base_k tokens
+    fallback = apply_tetris(
+        tok,
+        logp,
+        num_speculative_tokens=K,
+        extra_proposals=extra,
+        turn_on_batch_size=100,  # b=3 < 100
+    )
+    assert all(len(r) == base_k for r in fallback), fallback
+
     print("[tetris] smoke OK (select_proposals + apply_tetris)")
     return True
 
@@ -147,10 +174,10 @@ def e2e_tetris(*, target_model: str, draft_model: str) -> bool:
         speculative_config={
             "method": "draft_model",
             "model": draft_model,
-            "num_speculative_tokens": 3,
+            "num_speculative_tokens": 5,
             "max_model_len": 512,
             "tetris": True,
-            "tetris_extra_proposals": 0,
+            "tetris_extra_proposals": 2,
             "tetris_turn_on_batch_size": None,
         },
     )

@@ -1173,11 +1173,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tetris-extra-proposals",
         type=int,
-        default=0,
+        default=2,
         help=(
-            "When --spec-method=tetris: added to batch_size * num_spec_tokens for "
-            "TETRIS capacity. Non-negative values are a no-op; use negative to "
-            "cap below B*K."
+            "When --spec-method=tetris: extra draft tokens beyond base_k. "
+            "Drafter produces K = num_spec_tokens total; "
+            "capacity = (K - extra) * batch_size (default: 2)."
         ),
     )
     parser.add_argument(

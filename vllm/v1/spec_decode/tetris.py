@@ -12,6 +12,14 @@ This module implements TETRIS for vLLM's V1 engine.
 The core algorithm selects, for every scheduler step, which subset of
 draft tokens across the entire batch to actually send to the target model
 for verification, subject to a total *capacity* constraint.
+
+Key formula (from the paper):
+    actual_draft_len (K) = base_k + extra_proposals
+    capacity = base_k × batch_size = (K − extra_proposals) × batch_size
+
+The drafter produces K tokens per request, but the target model only
+verifies capacity = base_k × B of them.  TETRIS decides *which* prefix
+depths to keep per request so the expected accepted tokens is maximised.
 """
 
 from __future__ import annotations
@@ -76,7 +84,7 @@ def select_proposals(
 
     Args:
         capacity: Total number of draft-token verification slots for the
-            batch.
+            batch.  Must satisfy ``0 < capacity <= B * K``.
         draft_token_logprobs: Float tensor of shape
             ``[batch_size, max_spec_len]`` containing the log-probability
             (under the draft model) of each selected draft token.
@@ -91,7 +99,7 @@ def select_proposals(
     batch_size, max_spec_len = draft_token_logprobs.shape
     device = draft_token_logprobs.device
 
-    if batch_size == 0 or capacity == 0:
+    if batch_size == 0 or capacity <= 0:
         return [0] * batch_size
 
     # 1. Mask padding positions
@@ -143,18 +151,23 @@ def apply_tetris(
 ) -> list[list[int]]:
     """Apply TETRIS to a batch of draft proposals.
 
-    Converts a dense ``[batch_size, num_speculative_tokens]`` tensor of draft
-    token IDs into a ragged ``list[list[int]]`` where each inner list has been
-    trimmed to the TETRIS-optimal length for that request.
+    Converts a dense ``[batch_size, K]`` tensor of draft token IDs into a
+    ragged ``list[list[int]]`` where each inner list has been trimmed to the
+    TETRIS-optimal length for that request.
+
+    The drafter generates ``K = num_speculative_tokens`` tokens per request
+    (including ``extra_proposals`` additional positions).  The verification
+    budget is ``base_k × batch_size`` where ``base_k = K − extra_proposals``.
 
     Args:
-        draft_token_ids: Integer tensor ``[batch_size, num_spec_tokens]``.
-        draft_token_logprobs: Float tensor ``[batch_size, num_spec_tokens]``
+        draft_token_ids: Integer tensor ``[batch_size, K]``.
+        draft_token_logprobs: Float tensor ``[batch_size, K]``
             of log-probabilities of the selected draft tokens at each step.
-        num_speculative_tokens: Maximum number of draft tokens per request.
-        extra_proposals: Added to ``batch_size * num_speculative_tokens`` to
-            form ``capacity``. Non-negative values cannot exceed the ``B*K``
-            grid and are thus a no-op vs ``0``; negative values tighten the cap.
+        num_speculative_tokens: Total draft length K produced by the drafter,
+            equal to ``base_k + extra_proposals``.
+        extra_proposals: Number of extra draft tokens beyond base_k.
+            ``capacity = (K − extra_proposals) × B``.  Must be
+            ``0 <= extra_proposals < num_speculative_tokens``.
         turn_on_batch_size: If set, TETRIS is only active when
             ``batch_size >= turn_on_batch_size``.
 
@@ -163,35 +176,55 @@ def apply_tetris(
         request *i*, truncated to the TETRIS-optimal length.
     """
     batch_size = draft_token_ids.shape[0]
+    K = num_speculative_tokens
+    base_k = K - extra_proposals
 
-    # Respect turn-on threshold.
+    if base_k <= 0:
+        logger.warning_once(
+            "TETRIS: extra_proposals (%d) >= num_speculative_tokens (%d); "
+            "base_k would be %d. Falling back to full draft length.",
+            extra_proposals,
+            K,
+            base_k,
+            scope="local",
+        )
+        base_k = K
+
+    # When TETRIS is inactive (batch too small), fall back to base_k tokens
+    # (equivalent to vanilla with num_speculative_tokens = base_k).
     if turn_on_batch_size is not None and batch_size < turn_on_batch_size:
         logger.debug(
-            "TETRIS: batch_size=%d < turn_on_batch_size=%d; skipping.",
+            "TETRIS: batch_size=%d < turn_on_batch_size=%d; "
+            "falling back to base_k=%d tokens per request.",
             batch_size,
             turn_on_batch_size,
+            base_k,
         )
         return [
-            draft_token_ids[i, :num_speculative_tokens].tolist()
+            draft_token_ids[i, :base_k].tolist()
             for i in range(batch_size)
         ]
 
-    capacity = batch_size * num_speculative_tokens + extra_proposals
-    total_slots = batch_size * num_speculative_tokens
-    # When capacity >= total_slots, top-k spans the entire B×K grid; scatter_max
-    # per request is always num_speculative_tokens — identical to vanilla.
+    # Paper formula: capacity = base_k × batch_size
+    # The drafter produced K = base_k + extra tokens; TETRIS selects from
+    # the wider K-token grid but caps verification at base_k × B slots.
+    capacity = base_k * batch_size
+    total_slots = K * batch_size
+
     if capacity >= total_slots:
         logger.info_once(
-            "TETRIS: verification capacity >= batch_size * num_speculative_tokens "
-            "(full draft grid). Selection is a no-op vs vanilla spec-decode. "
-            "Use negative tetris_extra_proposals for a sub-full budget, or a fixed "
-            "global cap if you need batch-size-dependent allocation. "
+            "TETRIS: capacity (%d) >= total draft slots (%d). "
+            "extra_proposals=%d is 0 or base_k >= K; selection is equivalent "
+            "to vanilla. Set extra_proposals > 0 for TETRIS to have effect. "
             "Set %s=1 for per-step stats.",
+            capacity,
+            total_slots,
+            extra_proposals,
             _TETRIS_DEBUG_ENV,
             scope="local",
         )
 
-    num_draft_tokens_list = [num_speculative_tokens] * batch_size
+    num_draft_tokens_list = [K] * batch_size
 
     optimal_lengths = select_proposals(
         capacity=capacity,
@@ -201,30 +234,33 @@ def apply_tetris(
 
     result: list[list[int]] = []
     for i, length in enumerate(optimal_lengths):
-        length = max(0, min(length, num_speculative_tokens))
+        length = max(0, min(length, K))
         result.append(draft_token_ids[i, :length].tolist())
 
-    total_before = batch_size * num_speculative_tokens
     total_after = sum(len(r) for r in result)
     logger.debug(
-        "TETRIS: batch_size=%d  capacity=%d  tokens %d->%d  (%.1f%% of budget)",
+        "TETRIS: batch=%d K=%d base_k=%d extra=%d capacity=%d "
+        "draft_tokens %d->%d (%.1f%% of full grid)",
         batch_size,
+        K,
+        base_k,
+        extra_proposals,
         capacity,
-        total_before,
+        total_slots,
         total_after,
-        100.0 * total_after / max(1, total_before),
+        100.0 * total_after / max(1, total_slots),
     )
     if _tetris_debug_enabled():
         logger.info(
-            "TETRIS debug: batch_size=%d num_spec=%d extra_proposals=%d "
-            "capacity=%d total_slots=%d total_draft_tokens %d->%d "
+            "TETRIS debug: batch=%d K=%d base_k=%d extra=%d "
+            "capacity=%d grid=%d selected=%d "
             "per_request_lengths=%s",
             batch_size,
-            num_speculative_tokens,
+            K,
+            base_k,
             extra_proposals,
             capacity,
             total_slots,
-            total_before,
             total_after,
             optimal_lengths,
         )

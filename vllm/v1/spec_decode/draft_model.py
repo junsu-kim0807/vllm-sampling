@@ -58,7 +58,10 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         # so we load them with a modified vllm config
         from vllm.compilation.backends import set_model_tag
 
-        temp_vllm_config = create_vllm_config_for_draft_model(self.vllm_config)
+        temp_vllm_config = create_vllm_config_for_draft_model(
+            self.vllm_config,
+            compile_cache_namespace="draft_model",
+        )
         with set_model_tag("draft_model"):
             model = get_model(
                 vllm_config=temp_vllm_config,

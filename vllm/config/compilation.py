@@ -418,6 +418,10 @@ class CompilationConfig:
     (NOT multiprocess safe)\n
     Defaults to `VLLM_COMPILE_CACHE_SAVE_FORMAT` if not specified.
     """
+    compile_cache_namespace: str = ""
+    """Salts :meth:`compute_hash` so logically distinct model submodules (e.g.
+    ``draft_model`` vs ``intermediate_model``) cannot share Inductor/AOT caches
+    when architecture and sliced ``method=\"draft_model\"`` configs coincide."""
     backend: str = ""
     """The backend for compilation. It needs to be a string:
 

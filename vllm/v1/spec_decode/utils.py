@@ -151,12 +151,18 @@ def compute_new_slot_mapping(
 
 def create_vllm_config_for_draft_model(
     target_model_vllm_config: VllmConfig,
+    *,
+    compile_cache_namespace: str = "",
 ) -> VllmConfig:
     """The vllm_config is configured for the target model, e.g.
     its quant_config and parallel_config. But the draft model is potentially
     quantized differently, and has potentially different tensor_parallel_size.
     This function creates a new vllm_config configured for the drafter.
     The vllm_config is useful when loading the draft model with get_model().
+
+    ``compile_cache_namespace`` (e.g. ``\"draft_model\"`` or ``\"intermediate_model\"``)
+    must differ per :func:`vllm.compilation.backends.set_model_tag` / ``prefix``
+    so Inductor/AOT caches cannot reuse graphs with wrong hard-coded layer names.
     """
     old = target_model_vllm_config
     assert old.speculative_config is not None, "speculative_config is not set"
@@ -164,11 +170,16 @@ def create_vllm_config_for_draft_model(
     new_parallel_config = replace(
         old_spec_config.draft_parallel_config, rank=old.parallel_config.rank
     )
+    new_compilation = replace(
+        old.compilation_config,
+        compile_cache_namespace=compile_cache_namespace,
+    )
     new: VllmConfig = replace(
         old,
         quant_config=None,
         parallel_config=new_parallel_config,
         model_config=old_spec_config.draft_model_config,
+        compilation_config=new_compilation,
     )
     return new
 

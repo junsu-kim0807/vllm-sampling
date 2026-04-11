@@ -174,14 +174,16 @@ class SpeculativeConfig:
     Reference: https://arxiv.org/pdf/2502.15197
     """
     tetris_extra_proposals: int = 0
-    """Delta added to the natural per-step budget ``batch_size *
-    num_speculative_tokens`` (``capacity = B*K + tetris_extra_proposals``).
+    """Number of *extra* draft tokens beyond the base speculative length.
 
-    The selector only considers at most ``B*K`` draft positions (one per
-    speculative depth). Therefore **non-negative values do not change**
-    allocation versus ``0``: the top-``k`` step already uses the full grid.
-    Use a **negative** value to set a tighter cap (``capacity < B*K``) so
-    TETRIS actually drops low-confidence prefixes on some requests."""
+    The drafter produces ``K = num_speculative_tokens`` tokens per request,
+    where ``K = base_k + tetris_extra_proposals``.  The verification capacity
+    is ``base_k × batch_size = (K − extra) × B``.
+
+    Set this to a positive value (paper experiments: 1, 2, 3) so the drafter
+    explores deeper drafts while TETRIS trims the budget to ``base_k × B``.
+    With ``extra_proposals = 0`` the capacity equals the full grid and TETRIS
+    is a no-op versus vanilla speculative decoding."""
     tetris_turn_on_batch_size: int | None = None
     """Minimum number of concurrently decoded requests required before TETRIS
     is activated.  When the live batch is smaller than this threshold, plain
