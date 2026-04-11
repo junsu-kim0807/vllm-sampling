@@ -267,6 +267,28 @@ def _split_flat_tokens_by_lengths(
     return rows
 
 
+def pivot_expansion_indices_fit_prepare_batch(
+    plan: PivotExpansionPlan,
+    num_reqs: int,
+) -> bool:
+    """True if each expanded row maps to a valid origin index for the current batch.
+
+    Pending pivot bundles are produced for the batch shape at propose time; if
+    ``num_reqs`` shrinks or rows are reordered between steps, ``expanded_to_origin``
+    may point outside ``[0, num_reqs)`` and must not drive expanded metadata.
+    """
+    if num_reqs <= 0:
+        return False
+    if plan.expanded_batch_size <= 0:
+        return False
+    if len(plan.expanded_to_origin) != plan.expanded_batch_size:
+        return False
+    for o in plan.expanded_to_origin:
+        if int(o) < 0 or int(o) >= num_reqs:
+            return False
+    return True
+
+
 def _split_probs_by_lengths(
     flat: torch.Tensor, lengths: list[int]
 ) -> list[torch.Tensor]:

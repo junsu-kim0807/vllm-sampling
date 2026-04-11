@@ -16,12 +16,25 @@ for verification, subject to a total *capacity* constraint.
 
 from __future__ import annotations
 
-import logging
+import os
 from typing import Optional
 
 import torch
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+_TETRIS_DEBUG_ENV = "VLLM_TETRIS_DEBUG"
+
+
+def _tetris_debug_enabled() -> bool:
+    return os.getenv(_TETRIS_DEBUG_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 # Lazy import so the rest of vLLM loads even when torch-scatter is absent.
 _scatter_max = None
@@ -139,7 +152,9 @@ def apply_tetris(
         draft_token_logprobs: Float tensor ``[batch_size, num_spec_tokens]``
             of log-probabilities of the selected draft tokens at each step.
         num_speculative_tokens: Maximum number of draft tokens per request.
-        extra_proposals: Additional capacity slots beyond the natural budget.
+        extra_proposals: Added to ``batch_size * num_speculative_tokens`` to
+            form ``capacity``. Non-negative values cannot exceed the ``B*K``
+            grid and are thus a no-op vs ``0``; negative values tighten the cap.
         turn_on_batch_size: If set, TETRIS is only active when
             ``batch_size >= turn_on_batch_size``.
 
@@ -162,6 +177,20 @@ def apply_tetris(
         ]
 
     capacity = batch_size * num_speculative_tokens + extra_proposals
+    total_slots = batch_size * num_speculative_tokens
+    # When capacity >= total_slots, top-k spans the entire B×K grid; scatter_max
+    # per request is always num_speculative_tokens — identical to vanilla.
+    if capacity >= total_slots:
+        logger.info_once(
+            "TETRIS: verification capacity >= batch_size * num_speculative_tokens "
+            "(full draft grid). Selection is a no-op vs vanilla spec-decode. "
+            "Use negative tetris_extra_proposals for a sub-full budget, or a fixed "
+            "global cap if you need batch-size-dependent allocation. "
+            "Set %s=1 for per-step stats.",
+            _TETRIS_DEBUG_ENV,
+            scope="local",
+        )
+
     num_draft_tokens_list = [num_speculative_tokens] * batch_size
 
     optimal_lengths = select_proposals(
@@ -185,5 +214,19 @@ def apply_tetris(
         total_after,
         100.0 * total_after / max(1, total_before),
     )
+    if _tetris_debug_enabled():
+        logger.info(
+            "TETRIS debug: batch_size=%d num_spec=%d extra_proposals=%d "
+            "capacity=%d total_slots=%d total_draft_tokens %d->%d "
+            "per_request_lengths=%s",
+            batch_size,
+            num_speculative_tokens,
+            extra_proposals,
+            capacity,
+            total_slots,
+            total_before,
+            total_after,
+            optimal_lengths,
+        )
 
     return result

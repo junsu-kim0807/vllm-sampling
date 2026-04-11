@@ -68,10 +68,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--tetris-extra-proposals",
         type=int,
-        default=2,
+        default=0,
         help=(
-            "When --method=tetris: extra verification slots beyond "
-            "batch_size * num_spec_tokens (default: 0)."
+            "When --method=tetris: added to batch_size * num_spec_tokens to form "
+            "TETRIS capacity. Non-negative values are a no-op (grid has at most "
+            "B*K cells). Use a negative integer to cap below B*K so selection "
+            "differs from vanilla."
         ),
     )
     p.add_argument(

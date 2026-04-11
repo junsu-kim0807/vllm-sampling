@@ -188,6 +188,7 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     PivotExpandedTreePlan,
     PivotExpansionPlan,
     expand_hybrid_bundle_for_pivot_expansion,
+    pivot_expansion_indices_fit_prepare_batch,
 )
 from vllm.v1.spec_decode.spec_stage_utils import slice_sampling_metadata_for_subbatch
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -1837,6 +1838,31 @@ class GPUModelRunner(
                     num_decode_draft_tokens[req_idx] = len(draft_token_ids)
             pivot_plan = self.pending_pivot_expansion_plan
             pb = self.pending_hybrid_spec_bundle
+            # Expanded pivot bundles are indexed by origin rows from propose-time;
+            # if the scheduled batch shrinks, expanded_to_origin can go out of range.
+            if (
+                pivot_plan is not None
+                and pb is not None
+                and pivot_plan.expanded_batch_size > 0
+                and len(pivot_plan.expanded_to_origin) == pivot_plan.expanded_batch_size
+                and len(pb.num_draft_tokens) == pivot_plan.expanded_batch_size
+            ):
+                if pb.expansion_plan is not pivot_plan:
+                    self._clear_pending_pivot_hybrid_at_prepare_boundary(
+                        "bundle.expansion_plan != pending_pivot_expansion_plan",
+                    )
+                    pivot_plan, pb = None, None
+                elif not pivot_expansion_indices_fit_prepare_batch(pivot_plan, num_reqs):
+                    max_o = (
+                        max(pivot_plan.expanded_to_origin)
+                        if pivot_plan.expanded_to_origin
+                        else -1
+                    )
+                    self._clear_pending_pivot_hybrid_at_prepare_boundary(
+                        "expanded_to_origin does not fit current batch",
+                        detail=f"num_reqs={num_reqs}, max_origin_index={max_o}",
+                    )
+                    pivot_plan, pb = None, None
             use_pivot_expanded = (
                 pivot_plan is not None
                 and pb is not None
@@ -3103,6 +3129,28 @@ class GPUModelRunner(
         self.pending_hybrid_spec_bundle = bundle
         self.pending_pivot_expansion_plan = (
             bundle.expansion_plan if bundle is not None else None
+        )
+
+    def _clear_pending_pivot_hybrid_at_prepare_boundary(
+        self, reason: str, *, detail: str | None = None
+    ) -> None:
+        """Drop runner + drafter pivot pending state when it cannot match this step."""
+        self.pending_hybrid_spec_bundle = None
+        self.pending_pivot_expansion_plan = None
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "pivot"
+        ):
+            discard_pending_state = getattr(
+                self.drafter, "discard_pending_hierarchical_verification_state", None
+            )
+            if callable(discard_pending_state):
+                discard_pending_state()
+        suffix = f" ({detail})" if detail else ""
+        logger.warning(
+            "Clearing pending pivot hybrid bundle/plan at prepare boundary: %s%s",
+            reason,
+            suffix,
         )
 
     def take_pending_hybrid_spec_bundle(self) -> HybridProposalBundle | None:
@@ -5188,6 +5236,15 @@ class GPUModelRunner(
                 ),
             )
         elif isinstance(draft_token_ids, torch.Tensor):
+            if spec_config is not None and getattr(spec_config, "tetris", False):
+                logger.warning_once(
+                    "TETRIS is enabled but draft logprobs are missing "
+                    "(drafter.last_draft_logprobs is None); using full draft "
+                    "tensor rows without TETRIS. Typical causes: "
+                    "parallel_drafting, use_local_argmax_reduction, or a proposer "
+                    "path that does not record per-step draft logprobs.",
+                    scope="local",
+                )
             num_spec = (
                 spec_config.num_speculative_tokens
                 if spec_config is not None

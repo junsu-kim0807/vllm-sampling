@@ -21,7 +21,19 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     PivotExpansionPlan,
     PivotTreeFamily,
     StagedHiddenStateBundle,
+    pivot_expansion_indices_fit_prepare_batch,
 )
+
+
+def test_pivot_expansion_indices_fit_prepare_batch() -> None:
+    plan = PivotExpansionPlan(
+        expanded_to_origin=[0, 1],
+        families=[],
+        expanded_batch_size=2,
+    )
+    assert pivot_expansion_indices_fit_prepare_batch(plan, num_reqs=2)
+    assert not pivot_expansion_indices_fit_prepare_batch(plan, num_reqs=1)
+    assert not pivot_expansion_indices_fit_prepare_batch(plan, num_reqs=0)
 
 
 def test_validate_root_only_pivot_expansion_rejects_non_root_prefix() -> None:

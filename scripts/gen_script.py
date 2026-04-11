@@ -1175,8 +1175,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "When --spec-method=tetris: extra verification slots beyond "
-            "batch_size * num_spec_tokens (default: 0)."
+            "When --spec-method=tetris: added to batch_size * num_spec_tokens for "
+            "TETRIS capacity. Non-negative values are a no-op; use negative to "
+            "cap below B*K."
         ),
     )
     parser.add_argument(
