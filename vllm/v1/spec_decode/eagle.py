@@ -416,6 +416,23 @@ class SpecDecodeBaseProposer:
         view = self._slot_mapping_buffer[:num_tokens]
         return {name: view for name in self._draft_attn_layer_names}
 
+    def _check_per_layer_attn_metadata_contract(
+        self,
+        per_layer_attn_metadata: dict[str, object],
+    ) -> None:
+        """Fail fast when forward context lacks metadata for any draft layer."""
+        expected = getattr(self, "_draft_attn_layer_names", None)
+        if not expected:
+            return
+        actual = set(per_layer_attn_metadata.keys())
+        missing = set(expected) - actual
+        if missing:
+            raise RuntimeError(
+                "Missing per-layer attention metadata for draft forward "
+                f"(forward will call attention/KV ops without context). "
+                f"Missing layer names (sample): {sorted(missing)[:32]}"
+            )
+
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
         """Initialize cudagraph dispatcher keys for eagle.
 
@@ -584,6 +601,8 @@ class SpecDecodeBaseProposer:
             )
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
+
+        self._check_per_layer_attn_metadata_contract(per_layer_attn_metadata)
 
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(num_tokens)

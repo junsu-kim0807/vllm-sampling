@@ -21,7 +21,8 @@ import torch
 import torch.nn as nn
 from typing_extensions import override
 
-from vllm.config import VllmConfig, replace
+from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
@@ -125,6 +126,8 @@ def _hv_clone_cad(cad: CommonAttentionMetadata) -> CommonAttentionMetadata:
 class IntermediateDraftModelProposer(DraftModelProposer):
     """Loads the intermediate verifier weights under a distinct module prefix."""
 
+    _INTERMEDIATE_PREFIX = "intermediate_model."
+
     @override
     def _get_model(self) -> nn.Module:
         from vllm.compilation.backends import set_model_tag
@@ -136,6 +139,47 @@ class IntermediateDraftModelProposer(DraftModelProposer):
                 prefix="intermediate_model",
             )
         return model
+
+    @override
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
+        all_attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,  # type: ignore[type-abstract]
+        )
+        intermediate_attn_layer_names = {
+            name
+            for name in all_attn_layers.keys()
+            if name.startswith(self._INTERMEDIATE_PREFIX)
+        }
+        if not intermediate_attn_layer_names:
+            sample = sorted(all_attn_layers.keys())[:16]
+            raise RuntimeError(
+                "Failed to discover intermediate_model attention layers in the "
+                "static forward context after loading the intermediate verifier. "
+                f"sample_layer_names={sample}"
+            )
+        self._draft_attn_layer_names = intermediate_attn_layer_names
+
+    @override
+    def initialize_attn_backend(
+        self,
+        kv_cache_config,
+        kernel_block_sizes=None,
+    ) -> None:
+        super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        discovered = {
+            layer_name
+            for group in self.draft_attn_groups
+            for layer_name in group.layer_names
+        }
+        missing = self._draft_attn_layer_names - discovered
+        if missing:
+            raise RuntimeError(
+                "Intermediate verifier KV/attention backend initialization missed "
+                "layers bound in load_model() "
+                f"(sample): {sorted(missing)[:32]}"
+            )
 
 
 def _build_prefix_conditioned_inputs(
@@ -381,6 +425,8 @@ def _forward_prefix_conditioned_logits(
         )
         for layer_name in attn_group.layer_names:
             per_layer_attn_metadata[layer_name] = attn_metadata
+
+    proposer._check_per_layer_attn_metadata_contract(per_layer_attn_metadata)
 
     if proposer.allowed_attn_types is not None and not isinstance(
         attn_metadata, proposer.allowed_attn_types
