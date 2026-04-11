@@ -183,6 +183,14 @@ class IntermediateModelStateProvider:
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
+        self.proposer._log_draft_attn_metadata_debug(  # type: ignore[attr-defined]
+            per_layer_attn_metadata,
+            "staged_eagle._forward_hidden_states:before_set_forward_context",
+        )
+        self.proposer._check_per_layer_attn_metadata_contract(  # type: ignore[attr-defined]
+            per_layer_attn_metadata
+        )
+
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self.proposer._determine_batch_execution_and_padding(num_tokens)  # type: ignore[attr-defined]
         )
