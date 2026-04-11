@@ -18,6 +18,19 @@ SpecStageMode = Literal[
 
 
 @dataclass
+class RootTopKInfo:
+    """Root draft step top-k tokens and probabilities (sorted descending per row).
+
+    Used when pivot expansion needs q(·) at the first speculative position without
+    materializing a full ``[B, 1, vocab]`` tensor (e.g. parallel drafting).
+    ``topk_probs`` are softmax probabilities from the same logits as ``topk_token_ids``.
+    """
+
+    topk_token_ids: torch.Tensor  # [B, K]
+    topk_probs: torch.Tensor  # [B, K], largest first
+
+
+@dataclass
 class PivotExpansionFamily:
     """Expanded top-k candidate family for one origin request row."""
 

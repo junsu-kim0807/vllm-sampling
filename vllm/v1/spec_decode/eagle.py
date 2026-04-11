@@ -38,7 +38,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.spec_stage_ops import sample_next_token_and_probs_processed
-from vllm.v1.spec_decode.spec_stage_runtime import EagleTreeTemplate
+from vllm.v1.spec_decode.spec_stage_runtime import EagleTreeTemplate, RootTopKInfo
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
@@ -126,6 +126,8 @@ class SpecDecodeBaseProposer:
 
         # Filled during propose when rejection sampling or pivot top-k expansion needs q(·).
         self.last_draft_probs_flat: torch.Tensor | None = None
+        # Pivot root top-k only (optional side channel; avoids full-vocab tensors).
+        self.last_root_topk_info: RootTopKInfo | None = None
 
         # persistent buffers for cuda graph
         self.input_ids = torch.zeros(
@@ -439,6 +441,24 @@ class SpecDecodeBaseProposer:
 
     def clear_draft_probs(self) -> None:
         self.last_draft_probs_flat = None
+        self.last_root_topk_info = None
+
+    def _fill_last_root_topk_from_logits(self, logits: torch.Tensor) -> None:
+        """Set ``last_root_topk_info`` from root logits when global spec method is pivot."""
+        sc = self.speculative_config
+        if sc.method != "pivot":
+            self.last_root_topk_info = None
+            return
+        k_sel = int(getattr(sc, "pivot_topk_selection", 1) or 1)
+        if k_sel <= 1:
+            self.last_root_topk_info = None
+            return
+        k = min(k_sel, int(logits.shape[-1]))
+        probs = torch.softmax(logits.float(), dim=-1)
+        vals, idx = torch.topk(probs, k=k, dim=-1)
+        self.last_root_topk_info = RootTopKInfo(
+            topk_token_ids=idx.to(torch.long), topk_probs=vals
+        )
 
     def _use_draft_probs_in_rejection(self, sampling_metadata: SamplingMetadata) -> bool:
         return (
@@ -457,7 +477,9 @@ class SpecDecodeBaseProposer:
         if self._use_draft_probs_in_rejection(sampling_metadata):
             return True
         sc = self.speculative_config
-        return self.method == "pivot" and int(sc.pivot_topk_selection) > 1
+        # Delegate proposers run with method draft_model/eagle while the global
+        # speculative method is pivot; pivot top-k still needs per-step q(·).
+        return sc.method == "pivot" and int(sc.pivot_topk_selection) > 1
 
     @staticmethod
     def _with_provisional_draft_prefix(
@@ -519,6 +541,7 @@ class SpecDecodeBaseProposer:
 
         batch_size = common_attn_metadata.batch_size()
         self.last_draft_probs_flat = None
+        self.last_root_topk_info = None
 
         if self.method == "eagle3":
             assert isinstance(self.model, Eagle3LlamaForCausalLM)
@@ -600,10 +623,17 @@ class SpecDecodeBaseProposer:
         # Early exit if there is only one draft token to be generated.
         if self.parallel_drafting:
             draft_token_ids = self._greedy_sample(sample_hidden_states)
+            # Parallel path skips processed probs; pivot still needs root q(·).
+            if self.speculative_config.method == "pivot" and int(
+                self.speculative_config.pivot_topk_selection
+            ) > 1:
+                logits_root = self.model.compute_logits(sample_hidden_states)
+                self._fill_last_root_topk_from_logits(logits_root)
             return draft_token_ids.view(-1, self.num_speculative_tokens)
         if self.num_speculative_tokens == 1:
             if self._should_collect_draft_step_probs(sampling_metadata):
                 logits0 = self.model.compute_logits(sample_hidden_states)
+                self._fill_last_root_topk_from_logits(logits0)
                 draft_token_ids, probs0 = sample_next_token_and_probs_processed(
                     runner_sampler,
                     logits0,
@@ -651,6 +681,7 @@ class SpecDecodeBaseProposer:
         probs_per_step: list[torch.Tensor] = []
         if track_probs:
             logits0 = self.model.compute_logits(sample_hidden_states)
+            self._fill_last_root_topk_from_logits(logits0)
             draft_token_ids, p0 = sample_next_token_and_probs_processed(
                 runner_sampler,
                 logits0,

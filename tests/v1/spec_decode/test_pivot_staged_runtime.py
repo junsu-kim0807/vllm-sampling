@@ -23,6 +23,7 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     PivotExpansionFamily,
     PivotExpansionPlan,
     PivotTreeFamily,
+    RootTopKInfo,
     StagedHiddenStateBundle,
     expand_hybrid_bundle_for_pivot_expansion,
     pivot_expansion_indices_fit_prepare_batch,
@@ -337,8 +338,8 @@ def test_get_unselected_cleanup_rows_returns_unselected_family_rows() -> None:
     assert get_unselected_cleanup_rows(expansion_plan=plan, selected_rows=[1]) == [0]
 
 
-def test_build_pivot_expansion_plan_skips_when_probs_missing_but_topk_enabled() -> None:
-    """If pivot step probs are unavailable, skip expansion without crashing."""
+def test_build_pivot_expansion_plan_skips_when_probs_and_root_topk_missing() -> None:
+    """If pivot step probs and root top-k are unavailable, skip expansion."""
     proposer = object.__new__(PivotProposer)
     proposer._topk_selection = 5
     initial = torch.tensor([[42], [43]], dtype=torch.int32)
@@ -346,10 +347,68 @@ def test_build_pivot_expansion_plan_skips_when_probs_missing_but_topk_enabled() 
         initial_pivots=initial,
         pivot_probs=None,
         enable_topk_expansion=True,
+        root_topk_info=None,
     )
     assert torch.equal(ep, initial)
     assert eprob is None
     assert plan is None
+
+
+def test_build_pivot_expansion_plan_from_root_topk_when_probs_missing() -> None:
+    """RootTopKInfo alone is enough for fixed-capacity expansion (parallel drafting path)."""
+    proposer = object.__new__(PivotProposer)
+    proposer._topk_selection = 4
+    proposer._expansion_pct = 0.5
+    proposer._pivot_use_eagle_tree = False
+    # B=2, num_expand=ceil(2*0.5)=1, K=4, p_extra=3, P=5
+    initial = torch.tensor([[10], [20]], dtype=torch.int32)
+    root_topk = RootTopKInfo(
+        topk_token_ids=torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]]),
+        topk_probs=torch.tensor(
+            [[0.7, 0.15, 0.1, 0.05], [0.6, 0.2, 0.1, 0.1]], dtype=torch.float32
+        ),
+    )
+    ep, eprob, plan = proposer._build_pivot_expansion_plan(
+        initial_pivots=initial,
+        pivot_probs=None,
+        enable_topk_expansion=True,
+        root_topk_info=root_topk,
+    )
+    assert plan is not None
+    assert plan.expanded_batch_size == 5
+    assert plan.uses_fixed_capacity_packing
+    assert eprob is None
+    assert ep.shape[0] == 5
+
+
+def test_pivot_bundle_row_count_matches_metadata_rows() -> None:
+    """Regression: staged hybrid bundle row count matches spec decode metadata."""
+    plan = PivotExpansionPlan(
+        expanded_to_origin=[0, 1, 0, 0],
+        families=[],
+        expanded_batch_size=4,
+        origin_batch_size=2,
+        packed_batch_size=4,
+        packed_to_origin=[0, 1, -1, -1],
+        packed_sm_origin=[0, 1, 0, 0],
+        packed_row_is_active=[True, True, True, False],
+        packed_row_is_base=[True, True, False, False],
+        packed_row_family_rank=[0, 0, 1, -1],
+        origin_to_base_row=[0, 1],
+        origin_to_family_rows=[[], []],
+        uses_fixed_capacity_packing=True,
+    )
+    bundle = HybridProposalBundle(
+        draft_token_ids=torch.zeros(8, dtype=torch.int32),
+        draft_probs=None,
+        num_draft_tokens=[2, 2, 2, 2],
+        cu_num_draft_tokens=torch.tensor([2, 4, 6, 8], dtype=torch.int32),
+        max_spec_len=2,
+        mode="pivot",
+        expansion_plan=plan,
+        bundle_row_req_ids=("a", "b", "a", "a"),
+    )
+    assert len(bundle.num_draft_tokens) == plan.expanded_batch_size
 
 
 def test_pivot_bootstrap_hidden_source_uses_provider_in_intermediate_mode() -> None:

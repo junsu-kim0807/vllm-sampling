@@ -3266,6 +3266,35 @@ class GPUModelRunner(
             bundle.expansion_plan if bundle is not None else None
         )
 
+    def _take_drafter_staged_hybrid_and_publish(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        """Move drafter-staged hybrid bundle to ``pending_hybrid_spec_bundle`` once.
+
+        Pivot row universe must match **target verification decode rows** for this
+        step (``SpecDecodeMetadata.num_draft_tokens`` / related layout), not only
+        ``CommonAttentionMetadata.num_reqs``, when mixed prefill/decode or split
+        decode applies.
+        """
+        take_bundle = getattr(self.drafter, "take_pending_spechive_bundle", None)
+        if not callable(take_bundle):
+            self.set_pending_hybrid_spec_bundle(None)
+            return
+        bundle = take_bundle()
+        self.set_pending_hybrid_spec_bundle(bundle)
+        if (
+            bundle is not None
+            and self.speculative_config is not None
+            and self.speculative_config.method == "pivot"
+            and spec_decode_metadata is not None
+        ):
+            logger.warning(
+                "PIVOT_DEBUG publish_bundle: bundle_rows=%d metadata_rows=%d",
+                len(bundle.num_draft_tokens),
+                len(spec_decode_metadata.num_draft_tokens),
+            )
+
     def _clear_pending_pivot_hybrid_at_prepare_boundary(
         self, reason: str, *, detail: str | None = None
     ) -> None:
@@ -5413,11 +5442,7 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
-            take_bundle = getattr(self.drafter, "take_pending_spechive_bundle", None)
-            if callable(take_bundle):
-                self.set_pending_hybrid_spec_bundle(take_bundle())
-            else:
-                self.set_pending_hybrid_spec_bundle(None)
+            self._take_drafter_staged_hybrid_and_publish(spec_decode_metadata)
 
         # ---- TETRIS post-processing ----------------------------------------
         spec_config = self.speculative_config

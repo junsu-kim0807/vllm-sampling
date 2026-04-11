@@ -53,6 +53,7 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     PivotExpansionFamily,
     PivotExpansionPlan,
     PivotTreeFamily,
+    RootTopKInfo,
 )
 from vllm.v1.spec_decode.staged_delegate_factory import (
     PivotStagedDelegates,
@@ -370,7 +371,9 @@ class PivotProposer:
         # Keep parity with AdaptiveSpechiveProposer contract used by
         # run_hierarchical_verification_rounds().
         self._inter_dit: DraftModelProposer = self._intermediate
-        self._pending_hybrid_bundle: HybridProposalBundle | None = None
+        # Staging only: GpuModelRunner must call take_pending_spechive_bundle() then
+        # set_pending_hybrid_spec_bundle() once per draft proposal step (single publish).
+        self._staged_hybrid_bundle: HybridProposalBundle | None = None
         self._pending_tree_plan: PivotExpandedTreePlan | None = None
         self._active_pivot_expansion_plan: PivotExpansionPlan | None = None
         self._is_waiting_for_target_collapse: bool = False
@@ -462,12 +465,12 @@ class PivotProposer:
         self._intermediate.clear_draft_probs()
 
     def take_pending_spechive_bundle(self) -> HybridProposalBundle | None:
-        bundle = self._pending_hybrid_bundle
-        self._pending_hybrid_bundle = None
+        bundle = self._staged_hybrid_bundle
+        self._staged_hybrid_bundle = None
         return bundle
 
     def discard_pending_hierarchical_verification_state(self) -> None:
-        self._pending_hybrid_bundle = None
+        self._staged_hybrid_bundle = None
         self._active_pivot_expansion_plan = None
         self._pending_tree_plan = None
         self._is_waiting_for_target_collapse = False
@@ -482,6 +485,18 @@ class PivotProposer:
         if num_expand == 0:
             return []
         top1_prob = pivot_probs[:, 0, :].amax(dim=-1)
+        return self._select_low_confidence_indices_from_top1_prob(top1_prob)
+
+    def _select_low_confidence_indices_from_top1_prob(
+        self, top1_prob: torch.Tensor
+    ) -> list[int]:
+        batch_size = int(top1_prob.shape[0])
+        if batch_size <= 0:
+            return []
+        num_expand = int(math.ceil(batch_size * self._expansion_pct))
+        num_expand = min(max(num_expand, 0), batch_size)
+        if num_expand == 0:
+            return []
         chosen = torch.topk(top1_prob, k=num_expand, largest=False).indices
         return [int(i) for i in chosen.tolist()]
 
@@ -596,15 +611,14 @@ class PivotProposer:
         initial_pivots: torch.Tensor,
         pivot_probs: torch.Tensor | None,
         enable_topk_expansion: bool,
+        root_topk_info: RootTopKInfo | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, PivotExpansionPlan | None]:
         """Build packed pivot rows (fixed P) or legacy variable rows (eagle tree)."""
         batch_size = int(initial_pivots.shape[0])
-        # Missing q(·) (e.g. parallel drafting fast path): skip expansion safely.
         if (
             not enable_topk_expansion
             or self._topk_selection <= 1
             or batch_size == 0
-            or pivot_probs is None
         ):
             ep = initial_pivots.to(torch.int32)
             eprob = (
@@ -613,6 +627,18 @@ class PivotProposer:
                 else None
             )
             return ep, eprob, None
+
+        if pivot_probs is None:
+            if root_topk_info is None:
+                ep = initial_pivots.to(torch.int32)
+                return ep, None, None
+            if int(root_topk_info.topk_token_ids.shape[0]) != batch_size:
+                ep = initial_pivots.to(torch.int32)
+                return ep, None, None
+            return self._build_pivot_expansion_plan_fixed_capacity_from_root_topk(
+                initial_pivots=initial_pivots,
+                root_topk=root_topk_info,
+            )
 
         # Eagle tree uses the same fixed P layout as linear pivot (PR2) so tree
         # families, bundle rows, and verifier metadata stay aligned at P.
@@ -808,6 +834,116 @@ class PivotProposer:
             uses_fixed_capacity_packing=True,
         )
         return expanded_pivots, expanded_probs, plan
+
+    def _build_pivot_expansion_plan_fixed_capacity_from_root_topk(
+        self,
+        *,
+        initial_pivots: torch.Tensor,
+        root_topk: RootTopKInfo,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, PivotExpansionPlan | None]:
+        """Same fixed P layout as ``_build_pivot_expansion_plan_fixed_capacity`` using top-k only."""
+        B = int(initial_pivots.shape[0])
+        k_width = int(root_topk.topk_token_ids.shape[1])
+        K = min(self._topk_selection, k_width)
+        num_expand = int(math.ceil(B * self._expansion_pct))
+        p_extra = max(0, K - 1)
+        P = B + num_expand * p_extra
+        base_piv = initial_pivots.to(torch.int32).view(-1)
+
+        top1_prob = root_topk.topk_probs[:, 0]
+        selected_set = set(self._select_low_confidence_indices_from_top1_prob(top1_prob))
+        selected_sorted = sorted(selected_set)[:num_expand]
+        logger.warning(
+            "PIVOT_DEBUG plan: B=%d K=%d pct=%.3f num_expand=%d P=%d p_extra=%d selected=%s "
+            "(root_topk)",
+            B,
+            K,
+            self._expansion_pct,
+            num_expand,
+            P,
+            p_extra,
+            selected_sorted,
+        )
+
+        packed_to_origin = [-1] * P
+        packed_sm_origin = [0] * P
+        is_active = [False] * P
+        is_base = [False] * P
+        fam_rank = [-1] * P
+        for o in range(B):
+            packed_to_origin[o] = o
+            packed_sm_origin[o] = o
+            is_active[o] = True
+            is_base[o] = True
+            fam_rank[o] = 0
+
+        pivot_vals = [0] * P
+        for o in range(B):
+            pivot_vals[o] = int(base_piv[o].item())
+        families: list[PivotExpansionFamily] = []
+        origin_to_family_rows: list[list[int]] = [[] for _ in range(B)]
+
+        for b in range(num_expand):
+            owner = selected_sorted[b] if b < len(selected_sorted) else (b % B)
+            for r in range(p_extra):
+                j = B + b * p_extra + r
+                packed_sm_origin[j] = owner
+                if b < len(selected_sorted):
+                    packed_to_origin[j] = owner
+                    is_active[j] = True
+                    fam_rank[j] = r + 1
+                else:
+                    packed_to_origin[j] = -1
+                    is_active[j] = False
+                    fam_rank[j] = -1
+                    pivot_vals[j] = int(base_piv[owner].item())
+            if b < len(selected_sorted):
+                o = int(owner)
+                cand_ids = [
+                    int(root_topk.topk_token_ids[o, j].item()) for j in range(K)
+                ]
+                cand_probs = [
+                    float(root_topk.topk_probs[o, j].item()) for j in range(K)
+                ]
+                base_row = o
+                expanded_rows = [base_row]
+                for r in range(p_extra):
+                    jj = B + b * p_extra + r
+                    expanded_rows.append(jj)
+                    pivot_vals[jj] = cand_ids[r + 1]
+                families.append(
+                    PivotExpansionFamily(
+                        origin_row=o,
+                        expanded_rows=expanded_rows,
+                        candidate_ranks=list(range(len(cand_ids))),
+                        first_token_ids=cand_ids,
+                        first_token_probs=cand_probs,
+                    )
+                )
+                for r in range(p_extra):
+                    origin_to_family_rows[o].append(B + b * p_extra + r)
+
+        device = initial_pivots.device
+        expanded_pivots = torch.tensor(pivot_vals, device=device, dtype=torch.int32).view(
+            P, 1
+        )
+        expanded_to_origin = list(packed_sm_origin)
+        plan = PivotExpansionPlan(
+            expanded_to_origin=expanded_to_origin,
+            families=families,
+            expanded_batch_size=P,
+            origin_batch_size=B,
+            packed_batch_size=P,
+            packed_to_origin=list(packed_to_origin),
+            packed_sm_origin=list(packed_sm_origin),
+            packed_row_is_active=list(is_active),
+            packed_row_is_base=list(is_base),
+            packed_row_family_rank=list(fam_rank),
+            origin_to_base_row=list(range(B)),
+            origin_to_family_rows=origin_to_family_rows,
+            uses_fixed_capacity_packing=True,
+        )
+        return expanded_pivots, None, plan
 
     @staticmethod
     def _expand_prefix_rows_for_plan(
@@ -1046,10 +1182,26 @@ class PivotProposer:
             prefix_prefab=pivot_prefix_prefab,
         )
         pivots = pivots.to(torch.int32)[:, :1]
+        delegate = self._main_delegate()
+        root_topk = getattr(delegate, "last_root_topk_info", None)
         chosen_pivots, pivot_probs_rows, expansion_plan = self._build_pivot_expansion_plan(
             initial_pivots=pivots,
             pivot_probs=pivot_probs,
             enable_topk_expansion=enable_topk_expansion,
+            root_topk_info=(
+                root_topk
+                if pivot_probs is None and root_topk is not None
+                else None
+            ),
+        )
+        logger.warning(
+            "PIVOT_DEBUG root: verification_rows=%d has_plan=%s expanded_batch=%s "
+            "used_root_topk=%s used_full_probs=%s",
+            int(pivots.shape[0]),
+            expansion_plan is not None,
+            expansion_plan.expanded_batch_size if expansion_plan is not None else None,
+            pivot_probs is None and root_topk is not None,
+            pivot_probs is not None,
         )
         if expansion_plan is not None:
             self._active_pivot_expansion_plan = expansion_plan
@@ -1130,10 +1282,12 @@ class PivotProposer:
             prefix_prefab=tree_pivot_prefab,
         )
         pivots = pivots.to(torch.int32)[:, :1]
+        rt = getattr(self._eagle_head, "last_root_topk_info", None)
         chosen_pivots, _, expansion_plan = self._build_pivot_expansion_plan(
             initial_pivots=pivots,
             pivot_probs=pivot_probs,
             enable_topk_expansion=True,
+            root_topk_info=rt if pivot_probs is None and rt is not None else None,
         )
         if expansion_plan is not None:
             self._active_pivot_expansion_plan = expansion_plan
@@ -1483,7 +1637,7 @@ class PivotProposer:
                     sampling_metadata=sampling_metadata,
                     num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 )
-            self._pending_hybrid_bundle = bundle
+            self._staged_hybrid_bundle = bundle
             self._pending_tree_plan = bundle.tree_plan
             self._num_intermediate_rounds_since_target += 1
             self._pending_pivot_bundle_metadata = {
@@ -1529,7 +1683,7 @@ class PivotProposer:
             int(out.shape[0]),
             expansion_plan,
         )
-        self._pending_hybrid_bundle = _build_hybrid_bundle_from_rows(
+        self._staged_hybrid_bundle = _build_hybrid_bundle_from_rows(
             out,
             mode="pivot",
             draft_probs=draft_probs_flat,
@@ -1544,8 +1698,8 @@ class PivotProposer:
                 expansion_plan=expansion_plan,
             )
             self._pending_tree_plan = tree_plan
-            self._pending_hybrid_bundle = dataclass_replace(
-                self._pending_hybrid_bundle,
+            self._staged_hybrid_bundle = dataclass_replace(
+                self._staged_hybrid_bundle,
                 expansion_plan=expansion_plan,
                 tree_plan=tree_plan,
             )
@@ -1558,15 +1712,13 @@ class PivotProposer:
             "is_waiting_for_target_collapse": self._is_waiting_for_target_collapse,
             "num_intermediate_rounds_since_target": self._num_intermediate_rounds_since_target,
         }
-        _phb = self._pending_hybrid_bundle
+        _phb = self._staged_hybrid_bundle
         logger.warning(
-            "PIVOT_DEBUG propose: base_batch=%d out_rows=%d has_plan=%s expanded_batch=%s "
-            "pending_bundle_rows=%d",
+            "PIVOT_DEBUG stage: origin_batch=%d bundle_rows=%d has_plan=%s expanded_batch=%s",
             batch_size,
-            int(out.shape[0]),
+            len(_phb.num_draft_tokens) if _phb is not None else 0,
             expansion_plan is not None,
             expansion_plan.expanded_batch_size if expansion_plan is not None else None,
-            len(_phb.num_draft_tokens) if _phb is not None else 0,
         )
         self.clear_draft_probs()
         return _collapse_draft_rows_for_scheduler(out, expansion_plan, batch_size)
