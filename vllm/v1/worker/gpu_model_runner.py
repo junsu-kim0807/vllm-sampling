@@ -231,10 +231,17 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _pivot_plan_sm_indices(plan: PivotExpansionPlan) -> list[int]:
+    """Sampling-metadata / list-index origins: always in ``[0, B)`` (never ``packed_to_origin``)."""
+    if plan.packed_sm_origin is not None:
+        return plan.packed_sm_origin
+    return plan.expanded_to_origin
+
+
 def _expand_list_rows_by_pivot_plan(
     rows: list[list[Any]], plan: PivotExpansionPlan
 ) -> list[list[Any]]:
-    return [list(rows[o]) for o in plan.expanded_to_origin]
+    return [list(rows[o]) for o in _pivot_plan_sm_indices(plan)]
 
 
 def _collapse_draft_tensor_rows_for_scheduler(
@@ -253,9 +260,12 @@ def _collapse_draft_tensor_rows_for_scheduler(
         device=device,
     )
     for o in range(batch_size):
-        j = next(
-            idx for idx, orig in enumerate(plan.expanded_to_origin) if orig == o
-        )
+        if plan.origin_to_base_row is not None and plan.origin_to_base_row[o] >= 0:
+            j = int(plan.origin_to_base_row[o])
+        else:
+            j = next(
+                idx for idx, orig in enumerate(plan.expanded_to_origin) if orig == o
+            )
         out[o].copy_(out_exp[j])
     return out
 
@@ -1838,8 +1848,19 @@ class GPUModelRunner(
                     num_decode_draft_tokens[req_idx] = len(draft_token_ids)
             pivot_plan = self.pending_pivot_expansion_plan
             pb = self.pending_hybrid_spec_bundle
+            expected_p_pivot: int | None = None
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.method == "pivot"
+            ):
+                expected_p_pivot = (
+                    self.speculative_config.pivot_packed_batch_size_for_origin_batch(
+                        num_reqs
+                    )
+                )
             # Expanded pivot bundles are indexed by origin rows from propose-time;
-            # if the scheduled batch shrinks, expanded_to_origin can go out of range.
+            # if the scheduled batch shrinks, packed_sm_origin / expanded_to_origin
+            # can go out of range.
             if (
                 pivot_plan is not None
                 and pb is not None
@@ -1852,15 +1873,16 @@ class GPUModelRunner(
                         "bundle.expansion_plan != pending_pivot_expansion_plan",
                     )
                     pivot_plan, pb = None, None
-                elif not pivot_expansion_indices_fit_prepare_batch(pivot_plan, num_reqs):
-                    max_o = (
-                        max(pivot_plan.expanded_to_origin)
-                        if pivot_plan.expanded_to_origin
-                        else -1
-                    )
+                elif not pivot_expansion_indices_fit_prepare_batch(
+                    pivot_plan,
+                    num_reqs,
+                    expected_packed_size=expected_p_pivot,
+                ):
+                    sm_idx = _pivot_plan_sm_indices(pivot_plan)
+                    max_o = max(sm_idx) if sm_idx else -1
                     self._clear_pending_pivot_hybrid_at_prepare_boundary(
-                        "expanded_to_origin does not fit current batch",
-                        detail=f"num_reqs={num_reqs}, max_origin_index={max_o}",
+                        "pivot expansion plan does not fit current batch",
+                        detail=f"num_reqs={num_reqs}, max_sm_origin_index={max_o}",
                     )
                     pivot_plan, pb = None, None
             use_pivot_expanded = (
@@ -1882,8 +1904,24 @@ class GPUModelRunner(
                 assert int(pb.draft_token_ids.shape[0]) == int(
                     pb.cu_num_draft_tokens[-1].item()
                 ), "bundle flat draft rows must match cu_num_draft_tokens tail"
-                num_draft_meta = num_draft_tokens[pivot_plan.expanded_to_origin]
-                cu_meta = cu_num_tokens[pivot_plan.expanded_to_origin]
+                if (
+                    pivot_plan.uses_fixed_capacity_packing
+                    and pivot_plan.packed_sm_origin is not None
+                    and pivot_plan.packed_row_is_active is not None
+                ):
+                    P = pivot_plan.packed_batch_size
+                    num_draft_meta = np.zeros(P, dtype=np.int32)
+                    cu_meta = np.zeros(P, dtype=np.int32)
+                    sm = pivot_plan.packed_sm_origin
+                    active = pivot_plan.packed_row_is_active
+                    for j in range(P):
+                        o = int(sm[j])
+                        cu_meta[j] = cu_num_tokens[o]
+                        if active[j]:
+                            num_draft_meta[j] = num_draft_tokens[o]
+                else:
+                    num_draft_meta = num_draft_tokens[pivot_plan.expanded_to_origin]
+                    cu_meta = cu_num_tokens[pivot_plan.expanded_to_origin]
                 spec_decode_metadata = self._calc_spec_decode_metadata(
                     num_draft_meta,
                     cu_meta,
@@ -3268,7 +3306,7 @@ class GPUModelRunner(
                 detail=f"round={round_idx}",
             )
             sm_idxs = (
-                pivot_expansion_plan.expanded_to_origin
+                _pivot_plan_sm_indices(pivot_expansion_plan)
                 if pivot_expansion_plan is not None
                 else list(range(batch_size))
             )
@@ -3281,7 +3319,7 @@ class GPUModelRunner(
             if self._is_dit_debug_enabled():
                 for b in range(len(prefix_rows)):
                     origin_b = (
-                        pivot_expansion_plan.expanded_to_origin[b]
+                        sm_idxs[b]
                         if pivot_expansion_plan is not None
                         else b
                     )
@@ -3430,7 +3468,7 @@ class GPUModelRunner(
         tail_len = min(L, remaining_cap)
         if tail_len > 0:
             tail_sm_idxs = (
-                pivot_expansion_plan.expanded_to_origin
+                _pivot_plan_sm_indices(pivot_expansion_plan)
                 if pivot_expansion_plan is not None
                 else list(range(batch_size))
             )
@@ -3750,7 +3788,7 @@ class GPUModelRunner(
             ):
                 verity_sm = slice_sampling_metadata_for_subbatch(
                     sampling_metadata,
-                    plan.expanded_to_origin,
+                    _pivot_plan_sm_indices(plan),
                     sampled_ids_only=False,
                 )
 

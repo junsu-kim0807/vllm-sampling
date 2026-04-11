@@ -30,11 +30,35 @@ class PivotExpansionFamily:
 
 @dataclass
 class PivotExpansionPlan:
-    """Runtime mapping between expanded pivot rows and origin rows."""
+    """Runtime mapping between expanded pivot rows and origin rows.
+
+    Fixed-capacity packing (linear pivot, PR1): ``packed_to_origin`` may contain
+    ``-1`` for inactive extra slots; **never** index Python lists with
+    ``packed_to_origin[j]``. Use ``packed_sm_origin[j]`` (always in ``[0, B)``).
+
+    ``expanded_to_origin`` is a **separate** list with the same values as
+    ``packed_sm_origin`` (never an alias of ``packed_to_origin``).
+    """
 
     expanded_to_origin: list[int]
     families: list[PivotExpansionFamily]
     expanded_batch_size: int
+    # --- Fixed-capacity packed layout (linear pivot); eagle-tree legacy may omit. ---
+    origin_batch_size: int = 0
+    """Origin batch B; 0 means legacy variable expansion (eagle tree path)."""
+    packed_batch_size: int = 0
+    """Equals expanded_batch_size when packing is used."""
+    packed_to_origin: list[int] | None = None
+    """Length P; active rows in ``[0, B)``; inactive extra slots ``-1``."""
+    packed_sm_origin: list[int] | None = None
+    """Length P; list-index / cu_meta anchor; every entry in ``[0, B)``."""
+    packed_row_is_active: list[bool] | None = None
+    packed_row_is_base: list[bool] | None = None
+    packed_row_family_rank: list[int] | None = None
+    origin_to_base_row: list[int] | None = None
+    origin_to_family_rows: list[list[int]] | None = None
+    uses_fixed_capacity_packing: bool = False
+    """True for linear pivot fixed P layout; false for legacy variable eagle expansion."""
 
 
 @dataclass(frozen=True)
@@ -270,19 +294,77 @@ def _split_flat_tokens_by_lengths(
 def pivot_expansion_indices_fit_prepare_batch(
     plan: PivotExpansionPlan,
     num_reqs: int,
+    *,
+    expected_packed_size: int | None = None,
 ) -> bool:
-    """True if each expanded row maps to a valid origin index for the current batch.
-
-    Pending pivot bundles are produced for the batch shape at propose time; if
-    ``num_reqs`` shrinks or rows are reordered between steps, ``expanded_to_origin``
-    may point outside ``[0, num_reqs)`` and must not drive expanded metadata.
-    """
+    """Validate pivot plan against the current scheduler batch and optional P formula."""
     if num_reqs <= 0:
         return False
     if plan.expanded_batch_size <= 0:
         return False
     if len(plan.expanded_to_origin) != plan.expanded_batch_size:
         return False
+    # Fixed-capacity packed layout
+    if plan.packed_sm_origin is not None:
+        p = plan.packed_batch_size
+        if p != plan.expanded_batch_size or len(plan.packed_sm_origin) != p:
+            return False
+        if plan.origin_batch_size != num_reqs:
+            return False
+        if (
+            plan.uses_fixed_capacity_packing
+            and expected_packed_size is not None
+            and p != expected_packed_size
+        ):
+            return False
+        for x in plan.packed_sm_origin:
+            if int(x) < 0 or int(x) >= num_reqs:
+                return False
+        if plan.packed_to_origin is not None:
+            if len(plan.packed_to_origin) != p:
+                return False
+            if plan.packed_row_is_active is None or len(plan.packed_row_is_active) != p:
+                return False
+            for j in range(p):
+                active = bool(plan.packed_row_is_active[j])
+                po = int(plan.packed_to_origin[j])
+                if active and (po < 0 or po >= num_reqs):
+                    return False
+                if not active and po != -1:
+                    return False
+        if plan.uses_fixed_capacity_packing:
+            # PR1 linear packed invariants (see PivotExpansionPlan / pivot builder).
+            if plan.packed_to_origin is None or plan.packed_row_is_active is None:
+                return False
+            sm = plan.packed_sm_origin
+            if sm is None:
+                return False
+            if plan.origin_to_base_row is None or len(plan.origin_to_base_row) != num_reqs:
+                return False
+            for o in range(num_reqs):
+                if int(plan.origin_to_base_row[o]) != o:
+                    return False
+            if plan.packed_row_is_base is None or len(plan.packed_row_is_base) != p:
+                return False
+            if sum(1 for b in plan.packed_row_is_base if b) != num_reqs:
+                return False
+            for o in range(num_reqs):
+                if not plan.packed_row_is_base[o]:
+                    return False
+            for j in range(num_reqs, p):
+                if plan.packed_row_is_base[j]:
+                    return False
+            for o in range(num_reqs):
+                if not bool(plan.packed_row_is_active[o]):
+                    return False
+                if int(plan.packed_to_origin[o]) != o:
+                    return False
+                if int(sm[o]) != o:
+                    return False
+            if any(int(plan.expanded_to_origin[j]) != int(sm[j]) for j in range(p)):
+                return False
+        return True
+    # Legacy dense expansion (e.g. eagle tree): expanded_to_origin is all valid origins
     for o in plan.expanded_to_origin:
         if int(o) < 0 or int(o) >= num_reqs:
             return False
@@ -309,10 +391,11 @@ def _split_probs_by_lengths(
 def expand_hybrid_bundle_for_pivot_expansion(
     bundle: HybridProposalBundle,
 ) -> HybridProposalBundle:
-    """Duplicate per-origin draft rows into expanded_batch_size rows (pivot top-k).
+    """Apply pivot expansion to the hybrid bundle (densify B->P or sync packed rows).
 
-    Each expanded row reuses the origin draft tail; the first pivot token is
-    taken from :class:`PivotExpansionFamily` when applicable.
+    Fixed-capacity linear pivot: the proposer already emits ``P`` rows; inactive
+    rows must carry zero draft width. Legacy eagle-tree path still densifies
+    from origin batch ``B`` to variable ``B'``.
     """
     plan = bundle.expansion_plan
     if plan is None or plan.expanded_batch_size <= 0:
@@ -324,11 +407,64 @@ def expand_hybrid_bundle_for_pivot_expansion(
         bundle = replace(bundle, draft_probs=None)
     if len(plan.expanded_to_origin) != plan.expanded_batch_size:
         return bundle
+
+    # Already packed: enforce inactive rows have zero draft tokens.
+    if (
+        plan.packed_sm_origin is not None
+        and plan.packed_row_is_active is not None
+        and len(bundle.num_draft_tokens) == plan.packed_batch_size
+    ):
+        p = plan.packed_batch_size
+        lengths = list(bundle.num_draft_tokens)
+        needs_rebuild = any(
+            (not plan.packed_row_is_active[j]) and lengths[j] != 0
+            for j in range(p)
+        )
+        if not needs_rebuild:
+            return bundle
+        tok_rows = _split_flat_tokens_by_lengths(
+            bundle.draft_token_ids, bundle.num_draft_tokens
+        )
+        new_lengths: list[int] = []
+        new_tok: list[torch.Tensor] = []
+        for j in range(p):
+            if plan.packed_row_is_active[j]:
+                new_lengths.append(lengths[j])
+                new_tok.append(tok_rows[j])
+            else:
+                new_lengths.append(0)
+                new_tok.append(
+                    tok_rows[j].new_empty((0,), dtype=tok_rows[j].dtype)
+                )
+        draft_token_ids = (
+            torch.cat(new_tok, dim=0).to(torch.int32)
+            if any(l > 0 for l in new_lengths)
+            else bundle.draft_token_ids.new_empty((0,), dtype=torch.int32)
+        )
+        device = draft_token_ids.device
+        cu = torch.cumsum(
+            torch.tensor(new_lengths, dtype=torch.int32, device=device), dim=0
+        )
+        max_spec_len = max(new_lengths) if any(new_lengths) else bundle.max_spec_len
+        return replace(
+            bundle,
+            draft_token_ids=draft_token_ids,
+            draft_probs=None,
+            num_draft_tokens=new_lengths,
+            cu_num_draft_tokens=cu,
+            max_spec_len=max_spec_len,
+            source_stage=None,
+        )
+
     origin_b = len(bundle.num_draft_tokens)
     if origin_b == plan.expanded_batch_size:
         return bundle
     if origin_b == 0 or origin_b > plan.expanded_batch_size:
         return bundle
+
+    sm = plan.packed_sm_origin
+    if sm is None or len(sm) != plan.expanded_batch_size:
+        sm = plan.expanded_to_origin
 
     tok_rows = _split_flat_tokens_by_lengths(
         bundle.draft_token_ids, bundle.num_draft_tokens
@@ -351,7 +487,7 @@ def expand_hybrid_bundle_for_pivot_expansion(
     new_prob: list[torch.Tensor] = []
     new_src: list[torch.Tensor] = []
 
-    for j, o in enumerate(plan.expanded_to_origin):
+    for j, o in enumerate(sm):
         if o < 0 or o >= origin_b:
             return bundle
         row_t = tok_rows[o].clone()

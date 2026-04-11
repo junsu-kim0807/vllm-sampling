@@ -25,6 +25,16 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
 )
 
 
+def _pivot_packed_row_is_active(plan: PivotExpansionPlan, row_idx: int) -> bool:
+    """Whether ``row_idx`` participates in family competition / cleanup (linear packed)."""
+    active = plan.packed_row_is_active
+    if active is None:
+        return True
+    if row_idx < 0 or row_idx >= len(active):
+        return False
+    return bool(active[row_idx])
+
+
 def get_accepted_draft_lens_from_sampled_tokens(
     sampled_token_ids: torch.Tensor,
     *,
@@ -313,7 +323,12 @@ def collapse_pivot_expanded_sampled_to_origin(
     *,
     num_draft_tokens: list[int] | None = None,
 ) -> torch.Tensor:
-    """Map expanded verification rows (B') back to one row per origin request (B)."""
+    """Map expanded verification rows (P) back to one row per origin request (B).
+
+    Inactive fixed-capacity packed rows are never chosen from ``PivotExpansionFamily``
+    (those indices are omitted from ``expanded_rows``); we still skip any inactive
+    row defensively when ``packed_row_is_active`` is present.
+    """
     if sampled_token_ids.shape[0] < expansion_plan.expanded_batch_size:
         return sampled_token_ids
     if not expansion_plan.expanded_to_origin:
@@ -332,21 +347,34 @@ def collapse_pivot_expanded_sampled_to_origin(
             sampled_token_ids,
             placeholder_token_id=PLACEHOLDER_TOKEN_ID,
         )
-    b_origin = max(expansion_plan.expanded_to_origin) + 1
+    b_origin = (
+        int(expansion_plan.origin_batch_size)
+        if expansion_plan.origin_batch_size > 0
+        else max(expansion_plan.expanded_to_origin) + 1
+    )
     origin_to_family = {fam.origin_row: fam for fam in expansion_plan.families}
     selected_rows: list[int] = []
     for o in range(b_origin):
         fam = origin_to_family.get(o)
         if fam is None:
-            j = next(
-                idx
-                for idx, orig in enumerate(expansion_plan.expanded_to_origin)
-                if orig == o
-            )
+            if (
+                expansion_plan.origin_to_base_row is not None
+                and o < len(expansion_plan.origin_to_base_row)
+                and int(expansion_plan.origin_to_base_row[o]) >= 0
+            ):
+                j = int(expansion_plan.origin_to_base_row[o])
+            else:
+                j = next(
+                    idx
+                    for idx, orig in enumerate(expansion_plan.expanded_to_origin)
+                    if orig == o
+                )
         else:
-            best_row = fam.expanded_rows[0]
+            best_row: int | None = None
             best_key = (-1, float("-inf"), 10**9)
             for local_idx, row_idx in enumerate(fam.expanded_rows):
+                if not _pivot_packed_row_is_active(expansion_plan, row_idx):
+                    continue
                 if row_idx >= len(accepted_lens):
                     continue
                 key = (
@@ -354,10 +382,24 @@ def collapse_pivot_expanded_sampled_to_origin(
                     fam.first_token_probs[local_idx],
                     -fam.candidate_ranks[local_idx],
                 )
-                if key > best_key:
+                if best_row is None or key > best_key:
                     best_key = key
                     best_row = row_idx
-            j = best_row
+            if best_row is None:
+                if (
+                    expansion_plan.origin_to_base_row is not None
+                    and o < len(expansion_plan.origin_to_base_row)
+                    and int(expansion_plan.origin_to_base_row[o]) >= 0
+                ):
+                    j = int(expansion_plan.origin_to_base_row[o])
+                else:
+                    j = next(
+                        idx
+                        for idx, orig in enumerate(expansion_plan.expanded_to_origin)
+                        if orig == o
+                    )
+            else:
+                j = best_row
         selected_rows.append(j)
     device = sampled_token_ids.device
     idx = torch.tensor(selected_rows, device=device, dtype=torch.long)
@@ -392,7 +434,10 @@ def expand_intermediate_state_for_pivot_plan(
         return state
     if len(state.frontier_metadata) == plan.expanded_batch_size:
         return state
-    expanded_frontier = [state.frontier_metadata[o] for o in plan.expanded_to_origin]
+    sm = plan.packed_sm_origin
+    if sm is None:
+        sm = plan.expanded_to_origin
+    expanded_frontier = [state.frontier_metadata[o] for o in sm]
     state.frontier_metadata = [dict(item) for item in expanded_frontier]
     return state
 
@@ -402,11 +447,17 @@ def get_unselected_cleanup_rows(
     expansion_plan: PivotExpansionPlan,
     selected_rows: list[int],
 ) -> list[int]:
-    """Return expanded rows that must be cleaned after target collapse."""
+    """Return expanded rows that must be cleaned after target collapse.
+
+    Only **active** packed candidate rows are considered; inactive placeholder rows
+    are never listed (they are not part of the family competition contract).
+    """
     selected = set(int(r) for r in selected_rows)
     cleanup: list[int] = []
     for fam in expansion_plan.families:
         for row_idx in fam.expanded_rows:
+            if not _pivot_packed_row_is_active(expansion_plan, row_idx):
+                continue
             if row_idx not in selected:
                 cleanup.append(int(row_idx))
     return cleanup
@@ -644,11 +695,21 @@ def sanitize_hybrid_bundle_for_metadata(
             sanitized = replace(sanitized, source_stage=None)
     if sanitized.expansion_plan is not None:
         plan = sanitized.expansion_plan
-        if (
-            plan.expanded_batch_size < 0
-            or len(plan.expanded_to_origin) != plan.expanded_batch_size
-            or len(plan.families) == 0
+        if plan.expanded_batch_size < 0 or len(plan.expanded_to_origin) != plan.expanded_batch_size:
+            sanitized = replace(sanitized, expansion_plan=None)
+        elif plan.packed_sm_origin is not None and len(plan.packed_sm_origin) != plan.expanded_batch_size:
+            sanitized = replace(sanitized, expansion_plan=None)
+        elif (
+            plan.packed_row_is_active is not None
+            and len(plan.packed_row_is_active) != plan.expanded_batch_size
         ):
+            sanitized = replace(sanitized, expansion_plan=None)
+        elif plan.uses_fixed_capacity_packing and (
+            plan.packed_sm_origin is None
+            or len(plan.packed_sm_origin) != plan.expanded_batch_size
+        ):
+            sanitized = replace(sanitized, expansion_plan=None)
+        elif not plan.uses_fixed_capacity_packing and len(plan.families) == 0:
             sanitized = replace(sanitized, expansion_plan=None)
     if sanitized.max_spec_len != runner_num_spec_tokens:
         # Keep bundle usable; width mismatch is informational only.

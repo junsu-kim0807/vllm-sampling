@@ -3,6 +3,7 @@
 
 import ast
 import copy
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -375,6 +376,20 @@ class SpeculativeConfig:
             verification_pipeline=verification_pipeline,
             hidden_state_source=hidden_state_source,
         )
+
+    def pivot_packed_batch_size_for_origin_batch(self, origin_batch_size: int) -> int:
+        """Verifier packed row count P for linear fixed-capacity pivot.
+
+        ``P = B + ceil(B * pivot_expansion_pct) * (pivot_topk_selection - 1)``.
+        Uses config top-k (actual runtime K may be ``min(topk, vocab)``).
+        """
+        if self.method != "pivot" or origin_batch_size <= 0:
+            return 0
+        b = int(origin_batch_size)
+        k = int(self.pivot_topk_selection)
+        extra_per_block = max(0, k - 1)
+        num_blocks = int(math.ceil(b * float(self.pivot_expansion_pct)))
+        return b + num_blocks * extra_per_block
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:

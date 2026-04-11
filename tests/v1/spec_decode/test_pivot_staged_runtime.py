@@ -10,6 +10,7 @@ from vllm.v1.spec_decode.spec_stage_ops import (
     build_family_flatten_order,
     collapse_family_paths_to_origin,
     collapse_family_tree_sampled_to_family_paths,
+    collapse_pivot_expanded_sampled_to_origin,
     get_unselected_cleanup_rows,
     validate_root_only_pivot_expansion,
 )
@@ -34,6 +35,133 @@ def test_pivot_expansion_indices_fit_prepare_batch() -> None:
     assert pivot_expansion_indices_fit_prepare_batch(plan, num_reqs=2)
     assert not pivot_expansion_indices_fit_prepare_batch(plan, num_reqs=1)
     assert not pivot_expansion_indices_fit_prepare_batch(plan, num_reqs=0)
+
+
+def test_pivot_expansion_indices_fit_fixed_capacity_packed() -> None:
+    """``packed_to_origin`` may use -1; ``packed_sm_origin`` must stay in-range."""
+    B, P = 2, 4
+    plan = PivotExpansionPlan(
+        expanded_to_origin=[0, 1, 0, 0],
+        families=[],
+        expanded_batch_size=P,
+        origin_batch_size=B,
+        packed_batch_size=P,
+        packed_to_origin=[0, 1, -1, -1],
+        packed_sm_origin=[0, 1, 0, 0],
+        packed_row_is_active=[True, True, False, False],
+        packed_row_is_base=[True, True, False, False],
+        packed_row_family_rank=[0, 0, -1, -1],
+        origin_to_base_row=[0, 1],
+        origin_to_family_rows=[[], []],
+        uses_fixed_capacity_packing=True,
+    )
+    assert pivot_expansion_indices_fit_prepare_batch(
+        plan, num_reqs=B, expected_packed_size=P
+    )
+    assert not pivot_expansion_indices_fit_prepare_batch(
+        plan, num_reqs=1, expected_packed_size=P
+    )
+    assert not pivot_expansion_indices_fit_prepare_batch(
+        plan, num_reqs=B, expected_packed_size=P + 1
+    )
+
+
+def test_pivot_expansion_indices_fit_rejects_inconsistent_inactive_sentinel() -> None:
+    B, P = 2, 4
+    bad = PivotExpansionPlan(
+        expanded_to_origin=[0, 1, 0, 0],
+        families=[],
+        expanded_batch_size=P,
+        origin_batch_size=B,
+        packed_batch_size=P,
+        packed_to_origin=[0, 1, 0, -1],
+        packed_sm_origin=[0, 1, 0, 0],
+        packed_row_is_active=[True, True, False, False],
+        packed_row_is_base=[True, True, False, False],
+        packed_row_family_rank=[0, 0, -1, -1],
+        origin_to_base_row=[0, 1],
+        origin_to_family_rows=[[], []],
+        uses_fixed_capacity_packing=True,
+    )
+    assert not pivot_expansion_indices_fit_prepare_batch(
+        bad, num_reqs=B, expected_packed_size=P
+    )
+
+
+def test_pivot_expansion_indices_fit_rejects_bad_origin_to_base_row() -> None:
+    B, P = 2, 4
+    bad = PivotExpansionPlan(
+        expanded_to_origin=[0, 1, 0, 0],
+        families=[],
+        expanded_batch_size=P,
+        origin_batch_size=B,
+        packed_batch_size=P,
+        packed_to_origin=[0, 1, -1, -1],
+        packed_sm_origin=[0, 1, 0, 0],
+        packed_row_is_active=[True, True, False, False],
+        packed_row_is_base=[True, True, False, False],
+        packed_row_family_rank=[0, 0, -1, -1],
+        origin_to_base_row=[0, 0],
+        origin_to_family_rows=[[], []],
+        uses_fixed_capacity_packing=True,
+    )
+    assert not pivot_expansion_indices_fit_prepare_batch(
+        bad, num_reqs=B, expected_packed_size=P
+    )
+
+
+def test_get_unselected_cleanup_rows_skips_inactive_family_rows() -> None:
+    """Inactive packed indices must not appear in cleanup even if listed on a family."""
+    plan = PivotExpansionPlan(
+        expanded_to_origin=[0, 0],
+        families=[
+            PivotExpansionFamily(
+                origin_row=0,
+                expanded_rows=[0, 1],
+                candidate_ranks=[0, 1],
+                first_token_ids=[10, 20],
+                first_token_probs=[0.5, 0.5],
+            )
+        ],
+        expanded_batch_size=2,
+        origin_batch_size=1,
+        packed_batch_size=2,
+        packed_to_origin=[0, -1],
+        packed_sm_origin=[0, 0],
+        packed_row_is_active=[True, False],
+        packed_row_is_base=[True, False],
+        packed_row_family_rank=[0, -1],
+        origin_to_base_row=[0],
+        origin_to_family_rows=[[]],
+        uses_fixed_capacity_packing=True,
+    )
+    assert pivot_expansion_indices_fit_prepare_batch(plan, num_reqs=1, expected_packed_size=2)
+    assert get_unselected_cleanup_rows(expansion_plan=plan, selected_rows=[0]) == []
+
+
+def test_collapse_pivot_without_family_uses_origin_to_base_row() -> None:
+    """Inactive packed rows must not affect origin count (use ``origin_batch_size``)."""
+    B, P = 2, 4
+    plan = PivotExpansionPlan(
+        expanded_to_origin=[0, 1, 0, 0],
+        families=[],
+        expanded_batch_size=P,
+        origin_batch_size=B,
+        packed_batch_size=P,
+        packed_to_origin=[0, 1, -1, -1],
+        packed_sm_origin=[0, 1, 0, 0],
+        packed_row_is_active=[True, True, False, False],
+        packed_row_is_base=[True, True, False, False],
+        packed_row_family_rank=[0, 0, -1, -1],
+        origin_to_base_row=[0, 1],
+        origin_to_family_rows=[[], []],
+        uses_fixed_capacity_packing=True,
+    )
+    sampled = torch.tensor([[10], [20], [99], [99]], dtype=torch.int32)
+    out = collapse_pivot_expanded_sampled_to_origin(sampled, plan)
+    assert out.shape == (B, 1)
+    assert int(out[0, 0].item()) == 10
+    assert int(out[1, 0].item()) == 20
 
 
 def test_validate_root_only_pivot_expansion_rejects_non_root_prefix() -> None:

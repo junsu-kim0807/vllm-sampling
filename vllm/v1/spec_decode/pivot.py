@@ -161,9 +161,14 @@ def _collapse_draft_rows_for_scheduler(
         device=out_exp.device,
     )
     for origin in range(origin_batch_size):
-        row_idx = next(
-            idx for idx, orig in enumerate(plan.expanded_to_origin) if orig == origin
-        )
+        if plan.origin_to_base_row is not None:
+            row_idx = int(plan.origin_to_base_row[origin])
+        else:
+            row_idx = next(
+                idx
+                for idx, orig in enumerate(plan.expanded_to_origin)
+                if orig == origin
+            )
         out[origin].copy_(out_exp[row_idx])
     return out
 
@@ -455,6 +460,9 @@ class PivotProposer:
         *,
         expansion_plan: PivotExpansionPlan,
     ) -> list[PivotTreeFamily]:
+        # PR2 (tree packed pivot): fixed-capacity plans with inactive rows need a
+        # family mask / packed-row remap; do not assume len(families) == P or dense
+        # enumerate(expanded_to_origin) alignment.
         families: list[PivotTreeFamily] = []
         row_meta: dict[int, tuple[int, int]] = {}
         for fam in expansion_plan.families:
@@ -548,7 +556,7 @@ class PivotProposer:
         pivot_probs: torch.Tensor | None,
         enable_topk_expansion: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None, PivotExpansionPlan | None]:
-        """Build B' pivot rows and per-row first-step probs (same q(·) as origin)."""
+        """Build packed pivot rows (fixed P) or legacy variable rows (eagle tree)."""
         batch_size = int(initial_pivots.shape[0])
         # Missing q(·) (e.g. parallel drafting fast path): skip expansion safely.
         if (
@@ -565,15 +573,30 @@ class PivotProposer:
             )
             return ep, eprob, None
 
+        # Eagle tree still uses legacy variable-length expansion until PR2.
+        if self._pivot_use_eagle_tree:
+            return self._build_pivot_expansion_plan_legacy_variable(
+                initial_pivots=initial_pivots,
+                pivot_probs=pivot_probs,
+            )
+
+        return self._build_pivot_expansion_plan_fixed_capacity(
+            initial_pivots=initial_pivots,
+            pivot_probs=pivot_probs,
+        )
+
+    def _build_pivot_expansion_plan_legacy_variable(
+        self,
+        *,
+        initial_pivots: torch.Tensor,
+        pivot_probs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, PivotExpansionPlan | None]:
+        """Variable B' expansion for pivot_use_eagle_tree (pre-PR2)."""
+        batch_size = int(initial_pivots.shape[0])
         selected_set = set(self._select_low_confidence_indices(pivot_probs))
         if not selected_set:
             ep = initial_pivots.to(torch.int32)
-            eprob = (
-                pivot_probs[:, :1, :].clone()
-                if pivot_probs is not None
-                else None
-            )
-            return ep, eprob, None
+            return ep, pivot_probs[:, :1, :].clone(), None
 
         expanded_to_origin: list[int] = []
         families: list[PivotExpansionFamily] = []
@@ -608,13 +631,130 @@ class PivotProposer:
             expanded_row += len(cand_ids)
 
         expanded_pivots = torch.cat(pivot_cols, dim=0)
+        p_len = len(expanded_to_origin)
+        seen_o: set[int] = set()
+        is_base_flags: list[bool] = []
+        for o in expanded_to_origin:
+            is_base_flags.append(o not in seen_o)
+            seen_o.add(o)
+        origin_to_base_row = [-1] * batch_size
+        for i, o in enumerate(expanded_to_origin):
+            if origin_to_base_row[o] < 0:
+                origin_to_base_row[o] = i
+        eto = list(expanded_to_origin)
         plan = PivotExpansionPlan(
-            expanded_to_origin=expanded_to_origin,
+            expanded_to_origin=eto,
             families=families,
-            expanded_batch_size=len(expanded_to_origin),
+            expanded_batch_size=p_len,
+            origin_batch_size=batch_size,
+            packed_batch_size=p_len,
+            packed_to_origin=list(eto),
+            packed_sm_origin=list(eto),
+            packed_row_is_active=[True] * p_len,
+            packed_row_is_base=is_base_flags,
+            packed_row_family_rank=[0] * p_len,
+            origin_to_base_row=origin_to_base_row,
+            origin_to_family_rows=[[] for _ in range(batch_size)],
+            uses_fixed_capacity_packing=False,
         )
         idx = torch.tensor(expanded_to_origin, device=pivot_probs.device, dtype=torch.long)
         expanded_probs = pivot_probs[idx, :1, :].clone()
+        return expanded_pivots, expanded_probs, plan
+
+    def _build_pivot_expansion_plan_fixed_capacity(
+        self,
+        *,
+        initial_pivots: torch.Tensor,
+        pivot_probs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, PivotExpansionPlan | None]:
+        """Fixed P = B + ceil(B*pct)*(K-1); Option 2 — always packed when top-k on."""
+        B = int(initial_pivots.shape[0])
+        K = min(self._topk_selection, int(pivot_probs.shape[-1]))
+        num_expand = int(math.ceil(B * self._expansion_pct))
+        p_extra = max(0, K - 1)
+        P = B + num_expand * p_extra
+        base_piv = initial_pivots.to(torch.int32).view(-1)
+
+        packed_to_origin = [-1] * P
+        packed_sm_origin = [0] * P
+        is_active = [False] * P
+        is_base = [False] * P
+        fam_rank = [-1] * P
+        for o in range(B):
+            packed_to_origin[o] = o
+            packed_sm_origin[o] = o
+            is_active[o] = True
+            is_base[o] = True
+            fam_rank[o] = 0
+
+        selected_set = set(self._select_low_confidence_indices(pivot_probs))
+        selected_sorted = sorted(selected_set)[:num_expand]
+
+        pivot_vals = [0] * P
+        for o in range(B):
+            pivot_vals[o] = int(base_piv[o].item())
+        families: list[PivotExpansionFamily] = []
+        origin_to_family_rows: list[list[int]] = [[] for _ in range(B)]
+
+        for b in range(num_expand):
+            owner = selected_sorted[b] if b < len(selected_sorted) else (b % B)
+            for r in range(p_extra):
+                j = B + b * p_extra + r
+                packed_sm_origin[j] = owner
+                if b < len(selected_sorted):
+                    packed_to_origin[j] = owner
+                    is_active[j] = True
+                    fam_rank[j] = r + 1
+                else:
+                    packed_to_origin[j] = -1
+                    is_active[j] = False
+                    fam_rank[j] = -1
+                    pivot_vals[j] = int(base_piv[owner].item())
+            if b < len(selected_sorted):
+                o = int(owner)
+                cand_ids = torch.topk(pivot_probs[o, 0], k=K, largest=True).indices.tolist()
+                cand_ids = [int(t) for t in cand_ids]
+                cand_probs = [float(pivot_probs[o, 0, t].item()) for t in cand_ids]
+                base_row = o
+                expanded_rows = [base_row]
+                for r in range(p_extra):
+                    jj = B + b * p_extra + r
+                    expanded_rows.append(jj)
+                    pivot_vals[jj] = cand_ids[r + 1]
+                families.append(
+                    PivotExpansionFamily(
+                        origin_row=o,
+                        expanded_rows=expanded_rows,
+                        candidate_ranks=list(range(len(cand_ids))),
+                        first_token_ids=cand_ids,
+                        first_token_probs=cand_probs,
+                    )
+                )
+                for r in range(p_extra):
+                    origin_to_family_rows[o].append(B + b * p_extra + r)
+
+        device = initial_pivots.device
+        expanded_pivots = torch.tensor(pivot_vals, device=device, dtype=torch.int32).view(
+            P, 1
+        )
+        sm_idx = torch.tensor(packed_sm_origin, device=pivot_probs.device, dtype=torch.long)
+        expanded_probs = pivot_probs[sm_idx, :1, :].clone()
+        expanded_to_origin = list(packed_sm_origin)
+        plan = PivotExpansionPlan(
+            expanded_to_origin=expanded_to_origin,
+            families=families,
+            expanded_batch_size=P,
+            origin_batch_size=B,
+            packed_batch_size=P,
+            packed_to_origin=list(packed_to_origin),
+            packed_sm_origin=list(packed_sm_origin),
+            packed_row_is_active=list(is_active),
+            packed_row_is_base=list(is_base),
+            packed_row_family_rank=list(fam_rank),
+            origin_to_base_row=list(range(B)),
+            origin_to_family_rows=origin_to_family_rows,
+            uses_fixed_capacity_packing=True,
+        )
         return expanded_pivots, expanded_probs, plan
 
     @staticmethod
@@ -622,7 +762,10 @@ class PivotProposer:
         base_prefix_rows: list[list[int]],
         plan: PivotExpansionPlan,
     ) -> list[list[int]]:
-        return [list(base_prefix_rows[o]) for o in plan.expanded_to_origin]
+        sm = plan.packed_sm_origin
+        if sm is None:
+            sm = plan.expanded_to_origin
+        return [list(base_prefix_rows[o]) for o in sm]
 
     def _expand_sampling_metadata_for_plan(
         self,
@@ -630,9 +773,12 @@ class PivotProposer:
         plan: PivotExpansionPlan,
         expanded_prefix_rows: list[list[int]],
     ) -> SamplingMetadata:
+        sm = plan.packed_sm_origin
+        if sm is None:
+            sm = plan.expanded_to_origin
         return slice_sampling_metadata_for_subbatch(
             sampling_metadata,
-            plan.expanded_to_origin,
+            sm,
             provisional_prefix_rows=expanded_prefix_rows,
             sampled_ids_only=True,
         )
@@ -872,6 +1018,10 @@ class PivotProposer:
             use_draft_probs=use_draft_probs,
             pivot_probs=pivot_probs_rows,
         )
+        if expansion_plan is not None and expansion_plan.packed_row_is_active is not None:
+            for j in range(int(out.shape[0])):
+                if not expansion_plan.packed_row_is_active[j]:
+                    out[j].fill_(PLACEHOLDER_TOKEN_ID)
         return out, probs, expansion_plan
 
     def _propose_via_eagle_tree(
@@ -922,7 +1072,8 @@ class PivotProposer:
             if self._pivot_spechive:
                 self._is_waiting_for_target_collapse = True
             rows_per_family: list[torch.Tensor] = []
-            for fam_row, origin_row in enumerate(expansion_plan.expanded_to_origin):
+            sm_eagle = expansion_plan.packed_sm_origin or expansion_plan.expanded_to_origin
+            for fam_row, origin_row in enumerate(sm_eagle):
                 tok, pos, hid, nxt, cad = self._slice_origin_request_inputs(
                     origin_row=int(origin_row),
                     target_token_ids=target_token_ids,
