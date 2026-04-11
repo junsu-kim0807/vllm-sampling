@@ -1093,6 +1093,134 @@ class PivotProposer:
         )
         return tok, pos, hid, nxt, cad_one
 
+    def _expand_tail_proposer_frontier_for_plan(
+        self,
+        *,
+        plan: PivotExpansionPlan,
+        base_target_token_ids: torch.Tensor,
+        base_target_positions: torch.Tensor,
+        base_target_hidden_states: torch.Tensor,
+        base_next_token_ids: torch.Tensor,
+        base_common_attn_metadata: CommonAttentionMetadata,
+        base_num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        CommonAttentionMetadata,
+        torch.Tensor | None,
+    ]:
+        """Repeat origin frontier tensors/metadata once per packed pivot row (length P).
+
+        Tail drafting must see ``cad.batch_size() == len(prefix_rows)``; after root
+        expansion, ``prefix_rows`` has length P while the incoming metadata is still
+        origin batch B. Row ``j`` copies origin ``packed_sm_origin[j]``.
+        """
+        cad = _hv_clone_cad(base_common_attn_metadata)
+        qsl = cad.query_start_loc
+        p_len = int(plan.expanded_batch_size)
+        sm = plan.packed_sm_origin
+        if sm is None:
+            sm = plan.expanded_to_origin
+        assert len(sm) == p_len
+
+        token_pieces: list[torch.Tensor] = []
+        hidden_pieces: list[torch.Tensor] = []
+        slot_pieces: list[torch.Tensor] = []
+        pos_1d_pieces: list[torch.Tensor] = []
+        pos_2d_pieces: list[torch.Tensor] = []
+        next_ints: list[int] = []
+        seq_rows: list[torch.Tensor] = []
+        block_rows: list[torch.Tensor] = []
+        rej_rows: list[torch.Tensor] = []
+        dcp_rows: list[torch.Tensor] = []
+        lip_rows: list[torch.Tensor] = []
+
+        positions_2d = base_target_positions.dim() > 1
+
+        for j in range(p_len):
+            o = int(sm[j])
+            s = int(qsl[o].item())
+            e = int(qsl[o + 1].item())
+            token_pieces.append(base_target_token_ids[s:e])
+            hidden_pieces.append(base_target_hidden_states[s:e])
+            slot_pieces.append(cad.slot_mapping[s:e])
+            if positions_2d:
+                pos_2d_pieces.append(base_target_positions[:, s:e])
+            else:
+                pos_1d_pieces.append(base_target_positions[s:e])
+            next_ints.append(int(base_next_token_ids[o].item()))
+            seq_rows.append(cad.seq_lens[o : o + 1])
+            block_rows.append(cad.block_table_tensor[o : o + 1])
+            if base_num_rejected_tokens_gpu is not None:
+                rej_rows.append(base_num_rejected_tokens_gpu[o : o + 1])
+            if cad.dcp_local_seq_lens is not None:
+                dcp_rows.append(cad.dcp_local_seq_lens[o : o + 1])
+            if cad.logits_indices_padded is not None:
+                lip_rows.append(cad.logits_indices_padded[o : o + 1])
+
+        out_tokens = torch.cat(token_pieces, dim=0)
+        out_hidden = torch.cat(hidden_pieces, dim=0)
+        out_slot = torch.cat(slot_pieces, dim=0)
+        if positions_2d:
+            out_positions = torch.cat(pos_2d_pieces, dim=1)
+        else:
+            out_positions = torch.cat(pos_1d_pieces, dim=0)
+        out_next = torch.tensor(
+            next_ints, dtype=torch.int32, device=base_next_token_ids.device
+        )
+        out_seq_lens = torch.cat(seq_rows, dim=0)
+        out_block = torch.cat(block_rows, dim=0)
+
+        new_qsl = torch.zeros(p_len + 1, dtype=qsl.dtype, device=qsl.device)
+        cur = 0
+        for j in range(p_len):
+            o = int(sm[j])
+            ql = int(qsl[o + 1].item() - qsl[o].item())
+            cur += ql
+            new_qsl[j + 1] = cur
+        assert cur == int(out_tokens.shape[0]), (
+            f"expanded tail frontier token count mismatch: total={cur} "
+            f"vs flat_len={int(out_tokens.shape[0])}"
+        )
+
+        query_lens = new_qsl[1:] - new_qsl[:-1]
+        max_q = int(query_lens.max().item())
+
+        out_rej = torch.cat(rej_rows, dim=0) if rej_rows else None
+        out_dcp = torch.cat(dcp_rows, dim=0) if dcp_rows else None
+        out_lip = torch.cat(lip_rows, dim=0) if lip_rows else None
+
+        out_cad = cad.replace(
+            query_start_loc=new_qsl,
+            query_start_loc_cpu=new_qsl.detach().cpu(),
+            seq_lens=out_seq_lens,
+            block_table_tensor=out_block,
+            slot_mapping=out_slot,
+            num_reqs=p_len,
+            num_actual_tokens=int(out_tokens.shape[0]),
+            max_query_len=max_q,
+            max_seq_len=int(out_seq_lens.max().item()),
+            dcp_local_seq_lens=out_dcp,
+            dcp_local_seq_lens_cpu=None,
+            logits_indices_padded=out_lip,
+            num_logits_indices=None,
+            _seq_lens_cpu=out_seq_lens.detach().cpu()
+            if cad._seq_lens_cpu is not None
+            else None,
+            _num_computed_tokens_cpu=None,
+            _num_computed_tokens_cache=None,
+        )
+        return (
+            out_tokens,
+            out_positions,
+            out_hidden,
+            out_next,
+            out_cad,
+            out_rej,
+        )
+
     def _compose_tokens_from_pivots(
         self,
         *,
@@ -1108,6 +1236,7 @@ class PivotProposer:
         chunk_len: int,
         use_draft_probs: bool,
         pivot_probs: torch.Tensor | None,
+        expansion_plan: PivotExpansionPlan | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch_size = int(pivots.shape[0])
         out = torch.full(
@@ -1131,25 +1260,66 @@ class PivotProposer:
                 provisional_prefix_rows=full_prefix_rows,
                 sampled_ids_only=True,
             )
-            proposal_hidden_states, tail_prefix_prefab = (
-                self._resolve_hidden_states_for_proposal(
+            tail_cad = base_common_attn_metadata
+            tail_tok = base_target_token_ids
+            tail_pos = base_target_positions
+            tail_next = base_next_token_ids
+            tail_rej = base_num_rejected_tokens_gpu
+            if expansion_plan is not None:
+                (
+                    tail_tok,
+                    tail_pos,
+                    _tail_hid_base,
+                    tail_next,
+                    tail_cad,
+                    tail_rej,
+                ) = self._expand_tail_proposer_frontier_for_plan(
+                    plan=expansion_plan,
                     base_target_token_ids=base_target_token_ids,
                     base_target_positions=base_target_positions,
                     base_target_hidden_states=base_target_hidden_states,
                     base_next_token_ids=base_next_token_ids,
                     base_common_attn_metadata=base_common_attn_metadata,
                     base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-                    prefix_rows=full_prefix_rows,
                 )
-            )
+                assert int(tail_cad.batch_size()) == len(full_prefix_rows) == batch_size
+                logger.warning(
+                    "PIVOT_DEBUG tail_contract: prefix_rows=%d cad_rows=%d next_rows=%d",
+                    len(full_prefix_rows),
+                    int(tail_cad.batch_size()),
+                    int(tail_next.shape[0]),
+                )
+                proposal_hidden_states, tail_prefix_prefab = (
+                    self._resolve_hidden_states_for_proposal(
+                        base_target_token_ids=tail_tok,
+                        base_target_positions=tail_pos,
+                        base_target_hidden_states=_tail_hid_base,
+                        base_next_token_ids=tail_next,
+                        base_common_attn_metadata=tail_cad,
+                        base_num_rejected_tokens_gpu=tail_rej,
+                        prefix_rows=full_prefix_rows,
+                    )
+                )
+            else:
+                proposal_hidden_states, tail_prefix_prefab = (
+                    self._resolve_hidden_states_for_proposal(
+                        base_target_token_ids=base_target_token_ids,
+                        base_target_positions=base_target_positions,
+                        base_target_hidden_states=base_target_hidden_states,
+                        base_next_token_ids=base_next_token_ids,
+                        base_common_attn_metadata=base_common_attn_metadata,
+                        base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                        prefix_rows=full_prefix_rows,
+                    )
+                )
             tail_rows, tail_probs = _propose_chunk_from_prefix(
                 self._main_delegate(),
-                cad=base_common_attn_metadata,
-                target_token_ids=base_target_token_ids,
-                target_positions=base_target_positions,
+                cad=tail_cad,
+                target_token_ids=tail_tok,
+                target_positions=tail_pos,
                 target_hidden_states=proposal_hidden_states,
-                next_token_ids=base_next_token_ids,
-                num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                next_token_ids=tail_next,
+                num_rejected_tokens_gpu=tail_rej,
                 prefix_rows=full_prefix_rows,
                 chunk_len=tail_len,
                 sampling_metadata=tail_sm,
@@ -1274,6 +1444,7 @@ class PivotProposer:
             chunk_len=chunk_len,
             use_draft_probs=use_draft_probs,
             pivot_probs=pivot_probs_rows,
+            expansion_plan=expansion_plan,
         )
         if expansion_plan is not None and expansion_plan.packed_row_is_active is not None:
             for j in range(int(out.shape[0])):
