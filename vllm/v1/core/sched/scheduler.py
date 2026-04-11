@@ -1275,6 +1275,15 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        pivot_post_accept = getattr(
+            model_runner_output,
+            "pivot_post_collapse_accepted_draft_tokens",
+            None,
+        )
+        is_pivot_method = (
+            self.vllm_config.speculative_config is not None
+            and self.vllm_config.speculative_config.method == "pivot"
+        )
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1330,8 +1339,18 @@ class Scheduler(SchedulerInterface):
             )
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
-                num_rejected = num_draft_tokens - num_accepted
+                num_accepted_kv = len(generated_token_ids) - 1
+                num_rejected = num_draft_tokens - num_accepted_kv
+                if (
+                    is_pivot_method
+                    and pivot_post_accept is not None
+                    and req_id in pivot_post_accept
+                ):
+                    num_accepted_stats = min(
+                        num_draft_tokens, int(pivot_post_accept[req_id])
+                    )
+                else:
+                    num_accepted_stats = num_accepted_kv
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1349,7 +1368,7 @@ class Scheduler(SchedulerInterface):
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
-                    num_accepted_tokens=num_accepted,
+                    num_accepted_tokens=num_accepted_stats,
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                     cost_breakdown=cost_breakdown,

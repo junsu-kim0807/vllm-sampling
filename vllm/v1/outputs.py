@@ -268,6 +268,11 @@ class ModelRunnerOutput:
     # Staged speculative verification cost breakdown per batch.
     spec_decode_cost_breakdown: SpecDecodeCostBreakdown | None = None
 
+    # Pivot: per-request accepted draft-token count after expanded-row collapse,
+    # aligned with ``get_target_verification_accepted_draft_prefix_lens`` for
+    # ``len(scheduled_spec_decode_tokens)`` (excludes bonus/recovery past num_draft).
+    pivot_post_collapse_accepted_draft_tokens: dict[str, int] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

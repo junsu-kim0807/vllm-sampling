@@ -4254,6 +4254,7 @@ class GPUModelRunner(
         list[str],
         dict[str, int],
         list[int],
+        dict[str, int] | None,
     ]:
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -4276,6 +4277,27 @@ class GPUModelRunner(
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
         logprobs_tensors = sampler_output.logprobs_tensors
+        pivot_post_collapse_accepted: dict[str, int] | None = None
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "pivot"
+            and sampled_token_ids.shape[-1] > 1
+        ):
+            pivot_counts: dict[str, int] = {}
+            for req_idx in range(num_sampled_tokens):
+                req_id = req_ids_output_copy[req_idx]
+                spec_toks = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+                if not spec_toks:
+                    continue
+                nd = len(spec_toks)
+                row = sampled_token_ids[req_idx : req_idx + 1]
+                c = get_target_verification_accepted_draft_prefix_lens(
+                    row,
+                    [nd],
+                    placeholder_token_id=PLACEHOLDER_TOKEN_ID,
+                )[0]
+                pivot_counts[req_id] = int(c)
+            pivot_post_collapse_accepted = pivot_counts or None
         invalid_req_indices = []
         logprobs_lists = None
         if not self.use_async_scheduling:
@@ -4363,6 +4385,7 @@ class GPUModelRunner(
             req_ids_output_copy,
             req_id_to_index_output_copy,
             invalid_req_indices,
+            pivot_post_collapse_accepted,
         )
 
     @contextmanager
@@ -5140,6 +5163,7 @@ class GPUModelRunner(
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
+                pivot_post_collapse_accepted,
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,
@@ -5212,6 +5236,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 spec_decode_cost_breakdown=spec_decode_cost_breakdown,
+                pivot_post_collapse_accepted_draft_tokens=pivot_post_collapse_accepted,
             )
 
         if not self.use_async_scheduling:
