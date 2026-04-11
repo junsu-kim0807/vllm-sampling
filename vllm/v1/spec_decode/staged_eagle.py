@@ -212,10 +212,13 @@ class IntermediateModelStateProvider:
             ),
         ):
             ret_hidden_states = self.proposer.model(**model_kwargs)  # type: ignore[attr-defined]
-            if self.proposer.model_returns_tuple():  # type: ignore[attr-defined]
-                hidden_states, _ = ret_hidden_states
-            else:
+            # Same convention as eagle.py propose(): tuple is
+            # (last_hidden_states, hidden_states); bundle must carry the second
+            # for downstream target_hidden_states, not the last-layer logits view.
+            if not self.proposer.model_returns_tuple():  # type: ignore[attr-defined]
                 hidden_states = ret_hidden_states
+            else:
+                _, hidden_states = ret_hidden_states
         out_h = hidden_states.to(torch.float32)
         return StagedHiddenStateBundle(
             hidden_states=out_h,
