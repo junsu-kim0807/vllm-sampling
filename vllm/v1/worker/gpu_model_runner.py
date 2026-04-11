@@ -29,6 +29,7 @@ from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (
     CompilationMode,
     CUDAGraphMode,
+    SpeculativeConfig,
     VllmConfig,
     get_layers_from_vllm_config,
     update_config,
@@ -236,6 +237,18 @@ def _pivot_plan_sm_indices(plan: PivotExpansionPlan) -> list[int]:
     if plan.packed_sm_origin is not None:
         return plan.packed_sm_origin
     return plan.expanded_to_origin
+
+
+def _uses_pivot_linear_fixed_capacity_packing(
+    speculative_config: SpeculativeConfig | None,
+) -> bool:
+    """Linear pivot fixed P layout (not eagle-tree legacy variable expansion)."""
+    if speculative_config is None or speculative_config.method != "pivot":
+        return False
+    return (
+        not speculative_config.pivot_use_eagle_tree
+        and int(speculative_config.pivot_topk_selection) > 1
+    )
 
 
 def _expand_list_rows_by_pivot_plan(
@@ -1941,7 +1954,16 @@ class GPUModelRunner(
                     expansion_plan=None,
                 )
             logits_indices = spec_decode_metadata.logits_indices
-            num_sampled_tokens = num_draft_tokens + 1
+            if (
+                use_pivot_expanded
+                and pivot_plan is not None
+                and pivot_plan.uses_fixed_capacity_packing
+            ):
+                # LoRA prompt mapping length must match spec verifier sample count
+                # (sum over packed rows), not origin batch B.
+                num_sampled_tokens = num_draft_meta.astype(np.int32) + 1
+            else:
+                num_sampled_tokens = num_draft_tokens + 1
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
@@ -1953,9 +1975,39 @@ class GPUModelRunner(
                 np.sum(num_sampled_tokens)
                 <= self.vllm_config.scheduler_config.max_num_batched_tokens
             )
-            self.set_active_loras(
-                self.input_batch, num_scheduled_tokens, num_sampled_tokens
+            packed_lora = (
+                use_spec_decode
+                and spec_decode_metadata is not None
+                and spec_decode_metadata.expansion_plan is not None
+                and spec_decode_metadata.expansion_plan.uses_fixed_capacity_packing
+                and spec_decode_metadata.expansion_plan.packed_sm_origin is not None
             )
+            if packed_lora:
+                exp_plan = spec_decode_metadata.expansion_plan
+                assert exp_plan.packed_sm_origin is not None
+                req_lora = self.input_batch.request_lora_mapping[:num_reqs]
+                sm = exp_plan.packed_sm_origin
+                P = exp_plan.packed_batch_size
+                prompt_lora_mapping = tuple(
+                    int(req_lora[int(sm[j])])
+                    for j in range(P)
+                    for _ in range(int(num_sampled_tokens[j]))
+                )
+                token_lora_mapping = tuple(
+                    int(req_lora[i])
+                    for i in range(num_reqs)
+                    for _ in range(int(num_scheduled_tokens[i]))
+                )
+                self._set_active_loras(
+                    prompt_lora_mapping,
+                    token_lora_mapping,
+                    set(self.input_batch.lora_id_to_lora_request.values()),
+                    LoRAMappingType.LANGUAGE,
+                )
+            else:
+                self.set_active_loras(
+                    self.input_batch, num_scheduled_tokens, num_sampled_tokens
+                )
 
         return (
             logits_indices,
@@ -5874,6 +5926,22 @@ class GPUModelRunner(
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+        # Match worst-case packed-pivot verifier sample count for LoRA / capture warmup
+        # (sum over P rows of at most 1 + num_spec speculative slots each).
+        if (
+            _uses_pivot_linear_fixed_capacity_packing(self.speculative_config)
+            and num_reqs > 0
+        ):
+            spec = self.speculative_config
+            assert spec is not None
+            P = spec.pivot_packed_batch_size_for_origin_batch(num_reqs)
+            if P > 0:
+                sp1 = 1 + int(spec.num_speculative_tokens)
+                target = P * sp1
+                base, rem = divmod(target, num_reqs)
+                num_sampled_tokens = np.full(num_reqs, base, dtype=np.int32)
+                if rem:
+                    num_sampled_tokens[:rem] += 1
 
         _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(
@@ -6077,6 +6145,8 @@ class GPUModelRunner(
                         and cudagraph_runtime_mode != CUDAGraphMode.NONE
                     )
                 ) and not self.speculative_config.enforce_eager
+                if _uses_pivot_linear_fixed_capacity_packing(self.speculative_config):
+                    use_cudagraphs = False
 
                 # Note(gnovack) - We need to disable cudagraphs for one of the two
                 # lora cases when cudagraph_specialize_lora is enabled. This is a
@@ -6788,7 +6858,16 @@ class GPUModelRunner(
                 | PivotProposer
                 | ExtractHiddenStatesProposer,
             )
-            self.drafter.initialize_cudagraph_keys(cudagraph_mode)
+            # Drafter capture keys are still origin-B sized; skip until drafter
+            # graphs are packed-P aware (same class of mismatch as target LoRA).
+            if not _uses_pivot_linear_fixed_capacity_packing(self.speculative_config):
+                self.drafter.initialize_cudagraph_keys(cudagraph_mode)
+            else:
+                logger.debug_once(
+                    "Skipping drafter CUDA graph key init for linear fixed-capacity "
+                    "pivot (drafter uses origin batch shape; verifier uses packed P).",
+                    scope="local",
+                )
 
     def calculate_reorder_batch_threshold(self) -> None:
         """
