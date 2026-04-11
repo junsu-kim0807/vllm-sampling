@@ -254,6 +254,12 @@ class StagedHiddenStateBundle:
     batch_size: int
     # Provisional KV frontier ownership marker.
     owns_provisional_frontier: bool = True
+    # When present, ``hidden_states`` rows align with ``pref_cad`` (already
+    # prefix-conditioned). Tuple is
+    # ``(pref_toks, pref_pos, pref_hidden, pref_next, pref_cad)`` matching
+    # ``_build_prefix_conditioned_inputs`` output — use for follow-on propose /
+    # verify without re-slicing against the *base* attention metadata.
+    prefix_prefab: tuple | None = None
 
 
 @dataclass
@@ -400,10 +406,14 @@ def expand_hybrid_bundle_for_pivot_expansion(
     plan = bundle.expansion_plan
     if plan is None or plan.expanded_batch_size <= 0:
         return bundle
-    if bundle.draft_probs is not None and plan.families:
-        # Pivot top-k expansion currently reuses origin q(.) for multiple branches.
-        # Disable stochastic proposal probs for expanded families until branch-
-        # conditioned proposal math is implemented.
+    if (
+        bundle.draft_probs is not None
+        and plan.families
+        and not plan.uses_fixed_capacity_packing
+    ):
+        # Legacy variable expansion: origin q(.) is shared across branches.
+        # Fixed-capacity path: ``expand_hybrid_bundle`` clones rows and patches
+        # first-token mass from ``PivotExpansionFamily.first_token_probs`` (PR3).
         bundle = replace(bundle, draft_probs=None)
     if len(plan.expanded_to_origin) != plan.expanded_batch_size:
         return bundle

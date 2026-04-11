@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.adaptive_cascade import (
+    _hv_clone_cad,
     _propose_chunk_from_prefix,
     _verify_chunk_with_prefix,
 )
@@ -460,9 +461,7 @@ class PivotProposer:
         *,
         expansion_plan: PivotExpansionPlan,
     ) -> list[PivotTreeFamily]:
-        # PR2 (tree packed pivot): fixed-capacity plans with inactive rows need a
-        # family mask / packed-row remap; do not assume len(families) == P or dense
-        # enumerate(expanded_to_origin) alignment.
+        """One ``PivotTreeFamily`` per packed proposal row ``j`` in ``0..P-1``."""
         families: list[PivotTreeFamily] = []
         row_meta: dict[int, tuple[int, int]] = {}
         for fam in expansion_plan.families:
@@ -471,12 +470,17 @@ class PivotProposer:
                     int(fam.candidate_ranks[local_idx]),
                     int(fam.first_token_ids[local_idx]),
                 )
-        for family_id, origin_row in enumerate(expansion_plan.expanded_to_origin):
-            root_rank, root_token_id = row_meta.get(int(family_id), (0, 0))
+        p = int(expansion_plan.expanded_batch_size)
+        eto = expansion_plan.expanded_to_origin
+        if len(eto) != p:
+            return families
+        for j in range(p):
+            origin_row = int(eto[j])
+            root_rank, root_token_id = row_meta.get(j, (0, 0))
             families.append(
                 PivotTreeFamily(
-                    origin_row=int(origin_row),
-                    family_id=int(family_id),
+                    origin_row=origin_row,
+                    family_id=int(j),
                     root_rank=int(root_rank),
                     root_token_id=int(root_token_id),
                     node_row_start=-1,
@@ -497,10 +501,15 @@ class PivotProposer:
         families = self._build_expanded_root_families(expansion_plan=expansion_plan)
         if not families:
             return None
+        b_origin = (
+            int(expansion_plan.origin_batch_size)
+            if expansion_plan.origin_batch_size > 0
+            else max(expansion_plan.expanded_to_origin) + 1
+        )
         flat_plan = build_family_flatten_order(
             families=families,
             template=template,
-            origin_batch_size=max(expansion_plan.expanded_to_origin) + 1,
+            origin_batch_size=b_origin,
         )
         return FamilyTreeBundle(
             plan=flat_plan,
@@ -573,9 +582,10 @@ class PivotProposer:
             )
             return ep, eprob, None
 
-        # Eagle tree still uses legacy variable-length expansion until PR2.
+        # Eagle tree uses the same fixed P layout as linear pivot (PR2) so tree
+        # families, bundle rows, and verifier metadata stay aligned at P.
         if self._pivot_use_eagle_tree:
-            return self._build_pivot_expansion_plan_legacy_variable(
+            return self._build_pivot_expansion_plan_fixed_capacity(
                 initial_pivots=initial_pivots,
                 pivot_probs=pivot_probs,
             )
@@ -591,7 +601,7 @@ class PivotProposer:
         initial_pivots: torch.Tensor,
         pivot_probs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None, PivotExpansionPlan | None]:
-        """Variable B' expansion for pivot_use_eagle_tree (pre-PR2)."""
+        """Variable B' expansion (pre-PR2). Retained for reference; eagle tree uses fixed P."""
         batch_size = int(initial_pivots.shape[0])
         selected_set = set(self._select_low_confidence_indices(pivot_probs))
         if not selected_set:
@@ -793,11 +803,17 @@ class PivotProposer:
         base_common_attn_metadata: CommonAttentionMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
         prefix_rows: list[list[int]],
-    ) -> torch.Tensor:
+    ) -> tuple[
+        torch.Tensor,
+        tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, CommonAttentionMetadata
+        ]
+        | None,
+    ]:
         if self._pivot_mode.proposal_engine != "eagle3_head":
-            return base_target_hidden_states
+            return base_target_hidden_states, None
         if self._pivot_mode.hidden_state_source == "target":
-            return base_target_hidden_states
+            return base_target_hidden_states, None
         provider = self._staged_delegates.hidden_state_provider
         assert provider is not None, (
             "pivot eagle3_head + intermediate pipeline requires "
@@ -815,7 +831,8 @@ class PivotProposer:
         assert round_state.bootstrap_complete and round_state.hidden_bundle is not None, (
             "Intermediate bootstrap must produce hidden state bundle before staged proposal."
         )
-        return round_state.hidden_bundle.hidden_states
+        bundle = round_state.hidden_bundle
+        return bundle.hidden_states, bundle.prefix_prefab
 
     def _slice_origin_request_inputs(
         self,
@@ -906,14 +923,16 @@ class PivotProposer:
                 provisional_prefix_rows=full_prefix_rows,
                 sampled_ids_only=True,
             )
-            proposal_hidden_states = self._resolve_hidden_states_for_proposal(
-                base_target_token_ids=base_target_token_ids,
-                base_target_positions=base_target_positions,
-                base_target_hidden_states=base_target_hidden_states,
-                base_next_token_ids=base_next_token_ids,
-                base_common_attn_metadata=base_common_attn_metadata,
-                base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-                prefix_rows=full_prefix_rows,
+            proposal_hidden_states, tail_prefix_prefab = (
+                self._resolve_hidden_states_for_proposal(
+                    base_target_token_ids=base_target_token_ids,
+                    base_target_positions=base_target_positions,
+                    base_target_hidden_states=base_target_hidden_states,
+                    base_next_token_ids=base_next_token_ids,
+                    base_common_attn_metadata=base_common_attn_metadata,
+                    base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                    prefix_rows=full_prefix_rows,
+                )
             )
             tail_rows, tail_probs = _propose_chunk_from_prefix(
                 self._main_delegate(),
@@ -927,6 +946,7 @@ class PivotProposer:
                 chunk_len=tail_len,
                 sampling_metadata=tail_sm,
                 use_draft_probs=use_draft_probs,
+                prefix_prefab=tail_prefix_prefab,
             )
             out[:, 1 : 1 + tail_len] = tail_rows
 
@@ -958,14 +978,16 @@ class PivotProposer:
         enable_topk_expansion: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None, PivotExpansionPlan | None]:
         need_confidence_probs = enable_topk_expansion and self._topk_selection > 1
-        proposal_hidden_states = self._resolve_hidden_states_for_proposal(
-            base_target_token_ids=base_target_token_ids,
-            base_target_positions=base_target_positions,
-            base_target_hidden_states=base_target_hidden_states,
-            base_next_token_ids=base_next_token_ids,
-            base_common_attn_metadata=base_common_attn_metadata,
-            base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-            prefix_rows=base_prefix_rows,
+        proposal_hidden_states, pivot_prefix_prefab = (
+            self._resolve_hidden_states_for_proposal(
+                base_target_token_ids=base_target_token_ids,
+                base_target_positions=base_target_positions,
+                base_target_hidden_states=base_target_hidden_states,
+                base_next_token_ids=base_next_token_ids,
+                base_common_attn_metadata=base_common_attn_metadata,
+                base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                prefix_rows=base_prefix_rows,
+            )
         )
         pivots, pivot_probs = _propose_chunk_from_prefix(
             self._main_delegate(),
@@ -979,6 +1001,7 @@ class PivotProposer:
             chunk_len=1,
             sampling_metadata=sampling_metadata,
             use_draft_probs=(use_draft_probs or need_confidence_probs),
+            prefix_prefab=pivot_prefix_prefab,
         )
         pivots = pivots.to(torch.int32)[:, :1]
         chosen_pivots, pivot_probs_rows, expansion_plan = self._build_pivot_expansion_plan(
@@ -1039,14 +1062,16 @@ class PivotProposer:
         batch_size = int(common_attn_metadata.batch_size())
         assert self._eagle_head is not None
         base_prefix_rows = [[] for _ in range(batch_size)]
-        proposal_hidden_states = self._resolve_hidden_states_for_proposal(
-            base_target_token_ids=target_token_ids,
-            base_target_positions=target_positions,
-            base_target_hidden_states=target_hidden_states,
-            base_next_token_ids=next_token_ids,
-            base_common_attn_metadata=common_attn_metadata,
-            base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-            prefix_rows=base_prefix_rows,
+        proposal_hidden_states, tree_pivot_prefab = (
+            self._resolve_hidden_states_for_proposal(
+                base_target_token_ids=target_token_ids,
+                base_target_positions=target_positions,
+                base_target_hidden_states=target_hidden_states,
+                base_next_token_ids=next_token_ids,
+                base_common_attn_metadata=common_attn_metadata,
+                base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                prefix_rows=base_prefix_rows,
+            )
         )
         pivots, pivot_probs = _propose_chunk_from_prefix(
             self._eagle_head,
@@ -1060,6 +1085,7 @@ class PivotProposer:
             chunk_len=1,
             sampling_metadata=sampling_metadata,
             use_draft_probs=True,
+            prefix_prefab=tree_pivot_prefab,
         )
         pivots = pivots.to(torch.int32)[:, :1]
         chosen_pivots, _, expansion_plan = self._build_pivot_expansion_plan(
@@ -1126,8 +1152,19 @@ class PivotProposer:
         probs_flat = None
         if use_draft_probs and expansion_plan is None:
             probs_flat = getattr(self._eagle_head, "last_draft_probs_flat", None)
-        # Expanded tree families currently disable stochastic proposal probs.
-        if expansion_plan is not None:
+        elif (
+            use_draft_probs
+            and expansion_plan is not None
+            and expansion_plan.uses_fixed_capacity_packing
+        ):
+            # Fixed P: one tree proposal row per packed index; eagle stores flat
+            # probs aligned to ``rows.reshape(-1)`` when available.
+            probs_flat = getattr(self._eagle_head, "last_draft_probs_flat", None)
+            if probs_flat is not None and int(probs_flat.shape[0]) != int(
+                rows.numel()
+            ):
+                probs_flat = None
+        elif expansion_plan is not None:
             probs_flat = None
         return rows.to(torch.int32), probs_flat, expansion_plan
 
@@ -1176,9 +1213,10 @@ class PivotProposer:
             assert rows.shape[0] == expansion_plan.expanded_batch_size, (
                 f"proposal rows {rows.shape[0]} vs plan {expansion_plan.expanded_batch_size}"
             )
-            # Until branch-conditioned proposal math is fully implemented,
-            # disable stochastic draft probs for expanded pivot families.
-            probs_flat = None
+            # Legacy variable expansion: shared origin q(.) is unsafe for rejection.
+            # Fixed-capacity path: per-row probs from compose / eagle when aligned.
+            if not expansion_plan.uses_fixed_capacity_packing:
+                probs_flat = None
         probs = None
         if probs_flat is not None and probs_flat.numel() > 0:
             probs = probs_flat.view(rows.shape[0], rows.shape[1], probs_flat.shape[-1])
@@ -1241,17 +1279,36 @@ class PivotProposer:
                 f"hidden_rows={int(verifier_hidden_states.shape[0])}, "
                 f"families={int(candidate_tokens.shape[0])}"
             )
-        logits_flat, bonus_logits = _verify_chunk_with_prefix(
-            self._intermediate,
-            cad=base_common_attn_metadata,
-            target_token_ids=base_target_token_ids,
-            target_positions=base_target_positions,
-            target_hidden_states=verifier_hidden_states,
-            next_token_ids=base_next_token_ids,
-            num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-            prefix_rows=prefix_rows,
-            draft_tokens=candidate_tokens.to(torch.int32),
-        )
+        verify_prefab = None
+        if verifier_round_state is not None and verifier_round_state.hidden_bundle is not None:
+            verify_prefab = verifier_round_state.hidden_bundle.prefix_prefab
+        if verify_prefab is not None:
+            pt, pp, ph, pn, pcad = verify_prefab
+            pcad = _hv_clone_cad(pcad)
+            empty_prefix = [[] for _ in range(int(pcad.batch_size()))]
+            logits_flat, bonus_logits = _verify_chunk_with_prefix(
+                self._intermediate,
+                cad=pcad,
+                target_token_ids=pt,
+                target_positions=pp,
+                target_hidden_states=ph,
+                next_token_ids=pn,
+                num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                prefix_rows=empty_prefix,
+                draft_tokens=candidate_tokens.to(torch.int32),
+            )
+        else:
+            logits_flat, bonus_logits = _verify_chunk_with_prefix(
+                self._intermediate,
+                cad=base_common_attn_metadata,
+                target_token_ids=base_target_token_ids,
+                target_positions=base_target_positions,
+                target_hidden_states=verifier_hidden_states,
+                next_token_ids=base_next_token_ids,
+                num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                prefix_rows=prefix_rows,
+                draft_tokens=candidate_tokens.to(torch.int32),
+            )
         return DitRoundVerification(logits_flat=logits_flat, bonus_logits=bonus_logits)
 
     def run_inter_verification_acceptance(

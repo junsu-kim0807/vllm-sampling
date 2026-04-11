@@ -125,6 +125,7 @@ class EagleHeadProposalEngine:
             chunk_len=chunk_len,
             sampling_metadata=sampling_metadata,
             use_draft_probs=use_draft_probs,
+            prefix_prefab=hidden_bundle.prefix_prefab,
         )
         return DitRoundProposal(tokens=rows, probs=probs)
 
@@ -207,11 +208,13 @@ class IntermediateModelStateProvider:
                 hidden_states, _ = ret_hidden_states
             else:
                 hidden_states = ret_hidden_states
+        out_h = hidden_states.to(torch.float32)
         return StagedHiddenStateBundle(
-            hidden_states=hidden_states.to(torch.float32),
+            hidden_states=out_h,
             aux_hidden_states=None,
             batch_size=int(pref_cad.batch_size()),
             owns_provisional_frontier=True,
+            prefix_prefab=(pref_toks, pref_pos, out_h, pref_next, pref_cad),
         )
 
     def bootstrap_from_current_prefix(

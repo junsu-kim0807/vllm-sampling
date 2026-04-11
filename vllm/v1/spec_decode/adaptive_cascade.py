@@ -455,27 +455,35 @@ def _propose_chunk_from_prefix(
     chunk_len: int,
     sampling_metadata: SamplingMetadata,
     use_draft_probs: bool,
+    prefix_prefab: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, CommonAttentionMetadata
+    ]
+    | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sample one chunk from one proposer call conditioned on prefix rows."""
-    (
-        pref_toks,
-        pref_pos,
-        pref_hidden,
-        pref_next,
-        pref_cad,
-        _,
-        _,
-        _,
-    ) = _build_prefix_conditioned_inputs(
-        proposer,
-        cad=_hv_clone_cad(cad),
-        target_token_ids=target_token_ids,
-        target_positions=target_positions,
-        target_hidden_states=target_hidden_states,
-        next_token_ids=next_token_ids,
-        prefix_rows=prefix_rows,
-        roll_rows=None,
-    )
+    if prefix_prefab is not None:
+        pref_toks, pref_pos, pref_hidden, pref_next, pref_cad = prefix_prefab
+        pref_cad = _hv_clone_cad(pref_cad)
+    else:
+        (
+            pref_toks,
+            pref_pos,
+            pref_hidden,
+            pref_next,
+            pref_cad,
+            _,
+            _,
+            _,
+        ) = _build_prefix_conditioned_inputs(
+            proposer,
+            cad=_hv_clone_cad(cad),
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            prefix_rows=prefix_rows,
+            roll_rows=None,
+        )
     rows = proposer.propose(
         target_token_ids=pref_toks,
         target_positions=pref_pos,

@@ -17,13 +17,92 @@ from vllm.v1.spec_decode.spec_stage_ops import (
 from vllm.v1.spec_decode.spec_stage_runtime import (
     EagleTreeTemplate,
     FamilyTreeReduceResult,
+    HybridProposalBundle,
     PivotExpandedTreePlan,
     PivotExpansionFamily,
     PivotExpansionPlan,
     PivotTreeFamily,
     StagedHiddenStateBundle,
+    expand_hybrid_bundle_for_pivot_expansion,
     pivot_expansion_indices_fit_prepare_batch,
 )
+
+
+def test_build_expanded_root_families_one_entry_per_packed_row() -> None:
+    """PR2: tree flatten expects ``len(PivotTreeFamily) == P`` (packed rows)."""
+    proposer = object.__new__(PivotProposer)
+    B, P = 2, 4
+    plan = PivotExpansionPlan(
+        expanded_to_origin=[0, 1, 0, 0],
+        families=[
+            PivotExpansionFamily(
+                origin_row=0,
+                expanded_rows=[0, 2],
+                candidate_ranks=[0, 1],
+                first_token_ids=[7, 8],
+                first_token_probs=[0.6, 0.4],
+            )
+        ],
+        expanded_batch_size=P,
+        origin_batch_size=B,
+        packed_batch_size=P,
+        packed_to_origin=[0, 1, -1, -1],
+        packed_sm_origin=[0, 1, 0, 0],
+        packed_row_is_active=[True, True, True, False],
+        packed_row_is_base=[True, True, False, False],
+        packed_row_family_rank=[0, 0, 1, -1],
+        origin_to_base_row=[0, 1],
+        origin_to_family_rows=[[2], []],
+        uses_fixed_capacity_packing=True,
+    )
+    roots = proposer._build_expanded_root_families(expansion_plan=plan)
+    assert len(roots) == P
+    assert roots[0].root_token_id == 7
+    assert roots[2].root_token_id == 8
+    assert roots[3].root_token_id == 0
+
+
+def test_expand_hybrid_bundle_keeps_probs_when_fixed_capacity_and_families() -> None:
+    """PR3: do not strip ``draft_probs`` solely because ``families`` is non-empty."""
+    B, P = 2, 4
+    plan = PivotExpansionPlan(
+        expanded_to_origin=[0, 1, 0, 0],
+        families=[
+            PivotExpansionFamily(
+                origin_row=0,
+                expanded_rows=[0],
+                candidate_ranks=[0],
+                first_token_ids=[1],
+                first_token_probs=[1.0],
+            )
+        ],
+        expanded_batch_size=P,
+        origin_batch_size=B,
+        packed_batch_size=P,
+        packed_to_origin=[0, 1, -1, -1],
+        packed_sm_origin=[0, 1, 0, 0],
+        packed_row_is_active=[True, True, False, False],
+        packed_row_is_base=[True, True, False, False],
+        packed_row_family_rank=[0, 0, -1, -1],
+        origin_to_base_row=[0, 1],
+        origin_to_family_rows=[[], []],
+        uses_fixed_capacity_packing=True,
+    )
+    lengths = [1, 1, 0, 0]
+    draft_tok = torch.zeros((2,), dtype=torch.int32)
+    cu = torch.tensor([1, 2], dtype=torch.int32)
+    probs = torch.randn(2, 16)
+    bundle = HybridProposalBundle(
+        draft_token_ids=draft_tok,
+        draft_probs=probs,
+        num_draft_tokens=lengths,
+        cu_num_draft_tokens=cu,
+        max_spec_len=1,
+        mode="pivot",
+        expansion_plan=plan,
+    )
+    out = expand_hybrid_bundle_for_pivot_expansion(bundle)
+    assert out.draft_probs is not None
 
 
 def test_pivot_expansion_indices_fit_prepare_batch() -> None:
@@ -239,7 +318,7 @@ def test_pivot_bootstrap_hidden_source_uses_provider_in_intermediate_mode() -> N
         hidden_state_source="intermediate",
     )
     proposer._staged_delegates = SimpleNamespace(hidden_state_provider=_FakeProvider())
-    out = proposer._resolve_hidden_states_for_proposal(
+    out, prefab = proposer._resolve_hidden_states_for_proposal(
         base_target_token_ids=torch.zeros((2,), dtype=torch.int32),
         base_target_positions=torch.zeros((2,), dtype=torch.int64),
         base_target_hidden_states=torch.zeros((2, 4), dtype=torch.float32),
@@ -249,6 +328,7 @@ def test_pivot_bootstrap_hidden_source_uses_provider_in_intermediate_mode() -> N
         prefix_rows=[[], []],
     )
     assert called["value"]
+    assert prefab is None
     assert torch.allclose(out, torch.ones((2, 4), dtype=torch.float32))
 
 
