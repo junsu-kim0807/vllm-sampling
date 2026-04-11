@@ -945,6 +945,36 @@ class PivotProposer:
         )
         return expanded_pivots, None, plan
 
+    def _pivot_probs_sparse_from_root_topk_for_plan(
+        self,
+        plan: PivotExpansionPlan,
+        root_topk: RootTopKInfo,
+        vocab_size: int,
+    ) -> torch.Tensor:
+        """Build ``[P, 1, V]`` root-step probs by scattering top-k rows per origin.
+
+        Used when expansion came from ``RootTopKInfo`` only (no full delegate
+        ``last_draft_probs_flat``) so hybrid bundles still carry per-row q(·) for
+        rejection / non-greedy paths after ``clear_draft_probs()`` on the delegate.
+        """
+        device = root_topk.topk_token_ids.device
+        dtype = torch.float32
+        p_len = int(plan.expanded_batch_size)
+        sm = plan.packed_sm_origin
+        if sm is None:
+            sm = plan.expanded_to_origin
+        b_origin = int(root_topk.topk_token_ids.shape[0])
+        k_w = int(root_topk.topk_token_ids.shape[1])
+        out = torch.zeros(p_len, 1, vocab_size, device=device, dtype=dtype)
+        for j in range(p_len):
+            o = int(sm[j])
+            if o < 0 or o >= b_origin:
+                continue
+            tid = root_topk.topk_token_ids[o, :k_w].long().clamp(0, vocab_size - 1)
+            tpr = root_topk.topk_probs[o, :k_w].to(dtype=dtype)
+            out[j, 0].scatter_(0, tid, tpr)
+        return out
+
     @staticmethod
     def _expand_prefix_rows_for_plan(
         base_prefix_rows: list[list[int]],
@@ -1194,6 +1224,16 @@ class PivotProposer:
                 else None
             ),
         )
+        if (
+            expansion_plan is not None
+            and pivot_probs_rows is None
+            and root_topk is not None
+        ):
+            pivot_probs_rows = self._pivot_probs_sparse_from_root_topk_for_plan(
+                expansion_plan,
+                root_topk,
+                self.vllm_config.model_config.get_vocab_size(),
+            )
         logger.warning(
             "PIVOT_DEBUG root: verification_rows=%d has_plan=%s expanded_batch=%s "
             "used_root_topk=%s used_full_probs=%s",

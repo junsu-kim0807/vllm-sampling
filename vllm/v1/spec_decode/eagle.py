@@ -443,13 +443,27 @@ class SpecDecodeBaseProposer:
         self.last_draft_probs_flat = None
         self.last_root_topk_info = None
 
-    def _fill_last_root_topk_from_logits(self, logits: torch.Tensor) -> None:
-        """Set ``last_root_topk_info`` from root logits when global spec method is pivot."""
+    def _pivot_topk_selection_effective(self) -> int:
+        """Pivot top-k width for this proposer.
+
+        Draft/Eagle heads used inside ``PivotProposer`` use a *sliced* speculative
+        config whose ``method`` is ``eagle*`` / ``draft_model``, not ``pivot``.
+        Pivot flags still live on the runner's global ``VllmConfig.speculative_config``.
+        """
         sc = self.speculative_config
-        if sc.method != "pivot":
-            self.last_root_topk_info = None
-            return
-        k_sel = int(getattr(sc, "pivot_topk_selection", 1) or 1)
+        if sc.method == "pivot":
+            return int(getattr(sc, "pivot_topk_selection", 1) or 1)
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            vcfg = getattr(runner, "vllm_config", None)
+            g = getattr(vcfg, "speculative_config", None) if vcfg is not None else None
+            if g is not None and g.method == "pivot":
+                return int(getattr(g, "pivot_topk_selection", 1) or 1)
+        return 1
+
+    def _fill_last_root_topk_from_logits(self, logits: torch.Tensor) -> None:
+        """Set ``last_root_topk_info`` from root logits when pivot top-k is enabled."""
+        k_sel = self._pivot_topk_selection_effective()
         if k_sel <= 1:
             self.last_root_topk_info = None
             return
@@ -476,10 +490,7 @@ class SpecDecodeBaseProposer:
         """
         if self._use_draft_probs_in_rejection(sampling_metadata):
             return True
-        sc = self.speculative_config
-        # Delegate proposers run with method draft_model/eagle while the global
-        # speculative method is pivot; pivot top-k still needs per-step q(·).
-        return sc.method == "pivot" and int(sc.pivot_topk_selection) > 1
+        return self._pivot_topk_selection_effective() > 1
 
     @staticmethod
     def _with_provisional_draft_prefix(
@@ -624,9 +635,7 @@ class SpecDecodeBaseProposer:
         if self.parallel_drafting:
             draft_token_ids = self._greedy_sample(sample_hidden_states)
             # Parallel path skips processed probs; pivot still needs root q(·).
-            if self.speculative_config.method == "pivot" and int(
-                self.speculative_config.pivot_topk_selection
-            ) > 1:
+            if self._pivot_topk_selection_effective() > 1:
                 logits_root = self.model.compute_logits(sample_hidden_states)
                 self._fill_last_root_topk_from_logits(logits_root)
             return draft_token_ids.view(-1, self.num_speculative_tokens)

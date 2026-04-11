@@ -381,6 +381,39 @@ def test_build_pivot_expansion_plan_from_root_topk_when_probs_missing() -> None:
     assert ep.shape[0] == 5
 
 
+def test_pivot_probs_sparse_from_root_topk_scatters_per_packed_row() -> None:
+    """RootTopK-only expansion still yields [P,1,V] for hybrid bundle draft_probs."""
+    proposer = object.__new__(PivotProposer)
+    proposer.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(get_vocab_size=lambda: 32)
+    )
+    plan = PivotExpansionPlan(
+        expanded_to_origin=[0, 1],
+        families=[],
+        expanded_batch_size=2,
+        origin_batch_size=2,
+        packed_batch_size=2,
+        packed_to_origin=[0, 1],
+        packed_sm_origin=[0, 1],
+        packed_row_is_active=[True, True],
+        packed_row_is_base=[True, True],
+        packed_row_family_rank=[0, 0],
+        origin_to_base_row=[0, 1],
+        origin_to_family_rows=[[], []],
+        uses_fixed_capacity_packing=True,
+    )
+    root_topk = RootTopKInfo(
+        topk_token_ids=torch.tensor([[3, 4], [5, 6]]),
+        topk_probs=torch.tensor([[0.8, 0.2], [0.9, 0.1]], dtype=torch.float32),
+    )
+    dense = proposer._pivot_probs_sparse_from_root_topk_for_plan(
+        plan, root_topk, vocab_size=32
+    )
+    assert dense.shape == (2, 1, 32)
+    assert abs(float(dense[0, 0, 3].item()) - 0.8) < 1e-5
+    assert abs(float(dense[1, 0, 5].item()) - 0.9) < 1e-5
+
+
 def test_pivot_bundle_row_count_matches_metadata_rows() -> None:
     """Regression: staged hybrid bundle row count matches spec decode metadata."""
     plan = PivotExpansionPlan(
