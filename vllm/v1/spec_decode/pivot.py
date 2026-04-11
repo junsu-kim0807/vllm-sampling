@@ -35,7 +35,10 @@ from vllm.v1.spec_decode.adaptive_spechive import (
     _build_hybrid_bundle_from_rows,
     _flatten_prob_rows_for_output,
 )
-from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.draft_model import (
+    DraftModelProposer,
+    PinnedDraftNamespaceDraftModelProposer,
+)
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.spec_stage_ops import (
     build_family_flatten_order,
@@ -266,6 +269,12 @@ class IntermediatePivotModelProposer(DraftModelProposer):
             )
 
 
+class PivotDraftModelProposer(PinnedDraftNamespaceDraftModelProposer):
+    """Root pivot drafter: explicit ``draft_model.*`` namespace (symmetric to
+    :class:`IntermediatePivotModelProposer`).
+    """
+
+
 class PivotTargetDitVerifierProposer(DraftModelProposer):
     """DIT inner verification on the target module (alias `load_model(target)`).
 
@@ -382,7 +391,7 @@ class PivotProposer:
         self._draft: DraftModelProposer | None = None
         self._eagle_head: EagleProposer | None = None
         if mode.proposal_engine == "draft_model":
-            self._draft = DraftModelProposer(
+            self._draft = PivotDraftModelProposer(
                 _vllm_as_plain_draft(vllm_config, length=self._L),
                 device,
                 runner,

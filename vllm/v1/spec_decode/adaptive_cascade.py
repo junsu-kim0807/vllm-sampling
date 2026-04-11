@@ -31,7 +31,10 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
 )
-from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.draft_model import (
+    DraftModelProposer,
+    PinnedDraftNamespaceDraftModelProposer,
+)
 from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.spec_stage_ops import (
     run_verify_stage,
@@ -788,16 +791,16 @@ class AdaptiveSpechiveProposer:
         self._pending_hybrid_bundle: HybridProposalBundle | None = None
 
         if self._mode == "draft_target":
-            self._delegate = DraftModelProposer(
+            self._delegate = PinnedDraftNamespaceDraftModelProposer(
                 _vllm_as_plain_draft(vllm_config), device, runner
             )
         elif self._mode == "inter_verification":
-            self._delegate = DraftModelProposer(
+            self._delegate = PinnedDraftNamespaceDraftModelProposer(
                 _vllm_intermediate_as_draft(vllm_config), device, runner
             )
         else:
             assert self._mode == "hierarchical_verification"
-            self._delegate = DraftModelProposer(
+            self._delegate = PinnedDraftNamespaceDraftModelProposer(
                 _vllm_hierarchical_verification_chunk(
                     vllm_config, length=self._L, intermediate=False
                 ),
