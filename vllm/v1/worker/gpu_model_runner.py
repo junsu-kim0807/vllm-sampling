@@ -3884,6 +3884,18 @@ class GPUModelRunner(
                 spec_decode_metadata=spec_decode_metadata,
             )
             if remapped is None:
+                if (
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "pivot"
+                ):
+                    logger.warning(
+                        "PIVOT_DEBUG sample: metadata_rows=%d bundle_rows=%d "
+                        "bundle_req_ids=%s detail=%s",
+                        len(spec_decode_metadata.num_draft_tokens),
+                        len(bundle.num_draft_tokens),
+                        bundle.bundle_row_req_ids,
+                        remap_info,
+                    )
                 logger.warning(
                     "Dropping hybrid bundle (row alignment to spec metadata failed): %s",
                     remap_info,
@@ -3904,6 +3916,18 @@ class GPUModelRunner(
                 bundle, spec_decode_metadata
             )
             if validated_bundle is None:
+                if (
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "pivot"
+                ):
+                    logger.warning(
+                        "PIVOT_DEBUG sample: metadata_rows=%d bundle_rows=%d "
+                        "bundle_req_ids=%s detail=%s",
+                        len(spec_decode_metadata.num_draft_tokens),
+                        len(bundle.num_draft_tokens),
+                        bundle.bundle_row_req_ids,
+                        "sanitize_validate_failed",
+                    )
                 self.pending_pivot_expansion_plan = None
                 self._dit_debug_event(
                     "spechive_bundle_cleanup_on_validation_failure",

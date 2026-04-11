@@ -717,6 +717,19 @@ class PivotProposer:
         P = B + num_expand * p_extra
         base_piv = initial_pivots.to(torch.int32).view(-1)
 
+        selected_set = set(self._select_low_confidence_indices(pivot_probs))
+        selected_sorted = sorted(selected_set)[:num_expand]
+        logger.warning(
+            "PIVOT_DEBUG plan: B=%d K=%d pct=%.3f num_expand=%d P=%d p_extra=%d selected=%s",
+            B,
+            K,
+            self._expansion_pct,
+            num_expand,
+            P,
+            p_extra,
+            selected_sorted,
+        )
+
         packed_to_origin = [-1] * P
         packed_sm_origin = [0] * P
         is_active = [False] * P
@@ -728,9 +741,6 @@ class PivotProposer:
             is_active[o] = True
             is_base[o] = True
             fam_rank[o] = 0
-
-        selected_set = set(self._select_low_confidence_indices(pivot_probs))
-        selected_sorted = sorted(selected_set)[:num_expand]
 
         pivot_vals = [0] * P
         for o in range(B):
@@ -1548,6 +1558,16 @@ class PivotProposer:
             "is_waiting_for_target_collapse": self._is_waiting_for_target_collapse,
             "num_intermediate_rounds_since_target": self._num_intermediate_rounds_since_target,
         }
+        _phb = self._pending_hybrid_bundle
+        logger.warning(
+            "PIVOT_DEBUG propose: base_batch=%d out_rows=%d has_plan=%s expanded_batch=%s "
+            "pending_bundle_rows=%d",
+            batch_size,
+            int(out.shape[0]),
+            expansion_plan is not None,
+            expansion_plan.expanded_batch_size if expansion_plan is not None else None,
+            len(_phb.num_draft_tokens) if _phb is not None else 0,
+        )
         self.clear_draft_probs()
         return _collapse_draft_rows_for_scheduler(out, expansion_plan, batch_size)
 
