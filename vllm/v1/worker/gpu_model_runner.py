@@ -1984,19 +1984,18 @@ class GPUModelRunner(
                     cu_num_tokens,
                     expansion_plan=None,
                 )
-                if (
-                    pb is not None
-                    and (
-                        len(pb.num_draft_tokens) != num_reqs
-                        or pb.expansion_plan is not None
-                    )
-                ):
+                # Origin-only metadata: do **not** clear the pending bundle just because
+                # len(pb.num_draft_tokens) != num_reqs. Batch shrink / reorder is handled
+                # in _sample() via remap_hybrid_bundle_rows_for_metadata (subset survivor).
+                # Only clear when the bundle still carries an expansion_plan while this
+                # prepare path cannot use packed pivot metadata (true contract mismatch).
+                if pb is not None and pb.expansion_plan is not None:
                     self._clear_pending_pivot_hybrid_at_prepare_boundary(
                         "stale hybrid bundle vs origin-only spec metadata",
                         detail=(
                             f"bundle_rows={len(pb.num_draft_tokens)}, "
                             f"num_reqs={num_reqs}, "
-                            f"had_expansion_plan={pb.expansion_plan is not None}"
+                            "bundle has expansion_plan but prepare uses origin-only metadata"
                         ),
                     )
             logits_indices = spec_decode_metadata.logits_indices
