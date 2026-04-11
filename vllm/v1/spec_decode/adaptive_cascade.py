@@ -618,10 +618,22 @@ def _build_hybrid_bundle_from_rows(
     mode: str,
     draft_probs: torch.Tensor | None,
     source_stage_rows: list[list[int]] | None = None,
+    bundle_row_req_ids: tuple[str, ...] | list[str] | None = None,
 ) -> HybridProposalBundle:
     """Build a flattened proposal bundle from fixed-width padded rows."""
     device = rows_2d.device
-    num_rows = rows_2d.shape[0]
+    num_rows = int(rows_2d.shape[0])
+    br_ids: tuple[str, ...] | None = None
+    if bundle_row_req_ids is not None:
+        br_list = list(bundle_row_req_ids)
+        if len(br_list) != num_rows:
+            logger.warning(
+                "bundle_row_req_ids length %s != num_rows %s; omitting req ids on bundle.",
+                len(br_list),
+                num_rows,
+            )
+        else:
+            br_ids = tuple(str(x) for x in br_list)
     flat_rows: list[torch.Tensor] = []
     lengths: list[int] = []
     source_flat: list[torch.Tensor] = []
@@ -664,6 +676,7 @@ def _build_hybrid_bundle_from_rows(
         max_spec_len=rows_2d.shape[1],
         mode=mode,  # type: ignore[arg-type]
         source_stage=source_stage,
+        bundle_row_req_ids=br_ids,
     )
 
 

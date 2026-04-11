@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 
 import torch
@@ -20,8 +21,11 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     IntermediateRoundState,
     HybridProposalBundle,
     PivotExpandedTreePlan,
+    PivotExpansionFamily,
     PivotExpansionPlan,
     PivotTreeFamily,
+    _split_flat_tokens_by_lengths,
+    _split_probs_by_lengths,
 )
 
 
@@ -649,6 +653,227 @@ def run_verify_stage(
         processed_bonus_probs = torch.empty(0, dtype=torch.float32, device=device)
     rows, _ = RejectionSampler.parse_output(out.sampled_token_ids, vocab_size)
     return rows, out, processed_target_probs, processed_bonus_probs
+
+
+def _permute_pivot_expansion_plan(
+    plan: PivotExpansionPlan,
+    perm_old: list[int],
+) -> PivotExpansionPlan:
+    """Row ``j`` after permutation uses data from old row ``perm_old[j]``."""
+    p = len(perm_old)
+    inv = {perm_old[j]: j for j in range(p)}
+
+    def pick_row_major(field: list[int] | None) -> list[int] | None:
+        if field is None or len(field) != p:
+            return field
+        return [field[perm_old[j]] for j in range(p)]
+
+    new_families: list[PivotExpansionFamily] = []
+    for fam in plan.families:
+        new_families.append(
+            replace(
+                fam,
+                expanded_rows=[inv[r] for r in fam.expanded_rows],
+            )
+        )
+    new_otf: list[list[int]] | None = None
+    if plan.origin_to_family_rows is not None:
+        new_otf = [[inv[r] for r in rows] for rows in plan.origin_to_family_rows]
+    new_otb: list[int] | None = None
+    if plan.origin_to_base_row is not None:
+        new_otb = [inv[plan.origin_to_base_row[o]] for o in range(len(plan.origin_to_base_row))]
+
+    if len(plan.expanded_to_origin) != p:
+        return plan
+    new_eto: list[int] = [plan.expanded_to_origin[perm_old[j]] for j in range(p)]
+    return replace(
+        plan,
+        expanded_to_origin=new_eto,
+        packed_sm_origin=pick_row_major(plan.packed_sm_origin),
+        packed_to_origin=pick_row_major(plan.packed_to_origin),
+        packed_row_is_active=pick_row_major(plan.packed_row_is_active),
+        packed_row_is_base=pick_row_major(plan.packed_row_is_base),
+        packed_row_family_rank=pick_row_major(plan.packed_row_family_rank),
+        families=new_families,
+        origin_to_family_rows=new_otf,
+        origin_to_base_row=new_otb,
+    )
+
+
+def _reorder_hybrid_bundle_rows(
+    bundle: HybridProposalBundle,
+    perm_old: list[int],
+) -> HybridProposalBundle:
+    """Rebuild flattened tensors in row order ``perm_old`` (new row j <- old ``perm_old[j]``)."""
+    p = len(perm_old)
+    old_lens = bundle.num_draft_tokens
+    m_old = len(old_lens)
+    if p == 0:
+        device = bundle.draft_token_ids.device
+        return replace(
+            bundle,
+            draft_token_ids=bundle.draft_token_ids.new_empty((0,), dtype=torch.int32),
+            draft_probs=(
+                None
+                if bundle.draft_probs is None
+                else bundle.draft_probs.new_empty(
+                    (0, bundle.draft_probs.shape[-1]), dtype=bundle.draft_probs.dtype
+                )
+            ),
+            num_draft_tokens=[],
+            cu_num_draft_tokens=torch.zeros(0, dtype=torch.int32, device=device),
+            max_spec_len=bundle.max_spec_len,
+            source_stage=(
+                None
+                if bundle.source_stage is None
+                else bundle.source_stage.new_empty((0,), dtype=torch.int32)
+            ),
+            bundle_row_req_ids=(),
+            expansion_plan=None,
+            tree_plan=None,
+        )
+    for idx in perm_old:
+        if idx < 0 or idx >= m_old:
+            raise ValueError(
+                f"invalid perm_old index {idx} for bundle with {m_old} rows: {perm_old}"
+            )
+    new_lens = [old_lens[perm_old[j]] for j in range(p)]
+    tok_rows = _split_flat_tokens_by_lengths(bundle.draft_token_ids, old_lens)
+    new_tok = torch.cat([tok_rows[perm_old[j]] for j in range(p)], dim=0).to(torch.int32)
+    device = new_tok.device
+    cu = torch.cumsum(torch.tensor(new_lens, dtype=torch.int32, device=device), dim=0)
+    new_probs = None
+    if bundle.draft_probs is not None and bundle.draft_probs.shape[0] == int(
+        bundle.draft_token_ids.shape[0]
+    ):
+        prob_rows = _split_probs_by_lengths(bundle.draft_probs, old_lens)
+        new_probs = torch.cat([prob_rows[perm_old[j]] for j in range(p)], dim=0)
+    new_src = None
+    if bundle.source_stage is not None and bundle.source_stage.shape[0] == int(
+        bundle.draft_token_ids.shape[0]
+    ):
+        src_rows = _split_flat_tokens_by_lengths(bundle.source_stage, old_lens)
+        new_src = torch.cat([src_rows[perm_old[j]] for j in range(p)], dim=0).to(
+            torch.int32
+        )
+    br = bundle.bundle_row_req_ids
+    new_br: tuple[str, ...] | None = None
+    if br is not None and len(br) == m_old:
+        new_br = tuple(str(br[perm_old[j]]) for j in range(p))
+    new_plan = None
+    if bundle.expansion_plan is not None:
+        ep = bundle.expansion_plan
+        if len(ep.expanded_to_origin) == p:
+            new_plan = _permute_pivot_expansion_plan(ep, perm_old)
+    max_spec_len = max(new_lens) if new_lens else bundle.max_spec_len
+    return replace(
+        bundle,
+        draft_token_ids=new_tok,
+        draft_probs=new_probs,
+        num_draft_tokens=new_lens,
+        cu_num_draft_tokens=cu,
+        max_spec_len=max_spec_len,
+        source_stage=new_src,
+        bundle_row_req_ids=new_br,
+        expansion_plan=new_plan,
+        tree_plan=None if p != m_old else bundle.tree_plan,
+    )
+
+
+def remap_hybrid_bundle_rows_for_metadata(
+    bundle: HybridProposalBundle,
+    target_row_req_ids: list[str],
+    *,
+    spec_decode_metadata: SpecDecodeMetadata | None = None,
+) -> tuple[HybridProposalBundle | None, str | None]:
+    """Align bundle rows to ``target_row_req_ids`` (metadata row order).
+
+    Supports:
+    - **Same cardinality**: reorder rows so req-id multiset matches (permutation).
+    - **Subset (batch shrink)**: metadata row count *n* can be smaller than the
+      bundle *m* when every metadata req-id appears at least as often in the
+      bundle (``Counter(metadata) ⊆ Counter(bundle)``). Surviving rows are
+      picked in metadata order; leftover bundle rows (finished requests) are
+      dropped.
+
+    When *n < m* and ``spec_decode_metadata`` carries a pivot ``expansion_plan``
+    with ``len == n``, it replaces the bundle plan after tensor rebuild so the
+    plan matches the current prepare-time batch.
+
+    Tree bundles: reorder is rejected; subset drops ``tree_plan``.
+    """
+    n = len(target_row_req_ids)
+    m = len(bundle.num_draft_tokens)
+    if n > m:
+        return None, (
+            f"metadata rows {n} exceed bundle rows {m} "
+            "(cannot remap to a superset)"
+        )
+    br = bundle.bundle_row_req_ids
+    if br is None:
+        if n == m:
+            return bundle, None
+        return None, (
+            "bundle_row_req_ids missing; cannot subset/remap "
+            f"(bundle_rows={m}, metadata_rows={n})"
+        )
+    if len(br) != m:
+        return None, "bundle_row_req_ids length mismatch"
+    b_list = [str(x) for x in br]
+    t_list = [str(x) for x in target_row_req_ids]
+    if b_list == t_list:
+        return bundle, None
+
+    ct_b = Counter(b_list)
+    ct_t = Counter(t_list)
+    for r, need in ct_t.items():
+        if ct_b[r] < need:
+            return None, (
+                f"metadata needs {need} row(s) for req_id={r!r}, "
+                f"bundle has {ct_b[r]} "
+                f"(bundle_counts={sorted(ct_b.items())}, "
+                f"meta_counts={sorted(ct_t.items())})"
+            )
+
+    if bundle.expansion_plan is not None:
+        ep = bundle.expansion_plan
+        if len(ep.expanded_to_origin) != m:
+            return None, (
+                "expansion_plan expanded_to_origin length does not match bundle rows "
+                f"({len(ep.expanded_to_origin)} vs {m})"
+            )
+
+    queues: dict[str, deque[int]] = {}
+    for i, r in enumerate(b_list):
+        queues.setdefault(r, deque()).append(i)
+    perm_old: list[int] = []
+    for r in t_list:
+        q = queues.get(r)
+        if not q:
+            return None, f"exhausted bundle rows for req_id={r!r}"
+        perm_old.append(q.popleft())
+
+    if bundle.tree_plan is not None and n == m and perm_old != list(range(m)):
+        return None, "cannot reorder hybrid bundle rows when tree_plan is set"
+
+    subset = n < m
+    if not subset and perm_old == list(range(m)):
+        return bundle, None
+
+    try:
+        out = _reorder_hybrid_bundle_rows(bundle, perm_old)
+    except ValueError as e:
+        return None, str(e)
+    if subset:
+        out = replace(out, tree_plan=None)
+        meta = spec_decode_metadata
+        if meta is not None and len(meta.num_draft_tokens) == n:
+            mep = meta.expansion_plan
+            if mep is not None and len(mep.expanded_to_origin) == n:
+                out = replace(out, expansion_plan=mep)
+            else:
+                out = replace(out, expansion_plan=None)
+    return out, ("subset_survivor_remap" if subset else None)
 
 
 def sanitize_hybrid_bundle_for_metadata(

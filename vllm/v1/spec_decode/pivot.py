@@ -174,6 +174,38 @@ def _collapse_draft_rows_for_scheduler(
     return out
 
 
+def _pivot_hybrid_bundle_row_req_ids(
+    runner: object | None,
+    origin_batch_size: int,
+    num_bundle_rows: int,
+    expansion_plan: PivotExpansionPlan | None,
+) -> tuple[str, ...] | None:
+    """Map each proposal row to the scheduler request id for that origin row."""
+    if runner is None or origin_batch_size <= 0 or num_bundle_rows <= 0:
+        return None
+    ib = getattr(runner, "input_batch", None)
+    if ib is None:
+        return None
+    try:
+        req = [str(ib.req_ids[i]) for i in range(origin_batch_size)]
+    except (IndexError, TypeError):
+        return None
+    if expansion_plan is None:
+        if num_bundle_rows != origin_batch_size:
+            return None
+        return tuple(req[b] for b in range(num_bundle_rows))
+    sm = expansion_plan.packed_sm_origin or expansion_plan.expanded_to_origin
+    if len(sm) < num_bundle_rows:
+        return None
+    out: list[str] = []
+    for j in range(num_bundle_rows):
+        o = int(sm[j])
+        if o < 0 or o >= len(req):
+            return None
+        out.append(req[o])
+    return tuple(out)
+
+
 class IntermediatePivotModelProposer(DraftModelProposer):
     """Loads intermediate weights under separate model tag."""
 
@@ -1481,11 +1513,18 @@ class PivotProposer:
         source_stage_rows = [
             [0, *([1] * max(0, self._L - 1))] for _ in range(int(out.shape[0]))
         ]
+        row_req_ids = _pivot_hybrid_bundle_row_req_ids(
+            self.runner,
+            batch_size,
+            int(out.shape[0]),
+            expansion_plan,
+        )
         self._pending_hybrid_bundle = _build_hybrid_bundle_from_rows(
             out,
             mode="pivot",
             draft_probs=draft_probs_flat,
             source_stage_rows=source_stage_rows,
+            bundle_row_req_ids=row_req_ids,
         )
         if expansion_plan is not None:
             self._active_pivot_expansion_plan = expansion_plan

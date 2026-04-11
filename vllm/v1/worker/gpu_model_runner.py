@@ -181,6 +181,7 @@ from vllm.v1.spec_decode.spec_stage_ops import (
     collapse_family_tree_sampled_to_family_paths,
     collapse_pivot_expanded_sampled_to_origin,
     get_unselected_cleanup_rows,
+    remap_hybrid_bundle_rows_for_metadata,
     sanitize_hybrid_bundle_for_metadata,
     validate_root_only_pivot_expansion,
 )
@@ -237,6 +238,36 @@ def _pivot_plan_sm_indices(plan: PivotExpansionPlan) -> list[int]:
     if plan.packed_sm_origin is not None:
         return plan.packed_sm_origin
     return plan.expanded_to_origin
+
+
+def _hybrid_bundle_row_req_ids_for_batch(
+    input_batch,
+    *,
+    origin_batch_size: int,
+    num_bundle_rows: int,
+    pivot_expansion_plan: PivotExpansionPlan | None,
+) -> tuple[str, ...] | None:
+    """One scheduler request id per hybrid bundle row (propose-time batch order)."""
+    if origin_batch_size <= 0 or num_bundle_rows <= 0:
+        return None
+    try:
+        req = [str(input_batch.req_ids[i]) for i in range(origin_batch_size)]
+    except (IndexError, TypeError):
+        return None
+    if pivot_expansion_plan is None:
+        if num_bundle_rows != origin_batch_size:
+            return None
+        return tuple(req[b] for b in range(num_bundle_rows))
+    sm = _pivot_plan_sm_indices(pivot_expansion_plan)
+    if len(sm) < num_bundle_rows:
+        return None
+    out: list[str] = []
+    for j in range(num_bundle_rows):
+        o = int(sm[j])
+        if o < 0 or o >= len(req):
+            return None
+        out.append(req[o])
+    return tuple(out)
 
 
 def _uses_pivot_linear_fixed_capacity_packing(
@@ -1953,6 +1984,21 @@ class GPUModelRunner(
                     cu_num_tokens,
                     expansion_plan=None,
                 )
+                if (
+                    pb is not None
+                    and (
+                        len(pb.num_draft_tokens) != num_reqs
+                        or pb.expansion_plan is not None
+                    )
+                ):
+                    self._clear_pending_pivot_hybrid_at_prepare_boundary(
+                        "stale hybrid bundle vs origin-only spec metadata",
+                        detail=(
+                            f"bundle_rows={len(pb.num_draft_tokens)}, "
+                            f"num_reqs={num_reqs}, "
+                            f"had_expansion_plan={pb.expansion_plan is not None}"
+                        ),
+                    )
             logits_indices = spec_decode_metadata.logits_indices
             if (
                 use_pivot_expanded
@@ -3604,11 +3650,18 @@ class GPUModelRunner(
             if use_draft_probs
             else None
         )
+        row_req_ids = _hybrid_bundle_row_req_ids_for_batch(
+            self.input_batch,
+            origin_batch_size=batch_size,
+            num_bundle_rows=eff_rows,
+            pivot_expansion_plan=pivot_expansion_plan,
+        )
         bundle = _build_hybrid_bundle_from_rows(
             out_exp,
             mode="hierarchical_verification",
             draft_probs=draft_probs_flat,
             source_stage_rows=source_stage_rows,
+            bundle_row_req_ids=row_req_ids,
         )
         if pivot_expansion_plan is not None:
             bundle = dataclass_replace(bundle, expansion_plan=pivot_expansion_plan)
@@ -3711,6 +3764,21 @@ class GPUModelRunner(
             bundle = dataclass_replace(bundle, tree_plan=tree_plan)
         return out, bundle
 
+    def _spec_decode_metadata_row_req_ids(
+        self, meta: SpecDecodeMetadata
+    ) -> list[str]:
+        """Request id per ``meta.num_draft_tokens`` row (matches prepare-time layout)."""
+        n = len(meta.num_draft_tokens)
+        plan = meta.expansion_plan
+        if plan is not None and plan.packed_sm_origin is not None:
+            sm = plan.packed_sm_origin
+            if len(sm) >= n:
+                return [str(self.input_batch.req_ids[int(sm[j])]) for j in range(n)]
+        if plan is not None and len(plan.expanded_to_origin) >= n:
+            eto = plan.expanded_to_origin
+            return [str(self.input_batch.req_ids[int(eto[j])]) for j in range(n)]
+        return [str(self.input_batch.req_ids[j]) for j in range(n)]
+
     def _validate_hybrid_spec_bundle(
         self,
         bundle: HybridProposalBundle,
@@ -3809,6 +3877,29 @@ class GPUModelRunner(
         ):
             draft_probs = getattr(self.drafter, "last_draft_probs_flat", None)
         bundle = self.take_pending_hybrid_spec_bundle()
+        if bundle is not None:
+            target_row_ids = self._spec_decode_metadata_row_req_ids(spec_decode_metadata)
+            remapped, remap_info = remap_hybrid_bundle_rows_for_metadata(
+                bundle,
+                target_row_ids,
+                spec_decode_metadata=spec_decode_metadata,
+            )
+            if remapped is None:
+                logger.warning(
+                    "Dropping hybrid bundle (row alignment to spec metadata failed): %s",
+                    remap_info,
+                )
+                self.pending_pivot_expansion_plan = None
+                discard_pending_state = getattr(
+                    self.drafter, "discard_pending_hierarchical_verification_state", None
+                )
+                if callable(discard_pending_state):
+                    discard_pending_state()
+                bundle = None
+            else:
+                bundle = remapped
+                if remap_info is not None:
+                    logger.debug("Hybrid bundle row order adjusted: %s", remap_info)
         if bundle is not None:
             validated_bundle = self._validate_hybrid_spec_bundle(
                 bundle, spec_decode_metadata

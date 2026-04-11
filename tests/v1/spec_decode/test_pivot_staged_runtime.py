@@ -12,6 +12,7 @@ from vllm.v1.spec_decode.spec_stage_ops import (
     collapse_family_tree_sampled_to_family_paths,
     collapse_pivot_expanded_sampled_to_origin,
     get_unselected_cleanup_rows,
+    remap_hybrid_bundle_rows_for_metadata,
     validate_root_only_pivot_expansion,
 )
 from vllm.v1.spec_decode.spec_stage_runtime import (
@@ -60,6 +61,61 @@ def test_build_expanded_root_families_one_entry_per_packed_row() -> None:
     assert roots[0].root_token_id == 7
     assert roots[2].root_token_id == 8
     assert roots[3].root_token_id == 0
+
+
+def test_remap_hybrid_bundle_reorders_rows_by_req_id() -> None:
+    plan = PivotExpansionPlan(
+        expanded_to_origin=[0, 1],
+        families=[],
+        expanded_batch_size=2,
+        origin_batch_size=2,
+        packed_batch_size=2,
+        packed_to_origin=[0, 1],
+        packed_sm_origin=[0, 1],
+        packed_row_is_active=[True, True],
+        packed_row_is_base=[True, True],
+        packed_row_family_rank=[0, 0],
+        origin_to_base_row=[0, 1],
+        origin_to_family_rows=[[], []],
+        uses_fixed_capacity_packing=True,
+    )
+    bundle = HybridProposalBundle(
+        draft_token_ids=torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+        draft_probs=None,
+        num_draft_tokens=[2, 2],
+        cu_num_draft_tokens=torch.tensor([2, 4], dtype=torch.int32),
+        max_spec_len=2,
+        mode="pivot",
+        expansion_plan=plan,
+        bundle_row_req_ids=("req_b", "req_a"),
+    )
+    out, info = remap_hybrid_bundle_rows_for_metadata(bundle, ["req_a", "req_b"])
+    assert info is None
+    assert out is not None
+    assert list(out.draft_token_ids.tolist()) == [3, 4, 1, 2]
+    assert out.bundle_row_req_ids == ("req_a", "req_b")
+    assert out.expansion_plan is not None
+    assert list(out.expansion_plan.expanded_to_origin) == [1, 0]
+    assert list(out.expansion_plan.packed_sm_origin or []) == [1, 0]
+
+
+def test_remap_hybrid_bundle_subset_survivor_rows() -> None:
+    """Batch shrink: keep metadata rows that are a strict subset of bundle rows."""
+    bundle = HybridProposalBundle(
+        draft_token_ids=torch.tensor([10, 20, 30, 40], dtype=torch.int32),
+        draft_probs=None,
+        num_draft_tokens=[1, 1, 1, 1],
+        cu_num_draft_tokens=torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+        max_spec_len=1,
+        mode="pivot",
+        expansion_plan=None,
+        bundle_row_req_ids=("r_a", "r_b", "r_c", "r_d"),
+    )
+    out, info = remap_hybrid_bundle_rows_for_metadata(bundle, ["r_b", "r_d"])
+    assert info == "subset_survivor_remap"
+    assert out is not None
+    assert list(out.draft_token_ids.tolist()) == [20, 40]
+    assert out.bundle_row_req_ids == ("r_b", "r_d")
 
 
 def test_expand_hybrid_bundle_keeps_probs_when_fixed_capacity_and_families() -> None:

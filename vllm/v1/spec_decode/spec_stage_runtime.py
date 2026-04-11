@@ -143,6 +143,10 @@ class HybridProposalBundle:
     expansion_plan: PivotExpansionPlan | None = None
     # Optional tree-family flatten/reconstruction contract.
     tree_plan: PivotExpandedTreePlan | None = None
+    # Per bundle row: scheduler request id at propose time (same length as
+    # ``num_draft_tokens``). Used to reorder / validate against the current
+    # batch when prepare-time metadata rows differ from propose-time order.
+    bundle_row_req_ids: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -533,6 +537,11 @@ def expand_hybrid_bundle_for_pivot_expansion(
     source_stage = torch.cat(new_src, dim=0).to(torch.int32) if new_src else None
     max_spec_len = max(new_lengths) if new_lengths else bundle.max_spec_len
 
+    new_br: tuple[str, ...] | None = None
+    br = bundle.bundle_row_req_ids
+    if br is not None and len(br) == origin_b:
+        new_br = tuple(str(br[int(sm[j])]) for j in range(len(sm)))
+
     return replace(
         bundle,
         draft_token_ids=draft_token_ids,
@@ -541,4 +550,5 @@ def expand_hybrid_bundle_for_pivot_expansion(
         cu_num_draft_tokens=cu,
         max_spec_len=max_spec_len,
         source_stage=source_stage,
+        bundle_row_req_ids=new_br,
     )
