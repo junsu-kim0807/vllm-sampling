@@ -5035,7 +5035,7 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens),
             num_tokens_unpadded=num_tokens_unpadded,
             num_tokens_padded=num_tokens_padded,
-            max_query_len=max_query_len,
+            max_query_len=max_num_scheduled_tokens,
             speculative_decode_active=use_spec_decode,
             cudagraph_mode=str(cudagraph_mode),
         ))
