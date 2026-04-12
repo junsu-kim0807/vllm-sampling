@@ -37,6 +37,14 @@ from vllm.v1.spec_decode.profiler import (
     NullSpecDecodeProfiler,
     OnlineSpecDecodeProfiler,
 )
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
+from vllm.v1.spec_decode.spec_stage_ops import (
+    select_pivot_expanded_rows_to_origin,
+)
+from vllm.v1.spec_decode.spec_stage_runtime import (
+    PivotExpansionFamily,
+    PivotExpansionPlan,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +531,43 @@ class TestOriginCollapseHelpers:
         winner_partial = [per_row_partial[rows[0]]
                           for rows in origin_to_rows.values()]
         assert winner_partial == [5, 4]
+
+    def test_select_pivot_expanded_rows_prefers_longer_accept(self):
+        plan = PivotExpansionPlan(
+            expanded_to_origin=[0, 1, 0, 1],
+            families=[
+                PivotExpansionFamily(
+                    origin_row=0,
+                    expanded_rows=[0, 2],
+                    candidate_ranks=[0, 1],
+                    first_token_ids=[11, 12],
+                    first_token_probs=[0.9, 0.4],
+                ),
+                PivotExpansionFamily(
+                    origin_row=1,
+                    expanded_rows=[1, 3],
+                    candidate_ranks=[0, 1],
+                    first_token_ids=[21, 22],
+                    first_token_probs=[0.8, 0.3],
+                ),
+            ],
+            expanded_batch_size=4,
+            origin_batch_size=2,
+            packed_row_is_active=[True, True, True, True],
+            origin_to_base_row=[0, 1],
+        )
+        sampled = pytest.importorskip("torch").tensor([
+            [1, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID],
+            [2, 3, PLACEHOLDER_TOKEN_ID],
+            [4, 5, 6],
+            [7, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID],
+        ])
+        selected = select_pivot_expanded_rows_to_origin(
+            sampled,
+            plan,
+            num_draft_tokens=[3, 3, 3, 3],
+        )
+        assert selected == [2, 1]
 
 
 # ---------------------------------------------------------------------------

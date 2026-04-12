@@ -321,22 +321,17 @@ def collapse_family_paths_to_origin(
     return sampled_token_ids.index_select(0, idx), selected_family_rows
 
 
-def collapse_pivot_expanded_sampled_to_origin(
+def select_pivot_expanded_rows_to_origin(
     sampled_token_ids: torch.Tensor,
     expansion_plan: PivotExpansionPlan,
     *,
     num_draft_tokens: list[int] | None = None,
-) -> torch.Tensor:
-    """Map expanded verification rows (P) back to one row per origin request (B).
-
-    Inactive fixed-capacity packed rows are never chosen from ``PivotExpansionFamily``
-    (those indices are omitted from ``expanded_rows``); we still skip any inactive
-    row defensively when ``packed_row_is_active`` is present.
-    """
+) -> list[int]:
+    """Select one expanded row per origin using collapse tie-break rules."""
     if sampled_token_ids.shape[0] < expansion_plan.expanded_batch_size:
-        return sampled_token_ids
+        return list(range(int(sampled_token_ids.shape[0])))
     if not expansion_plan.expanded_to_origin:
-        return sampled_token_ids
+        return list(range(int(sampled_token_ids.shape[0])))
     if (
         num_draft_tokens is not None
         and len(num_draft_tokens) == expansion_plan.expanded_batch_size
@@ -405,6 +400,30 @@ def collapse_pivot_expanded_sampled_to_origin(
             else:
                 j = best_row
         selected_rows.append(j)
+    return selected_rows
+
+
+def collapse_pivot_expanded_sampled_to_origin(
+    sampled_token_ids: torch.Tensor,
+    expansion_plan: PivotExpansionPlan,
+    *,
+    num_draft_tokens: list[int] | None = None,
+) -> torch.Tensor:
+    """Map expanded verification rows (P) back to one row per origin request (B).
+
+    Inactive fixed-capacity packed rows are never chosen from ``PivotExpansionFamily``
+    (those indices are omitted from ``expanded_rows``); we still skip any inactive
+    row defensively when ``packed_row_is_active`` is present.
+    """
+    if sampled_token_ids.shape[0] < expansion_plan.expanded_batch_size:
+        return sampled_token_ids
+    if not expansion_plan.expanded_to_origin:
+        return sampled_token_ids
+    selected_rows = select_pivot_expanded_rows_to_origin(
+        sampled_token_ids,
+        expansion_plan,
+        num_draft_tokens=num_draft_tokens,
+    )
     device = sampled_token_ids.device
     idx = torch.tensor(selected_rows, device=device, dtype=torch.long)
     return sampled_token_ids.index_select(0, idx)

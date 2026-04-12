@@ -1475,6 +1475,47 @@ class PivotProposer:
                 pivot_probs is not None,
             )
         if expansion_plan is not None:
+            _ec_prof = (
+                getattr(self.runner, "_spec_profiler", None)
+                if self.runner is not None
+                else None
+            )
+            _pctx = (
+                getattr(self.runner, "_current_profile_ctx", None)
+                if self.runner is not None
+                else None
+            )
+            if _ec_prof is not None and _pctx is not None:
+                from vllm.v1.spec_decode.profiler_types import (  # noqa: E402
+                    SpecDecodeFamilyMetadataRecord,
+                )
+
+                _exp_pct = (
+                    ((int(expansion_plan.expanded_batch_size) - int(batch_size))
+                     / int(batch_size) * 100.0)
+                    if int(batch_size) > 0
+                    else 0.0
+                )
+                for _fi, _fam in enumerate(expansion_plan.families):
+                    _origin_b = int(getattr(_fam, "origin_row", -1))
+                    _origin_rid = (
+                        self.runner.input_batch.req_ids[_origin_b]
+                        if 0 <= _origin_b < len(self.runner.input_batch.req_ids)
+                        else ""
+                    )
+                    _ec_prof.emit_family_metadata(
+                        SpecDecodeFamilyMetadataRecord(
+                            step_id=getattr(_pctx, "step_id", 0),
+                            family_id=f"{_origin_rid}:f{_fi}",
+                            origin_req_id=_origin_rid,
+                            family_stage="expand",
+                            family_width_before=1,
+                            family_width_after=len(getattr(_fam, "expanded_rows", [])),
+                            topk_k=len(getattr(_fam, "candidate_ranks", [])),
+                            expansion_pct=_exp_pct,
+                        )
+                    )
+        if expansion_plan is not None:
             self._active_pivot_expansion_plan = expansion_plan
             if self._pivot_spechive:
                 self._is_waiting_for_target_collapse = True

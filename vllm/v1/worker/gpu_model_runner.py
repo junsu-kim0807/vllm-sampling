@@ -184,6 +184,7 @@ from vllm.v1.spec_decode.spec_stage_ops import (
     get_unselected_cleanup_rows,
     remap_hybrid_bundle_rows_for_metadata,
     sanitize_hybrid_bundle_for_metadata,
+    select_pivot_expanded_rows_to_origin,
     validate_root_only_pivot_expansion,
 )
 from vllm.v1.spec_decode.spec_stage_runtime import (
@@ -3538,6 +3539,152 @@ class GPUModelRunner(
         self._dit_debug_event("summary", {"reason": reason, "checks": summary})
         self._dit_debug_check_counts.clear()
 
+    @staticmethod
+    def _pivot_profile_row_is_active(
+        expansion_plan: PivotExpansionPlan | None, row_idx: int
+    ) -> bool:
+        if expansion_plan is None:
+            return True
+        active = expansion_plan.packed_row_is_active
+        if active is None:
+            return True
+        return 0 <= row_idx < len(active) and bool(active[row_idx])
+
+    def _populate_staged_profile_context_from_bundle(
+        self,
+        *,
+        bundle: HybridProposalBundle,
+        expansion_plan: PivotExpansionPlan | None,
+        selected_rows: list[int] | None,
+        origin_batch_size: int,
+    ) -> None:
+        pctx = self._current_profile_ctx
+        if pctx is None or bundle.mode != "hierarchical_verification":
+            return
+        inter_verified_rows = bundle.inter_verified_counts
+        inter_accepted_rows = bundle.inter_accepted_counts
+        if inter_verified_rows is None or inter_accepted_rows is None:
+            return
+
+        inter_verified_per_req = [0] * origin_batch_size
+        inter_accepted_per_req = [0] * origin_batch_size
+        partial_accepted_per_req = [0] * origin_batch_size
+
+        if expansion_plan is not None:
+            sm = expansion_plan.packed_sm_origin
+            if sm is None or len(sm) != len(bundle.num_draft_tokens):
+                sm = expansion_plan.expanded_to_origin
+            for row_idx, origin_row in enumerate(sm):
+                if not self._pivot_profile_row_is_active(expansion_plan, row_idx):
+                    continue
+                if not (0 <= origin_row < origin_batch_size):
+                    continue
+                if row_idx < len(inter_verified_rows):
+                    inter_verified_per_req[origin_row] += int(
+                        inter_verified_rows[row_idx]
+                    )
+                if row_idx < len(inter_accepted_rows):
+                    inter_accepted_per_req[origin_row] += int(
+                        inter_accepted_rows[row_idx]
+                    )
+            if selected_rows is not None:
+                for origin_row, row_idx in enumerate(selected_rows):
+                    if origin_row >= origin_batch_size:
+                        break
+                    if 0 <= row_idx < len(inter_accepted_rows):
+                        partial_accepted_per_req[origin_row] = int(
+                            inter_accepted_rows[row_idx]
+                        )
+        else:
+            limit = min(
+                origin_batch_size,
+                len(inter_verified_rows),
+                len(inter_accepted_rows),
+            )
+            for row_idx in range(limit):
+                inter_verified_per_req[row_idx] = int(inter_verified_rows[row_idx])
+                inter_accepted_per_req[row_idx] = int(inter_accepted_rows[row_idx])
+                partial_accepted_per_req[row_idx] = int(inter_accepted_rows[row_idx])
+
+        pctx.inter_verified_per_req = inter_verified_per_req
+        pctx.inter_accepted_per_req = inter_accepted_per_req
+        pctx.partial_accepted_per_req = partial_accepted_per_req
+        pctx.staged_verification_depth = int(bundle.staged_verification_depth)
+        pctx.staged_verification_used = True
+
+    def _emit_pivot_collapse_family_metadata(
+        self,
+        *,
+        expansion_plan: PivotExpansionPlan | None,
+        selected_rows: list[int] | None,
+        accepted_lens: list[int] | None,
+        req_ids: list[str],
+    ) -> None:
+        if expansion_plan is None or not expansion_plan.families:
+            return
+        if selected_rows is None or accepted_lens is None:
+            return
+
+        from vllm.v1.spec_decode.profiler_types import (  # noqa: E402
+            SpecDecodeFamilyMetadataRecord,
+        )
+
+        step_id = getattr(self._current_profile_ctx, "step_id", 0)
+        origin_batch_size = (
+            int(expansion_plan.origin_batch_size)
+            if expansion_plan.origin_batch_size > 0
+            else len(selected_rows)
+        )
+        expansion_pct = (
+            ((int(expansion_plan.expanded_batch_size) - origin_batch_size)
+             / origin_batch_size * 100.0)
+            if origin_batch_size > 0
+            else 0.0
+        )
+
+        for fam_idx, fam in enumerate(expansion_plan.families):
+            origin_row = int(fam.origin_row)
+            if not (0 <= origin_row < len(selected_rows) and origin_row < len(req_ids)):
+                continue
+            winner_row_idx = int(selected_rows[origin_row])
+            if winner_row_idx not in fam.expanded_rows:
+                continue
+
+            active_rows = [
+                int(row_idx)
+                for row_idx in fam.expanded_rows
+                if self._pivot_profile_row_is_active(expansion_plan, int(row_idx))
+            ]
+            if not active_rows:
+                continue
+
+            winner_local_idx = active_rows.index(winner_row_idx)
+            winner_accept_len = (
+                int(accepted_lens[winner_row_idx])
+                if 0 <= winner_row_idx < len(accepted_lens)
+                else 0
+            )
+            selected_req_ids = [req_ids[origin_row]] * len(active_rows)
+            self._spec_profiler.emit_family_metadata(
+                SpecDecodeFamilyMetadataRecord(
+                    step_id=step_id,
+                    family_id=f"{req_ids[origin_row]}:f{fam_idx}:collapse",
+                    origin_req_id=req_ids[origin_row],
+                    family_stage="collapse",
+                    family_width_before=len(active_rows),
+                    family_width_after=1,
+                    pruned_variant_count=max(0, len(active_rows) - 1),
+                    winner_family_row_idx=winner_local_idx,
+                    winner_accept_len=winner_accept_len,
+                    topk_k=len(getattr(fam, "candidate_ranks", [])),
+                    expansion_pct=expansion_pct,
+                    collapse_reason=(
+                        "winner_selected" if winner_accept_len > 0 else "all_rejected"
+                    ),
+                    selected_expansion_req_ids=selected_req_ids,
+                )
+            )
+
     # DIT shadow replay helpers were removed. DIT now runs with local round
     # orchestration and token buffers inside run_hierarchical_verification_rounds().
 
@@ -3597,6 +3744,8 @@ class GPUModelRunner(
         prefix_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
         source_stage_rows: list[list[int]] = [[] for _ in range(batch_size)]
         expected_prefix_rows: list[list[int]] = [[] for _ in range(batch_size)]
+        inter_verified_rows: list[int] = [0 for _ in range(batch_size)]
+        inter_accepted_rows: list[int] = [0 for _ in range(batch_size)]
         pivot_expansion_plan: PivotExpansionPlan | None = None
 
         for round_idx in range(n_inner):
@@ -3692,6 +3841,14 @@ class GPUModelRunner(
                 source_stage_rows = _expand_list_rows_by_pivot_plan(
                     source_stage_rows, pivot_expansion_plan
                 )
+                inter_verified_rows = [
+                    inter_verified_rows[o]
+                    for o in _pivot_plan_sm_indices(pivot_expansion_plan)
+                ]
+                inter_accepted_rows = [
+                    inter_accepted_rows[o]
+                    for o in _pivot_plan_sm_indices(pivot_expansion_plan)
+                ]
                 expected_prefix_rows = _expand_list_rows_by_pivot_plan(
                     expected_prefix_rows, pivot_expansion_plan
                 )
@@ -3827,6 +3984,11 @@ class GPUModelRunner(
             )
             _hv_prof.end_stage("reject_sample",
                                invocation_idx=round_idx)
+            for b in range(eff_bs):
+                if not self._pivot_profile_row_is_active(pivot_expansion_plan, b):
+                    continue
+                inter_verified_rows[b] += int(L)
+                inter_accepted_rows[b] += len(decision.emitted_rows[b])
             before_lens = [len(r) for r in prefix_rows]
             for b, emitted in enumerate(decision.emitted_rows):
                 prefix_rows[b].extend(emitted)
@@ -3918,6 +4080,14 @@ class GPUModelRunner(
                 source_stage_rows = _expand_list_rows_by_pivot_plan(
                     source_stage_rows, pivot_expansion_plan
                 )
+                inter_verified_rows = [
+                    inter_verified_rows[o]
+                    for o in _pivot_plan_sm_indices(pivot_expansion_plan)
+                ]
+                inter_accepted_rows = [
+                    inter_accepted_rows[o]
+                    for o in _pivot_plan_sm_indices(pivot_expansion_plan)
+                ]
             tail_eff = int(tail.tokens.shape[0])
             tail_rows = [
                 [int(tok) for tok in tail.tokens[b].tolist()] for b in range(tail_eff)
@@ -3978,6 +4148,12 @@ class GPUModelRunner(
             draft_probs=draft_probs_flat,
             source_stage_rows=source_stage_rows,
             bundle_row_req_ids=row_req_ids,
+        )
+        bundle = dataclass_replace(
+            bundle,
+            inter_verified_counts=inter_verified_rows,
+            inter_accepted_counts=inter_accepted_rows,
+            staged_verification_depth=int(n_inner),
         )
         if pivot_expansion_plan is not None:
             bundle = dataclass_replace(bundle, expansion_plan=pivot_expansion_plan)
@@ -4322,6 +4498,26 @@ class GPUModelRunner(
                     num_draft_for_collapse,
                 )
             )
+        selected_rows: list[int] | None = None
+        pre_collapse_accept_lens: list[int] | None = None
+        if expansion_plan is not None:
+            if (
+                num_draft_for_collapse is not None
+                and len(num_draft_for_collapse)
+                == int(sampler_output.sampled_token_ids.shape[0])
+            ):
+                pre_collapse_accept_lens = (
+                    get_target_verification_accepted_draft_prefix_lens(
+                        sampler_output.sampled_token_ids,
+                        num_draft_for_collapse,
+                        placeholder_token_id=PLACEHOLDER_TOKEN_ID,
+                    )
+                )
+            else:
+                pre_collapse_accept_lens = get_accepted_draft_lens_from_sampled_tokens(
+                    sampler_output.sampled_token_ids,
+                    placeholder_token_id=PLACEHOLDER_TOKEN_ID,
+                )
         if tree_plan is not None:
             reduced = collapse_family_tree_sampled_to_family_paths(
                 sampler_output.sampled_token_ids,
@@ -4359,6 +4555,11 @@ class GPUModelRunner(
                     ),
                 )
         elif expansion_plan is not None:
+            selected_rows = select_pivot_expanded_rows_to_origin(
+                sampler_output.sampled_token_ids,
+                expansion_plan,
+                num_draft_tokens=num_draft_for_collapse,
+            )
             sampler_output.sampled_token_ids = collapse_pivot_expanded_sampled_to_origin(
                 sampler_output.sampled_token_ids,
                 expansion_plan,
@@ -4398,6 +4599,22 @@ class GPUModelRunner(
                 len(num_draft_for_collapse or []),
                 tree_plan is not None,
                 post_nd_use is not None,
+            )
+        if bundle is not None:
+            self._populate_staged_profile_context_from_bundle(
+                bundle=bundle,
+                expansion_plan=expansion_plan,
+                selected_rows=selected_rows,
+                origin_batch_size=int(sampler_output.sampled_token_ids.shape[0]),
+            )
+        if tree_plan is None:
+            self._emit_pivot_collapse_family_metadata(
+                expansion_plan=expansion_plan,
+                selected_rows=selected_rows,
+                accepted_lens=pre_collapse_accept_lens,
+                req_ids=list(
+                    self.input_batch.req_ids[: int(sampler_output.sampled_token_ids.shape[0])]
+                ),
             )
         self.pending_pivot_expansion_plan = None
         if bundle is not None and bundle.mode == "hierarchical_verification":
@@ -5128,7 +5345,6 @@ class GPUModelRunner(
         from vllm.v1.spec_decode.profiler_types import (  # noqa: E402
             SpecDecodeBatchMetadataRecord,
             SpecDecodeRequestMetadataRecord,
-            SpecDecodeFamilyMetadataRecord,
         )
         _profiler.emit_batch_metadata(SpecDecodeBatchMetadataRecord(
             step_id=scheduler_output.spec_profile_step_id,
@@ -5558,7 +5774,6 @@ class GPUModelRunner(
             # -- Unified profiler: emit request + family metadata --
             from vllm.v1.spec_decode.profiler_types import (
                 SpecDecodeRequestMetadataRecord,
-                SpecDecodeFamilyMetadataRecord,
             )
             if use_spec_decode and spec_decode_metadata is not None:
                 _step_id = scheduler_output.spec_profile_step_id
@@ -5641,23 +5856,6 @@ class GPUModelRunner(
 
                     self._spec_profiler.emit_request_metadata(_req_rec)
                     _req_emitted += 1
-
-                # Emit collapse-phase family metadata with winner info
-                if pivot_post_collapse_accepted is not None:
-                    for _rid, _acc_len in (
-                            pivot_post_collapse_accepted.items()):
-                        _collapse_reason = (
-                            "winner_selected" if _acc_len > 0
-                            else "all_rejected")
-                        self._spec_profiler.emit_family_metadata(
-                            SpecDecodeFamilyMetadataRecord(
-                                step_id=_step_id,
-                                family_id=f"{_rid}:collapse",
-                                origin_req_id=_rid,
-                                family_stage="collapse",
-                                winner_accept_len=_acc_len,
-                                collapse_reason=_collapse_reason,
-                            ))
 
             # -- Unified profiler: finalize step --
             _profile_transport = None

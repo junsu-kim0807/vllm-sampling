@@ -160,6 +160,10 @@ class HybridProposalBundle:
     # ``num_draft_tokens``). Used to reorder / validate against the current
     # batch when prepare-time metadata rows differ from propose-time order.
     bundle_row_req_ids: tuple[str, ...] | None = None
+    # Optional per-row staged-verification totals recorded before target verify.
+    inter_verified_counts: list[int] | None = None
+    inter_accepted_counts: list[int] | None = None
+    staged_verification_depth: int = 0
 
 
 @dataclass
