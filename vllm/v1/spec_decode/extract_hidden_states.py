@@ -250,7 +250,6 @@ class ExtractHiddenStatesProposer:
         use_cudagraphs: bool = True,
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
-        origin_batch_size: int | None = None,
     ) -> None:
         assert self.model is not None, "Model must be initialized before dummy_run"
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (

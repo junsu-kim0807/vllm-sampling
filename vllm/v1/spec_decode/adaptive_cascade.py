@@ -793,12 +793,21 @@ def _build_hybrid_bundle_from_rows(
     *,
     mode: str,
     draft_probs: torch.Tensor | None,
-    source_stage_rows: list[list[int]] | None = None,
+    source_stage_2d: torch.Tensor | None = None,
     bundle_row_req_ids: tuple[str, ...] | list[str] | None = None,
 ) -> HybridProposalBundle:
-    """Build a flattened proposal bundle from fixed-width padded rows."""
-    device = rows_2d.device
+    """Build a flattened proposal bundle from fixed-width padded rows.
+
+    Uses mask-based vectorised ops instead of a per-row Python loop to
+    avoid repeated tensor slicing, list appends, and torch.cat overhead.
+
+    Args:
+        source_stage_2d: Optional int32 tensor with the same shape as
+            *rows_2d*.  Valid positions (where rows_2d != PLACEHOLDER)
+            carry the stage tag; padding positions are ignored.
+    """
     num_rows = int(rows_2d.shape[0])
+
     br_ids: tuple[str, ...] | None = None
     if bundle_row_req_ids is not None:
         br_list = list(bundle_row_req_ids)
@@ -810,46 +819,39 @@ def _build_hybrid_bundle_from_rows(
             )
         else:
             br_ids = tuple(str(x) for x in br_list)
-    flat_rows: list[torch.Tensor] = []
-    lengths: list[int] = []
-    source_flat: list[torch.Tensor] = []
-    for b in range(num_rows):
-        row = rows_2d[b]
-        valid = int((row != PLACEHOLDER_TOKEN_ID).sum().item())
-        lengths.append(valid)
-        if valid > 0:
-            flat_rows.append(row[:valid])
-            if source_stage_rows is not None and len(source_stage_rows[b]) >= valid:
-                source_flat.append(
-                    torch.tensor(
-                        source_stage_rows[b][:valid], device=device, dtype=torch.int32
-                    )
-                )
-        elif source_stage_rows is not None:
-            source_flat.append(torch.empty(0, device=device, dtype=torch.int32))
 
-    if flat_rows:
-        flat_tokens = torch.cat(flat_rows, dim=0).to(torch.int32)
-    else:
-        flat_tokens = torch.empty(0, dtype=torch.int32, device=device)
-    cu = torch.cumsum(torch.tensor(lengths, dtype=torch.int32, device=device), dim=0).to(torch.int32)
-    if source_stage_rows is not None and source_flat:
-        source_stage = torch.cat(source_flat, dim=0)
-    else:
-        source_stage = None
-    if draft_probs is not None and draft_probs.shape[0] != flat_tokens.shape[0]:
-        logger.warning(
-            "Hybrid bundle draft_probs rows %s mismatch token rows %s; dropping probs.",
-            draft_probs.shape[0],
-            flat_tokens.shape[0],
+    # --- vectorised valid-token extraction ---
+    valid_mask = rows_2d.ne(PLACEHOLDER_TOKEN_ID)
+    lengths_t = valid_mask.sum(dim=1, dtype=torch.int32)
+    lengths = lengths_t.tolist()
+
+    draft_token_ids = rows_2d.masked_select(valid_mask).to(torch.int32)
+    cu = torch.cumsum(lengths_t, dim=0, dtype=torch.int32)
+
+    # --- source_stage: single masked_select, no Python loop ---
+    source_stage: torch.Tensor | None = None
+    if source_stage_2d is not None:
+        if source_stage_2d.shape != rows_2d.shape:
+            raise ValueError(
+                "source_stage_2d shape must match rows_2d shape: "
+                f"{tuple(source_stage_2d.shape)} != {tuple(rows_2d.shape)}"
+            )
+        source_stage = source_stage_2d.masked_select(valid_mask).to(torch.int32)
+
+    if draft_probs is not None and int(draft_probs.shape[0]) != int(
+        draft_token_ids.shape[0]
+    ):
+        raise ValueError(
+            "draft_probs first dimension must equal flattened draft token count: "
+            f"{int(draft_probs.shape[0])} != {int(draft_token_ids.shape[0])}"
         )
-        draft_probs = None
+
     return HybridProposalBundle(
-        draft_token_ids=flat_tokens,
+        draft_token_ids=draft_token_ids,
         draft_probs=draft_probs,
         num_draft_tokens=lengths,
         cu_num_draft_tokens=cu,
-        max_spec_len=rows_2d.shape[1],
+        max_spec_len=int(rows_2d.shape[1]),
         mode=mode,  # type: ignore[arg-type]
         source_stage=source_stage,
         bundle_row_req_ids=br_ids,

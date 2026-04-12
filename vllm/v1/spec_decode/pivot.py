@@ -27,14 +27,12 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.adaptive_cascade import (
+    _build_hybrid_bundle_from_rows,
+    _flatten_prob_rows_for_output,
     _hv_clone_cad,
     _propose_chunk_from_prefix,
     _spechive_debug_enabled,
     _verify_chunk_with_prefix,
-)
-from vllm.v1.spec_decode.adaptive_spechive import (
-    _build_hybrid_bundle_from_rows,
-    _flatten_prob_rows_for_output,
 )
 from vllm.v1.spec_decode.draft_model import (
     DraftModelProposer,
@@ -522,7 +520,6 @@ class PivotProposer:
                 use_cudagraphs=use_cudagraphs,
                 is_graph_capturing=is_graph_capturing,
                 slot_mappings=slot_mappings,
-                origin_batch_size=origin_batch_size,
             )
         if self._eagle_head is not None:
             self._eagle_head.dummy_run(
@@ -530,14 +527,12 @@ class PivotProposer:
                 use_cudagraphs=use_cudagraphs,
                 is_graph_capturing=is_graph_capturing,
                 slot_mappings=slot_mappings,
-                origin_batch_size=origin_batch_size,
             )
         self._intermediate.dummy_run(
             num_tokens,
             use_cudagraphs=use_cudagraphs,
             is_graph_capturing=is_graph_capturing,
             slot_mappings=slot_mappings,
-            origin_batch_size=origin_batch_size,
         )
 
         sc = self.vllm_config.speculative_config
@@ -552,7 +547,6 @@ class PivotProposer:
                         use_cudagraphs=use_cudagraphs,
                         is_graph_capturing=is_graph_capturing,
                         slot_mappings=slot_mappings,
-                        origin_batch_size=origin_batch_size,
                     )
                 if self._eagle_head is not None:
                     self._eagle_head.dummy_run(
@@ -560,14 +554,12 @@ class PivotProposer:
                         use_cudagraphs=use_cudagraphs,
                         is_graph_capturing=is_graph_capturing,
                         slot_mappings=slot_mappings,
-                        origin_batch_size=origin_batch_size,
                     )
                 self._intermediate.dummy_run(
                     packed_num_tokens,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
                     slot_mappings=slot_mappings,
-                    origin_batch_size=origin_batch_size,
                 )
 
     def validate_same_kv_cache_group(self, kv_cache_config) -> None:
@@ -2131,22 +2123,34 @@ class PivotProposer:
                 use_draft_probs=use_draft_probs,
                 enable_topk_expansion=expand_ok,
             )
-        source_stage_rows = [
-            [0, *([1] * max(0, self._L - 1))] for _ in range(int(out.shape[0]))
-        ]
+        num_out_rows = int(out.shape[0])
+        source_stage_2d = torch.ones(
+            num_out_rows, self._L, device=out.device, dtype=torch.int32,
+        )
+        if self._L > 0:
+            source_stage_2d[:, 0] = 0
         row_req_ids = _pivot_hybrid_bundle_row_req_ids(
             self.runner,
             batch_size,
-            int(out.shape[0]),
+            num_out_rows,
             expansion_plan,
         )
+        _ba_prof = (
+            getattr(self.runner, "_spec_profiler", None)
+            if self.runner is not None
+            else None
+        )
+        if _ba_prof is not None:
+            _ba_prof.start_stage("bundle_assemble", invocation_idx=0)
         self._staged_hybrid_bundle = _build_hybrid_bundle_from_rows(
             out,
             mode="pivot",
             draft_probs=draft_probs_flat,
-            source_stage_rows=source_stage_rows,
+            source_stage_2d=source_stage_2d,
             bundle_row_req_ids=row_req_ids,
         )
+        if _ba_prof is not None:
+            _ba_prof.end_stage("bundle_assemble", invocation_idx=0)
         if expansion_plan is not None:
             self._active_pivot_expansion_plan = expansion_plan
             self._is_waiting_for_target_collapse = self._pivot_spechive

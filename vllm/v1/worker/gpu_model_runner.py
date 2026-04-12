@@ -164,11 +164,11 @@ from vllm.v1.sample.rejection_sampler import (
     RejectionSampler,
 )
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.spec_decode.adaptive_spechive import (
-    AdaptiveSpechiveProposer,
+from vllm.v1.spec_decode.adaptive_cascade import (
     _build_hybrid_bundle_from_rows,
     _flatten_prob_rows_for_output,
 )
+from vllm.v1.spec_decode.adaptive_spechive import AdaptiveSpechiveProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -4116,11 +4116,15 @@ class GPUModelRunner(
                 )
 
         eff_rows = len(prefix_rows)
+        dev = target_token_ids.device
         out_exp = torch.full(
             (eff_rows, cap),
             PLACEHOLDER_TOKEN_ID,
             dtype=torch.int32,
-            device=target_token_ids.device,
+            device=dev,
+        )
+        source_stage_2d = torch.zeros(
+            (eff_rows, cap), dtype=torch.int32, device=dev,
         )
         for b in range(eff_rows):
             valid = min(cap, len(prefix_rows[b]))
@@ -4128,9 +4132,13 @@ class GPUModelRunner(
                 out_exp[b, :valid] = torch.tensor(
                     prefix_rows[b][:valid],
                     dtype=torch.int32,
-                    device=target_token_ids.device,
+                    device=dev,
                 )
-                source_stage_rows[b] = source_stage_rows[b][:valid]
+                source_stage_2d[b, :valid] = torch.tensor(
+                    source_stage_rows[b][:valid],
+                    dtype=torch.int32,
+                    device=dev,
+                )
         draft_probs_flat = (
             _flatten_prob_rows_for_output(prefix_prob_rows, out_exp)
             if use_draft_probs
@@ -4142,13 +4150,16 @@ class GPUModelRunner(
             num_bundle_rows=eff_rows,
             pivot_expansion_plan=pivot_expansion_plan,
         )
+        _hv_prof = self._spec_profiler
+        _hv_prof.start_stage("bundle_assemble", invocation_idx=n_inner)
         bundle = _build_hybrid_bundle_from_rows(
             out_exp,
             mode="hierarchical_verification",
             draft_probs=draft_probs_flat,
-            source_stage_rows=source_stage_rows,
+            source_stage_2d=source_stage_2d,
             bundle_row_req_ids=row_req_ids,
         )
+        _hv_prof.end_stage("bundle_assemble", invocation_idx=n_inner)
         bundle = dataclass_replace(
             bundle,
             inter_verified_counts=inter_verified_rows,
@@ -7099,13 +7110,14 @@ class GPUModelRunner(
                 ):
                     use_cudagraphs = False
 
-                self.drafter.dummy_run(
-                    num_tokens,
+                dr_kwargs: dict[str, Any] = dict(
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
                     slot_mappings=slot_mappings,
-                    origin_batch_size=num_reqs,
                 )
+                if isinstance(self.drafter, PivotProposer):
+                    dr_kwargs["origin_batch_size"] = num_reqs
+                self.drafter.dummy_run(num_tokens, **dr_kwargs)
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by
