@@ -832,7 +832,7 @@ def _build_hybrid_bundle_from_rows(
         flat_tokens = torch.cat(flat_rows, dim=0).to(torch.int32)
     else:
         flat_tokens = torch.empty(0, dtype=torch.int32, device=device)
-    cu = torch.cumsum(torch.tensor(lengths, dtype=torch.int32, device=device), dim=0)
+    cu = torch.cumsum(torch.tensor(lengths, dtype=torch.int32, device=device), dim=0).to(torch.int32)
     if source_stage_rows is not None and source_flat:
         source_stage = torch.cat(source_flat, dim=0)
     else:
@@ -1077,7 +1077,7 @@ class AdaptiveSpechiveProposer:
                 num_draft_tokens, dtype=torch.int32, device=draft_flat.device
             ),
             dim=0,
-        )
+        ).to(torch.int32)
         draft_probs_flat = (
             proposal.probs.reshape(-1, vocab_size)
             if proposal.probs is not None

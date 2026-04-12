@@ -32,13 +32,14 @@ def eagle_prepare_inputs_padded_kernel(
 
     # Calculate num_draft_tokens from cu_num_draft_tokens, which is an inclusive
     # cumulative sum (first entry is the first value, not zero).
-    cu_draft_curr = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    cu_draft_curr = tl.load(cu_num_draft_tokens_ptr + req_idx).to(tl.int32)
 
     num_draft_tokens = 0
     if req_idx == 0:
         num_draft_tokens = cu_draft_curr
     else:
-        cu_draft_prev = tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
+        cu_draft_prev = tl.load(
+            cu_num_draft_tokens_ptr + req_idx - 1).to(tl.int32)
         num_draft_tokens = cu_draft_curr - cu_draft_prev
 
     valid_count = tl.load(valid_sampled_tokens_count_ptr + req_idx)

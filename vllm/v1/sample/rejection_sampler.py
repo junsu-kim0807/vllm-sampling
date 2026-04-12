@@ -805,8 +805,9 @@ def rejection_greedy_sample_kernel(
         # Early exit for non-greedy sampling requests.
         return
 
-    start_idx = 0 if req_idx == 0 else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
-    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx).to(tl.int32)
+    start_idx = 0 if req_idx == 0 else tl.load(
+        cu_num_draft_tokens_ptr + req_idx - 1).to(tl.int32)
     num_draft_tokens = end_idx - start_idx
 
     rejected = False
@@ -853,8 +854,9 @@ def rejection_random_sample_kernel(
         # Early exit for greedy sampling requests.
         return
 
-    start_idx = 0 if req_idx == 0 else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
-    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx).to(tl.int32)
+    start_idx = 0 if req_idx == 0 else tl.load(
+        cu_num_draft_tokens_ptr + req_idx - 1).to(tl.int32)
     num_draft_tokens = end_idx - start_idx
 
     rejected = False
@@ -930,8 +932,9 @@ def sample_recovered_tokens_kernel(
     NO_DRAFT_PROBS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
-    start_idx = 0 if req_idx == 0 else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
-    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx).to(tl.int32)
+    start_idx = 0 if req_idx == 0 else tl.load(
+        cu_num_draft_tokens_ptr + req_idx - 1).to(tl.int32)
     num_draft_tokens = end_idx - start_idx
 
     # Early exit for out-of-range positions.

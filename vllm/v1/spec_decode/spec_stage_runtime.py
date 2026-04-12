@@ -471,7 +471,7 @@ def expand_hybrid_bundle_for_pivot_expansion(
         device = draft_token_ids.device
         cu = torch.cumsum(
             torch.tensor(new_lengths, dtype=torch.int32, device=device), dim=0
-        )
+        ).to(torch.int32)
         max_spec_len = max(new_lengths) if any(new_lengths) else bundle.max_spec_len
         return replace(
             bundle,
@@ -545,7 +545,7 @@ def expand_hybrid_bundle_for_pivot_expansion(
     device = draft_token_ids.device
     cu = torch.cumsum(
         torch.tensor(new_lengths, dtype=torch.int32, device=device), dim=0
-    )
+    ).to(torch.int32)
     draft_probs = torch.cat(new_prob, dim=0) if new_prob else None
     source_stage = torch.cat(new_src, dim=0).to(torch.int32) if new_src else None
     max_spec_len = max(new_lengths) if new_lengths else bundle.max_spec_len

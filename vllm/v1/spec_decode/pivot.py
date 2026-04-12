@@ -1844,7 +1844,7 @@ class PivotProposer:
         cu_num_draft_tokens = torch.cumsum(
             torch.tensor(num_draft_tokens, dtype=torch.int32, device=draft_flat.device),
             dim=0,
-        )
+        ).to(torch.int32)
         draft_probs_flat = (
             proposal.probs.reshape(-1, vocab_size) if proposal.probs is not None else None
         )

@@ -627,7 +627,7 @@ def run_verify_stage(
             [n + 1 for n in num_draft_tokens], dtype=torch.int32, device=device
         ),
         dim=0,
-    )
+    ).to(torch.int32)
     metadata = SpecDecodeMetadata(
         draft_token_ids=draft_token_ids_flat,
         num_draft_tokens=num_draft_tokens,
@@ -741,7 +741,7 @@ def _reorder_hybrid_bundle_rows(
     tok_rows = _split_flat_tokens_by_lengths(bundle.draft_token_ids, old_lens)
     new_tok = torch.cat([tok_rows[perm_old[j]] for j in range(p)], dim=0).to(torch.int32)
     device = new_tok.device
-    cu = torch.cumsum(torch.tensor(new_lens, dtype=torch.int32, device=device), dim=0)
+    cu = torch.cumsum(torch.tensor(new_lens, dtype=torch.int32, device=device), dim=0).to(torch.int32)
     new_probs = None
     if bundle.draft_probs is not None and bundle.draft_probs.shape[0] == int(
         bundle.draft_token_ids.shape[0]
