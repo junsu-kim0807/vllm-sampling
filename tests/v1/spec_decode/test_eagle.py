@@ -1152,6 +1152,7 @@ def test_propose_tree(spec_token_tree):
 
 
 def test_should_collect_draft_step_probs_pivot_with_topk_even_when_greedy() -> None:
+    """Pivot top-k > 1 triggers _needs_root_topk, not full draft probs."""
     proposer = object.__new__(EagleProposer)
     proposer.method = "pivot"
     proposer.speculative_config = SimpleNamespace(
@@ -1160,7 +1161,8 @@ def test_should_collect_draft_step_probs_pivot_with_topk_even_when_greedy() -> N
         use_draft_probs_in_rejection=False,
     )
     greedy_sm = SimpleNamespace(all_greedy=True)
-    assert proposer._should_collect_draft_step_probs(greedy_sm)
+    assert proposer._needs_root_topk()
+    assert not proposer._should_collect_draft_step_probs(greedy_sm)
 
 
 def test_should_collect_draft_step_probs_draft_model_greedy_skips_without_flag() -> None:

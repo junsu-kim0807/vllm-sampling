@@ -1152,6 +1152,61 @@ class PivotProposer:
         )
         return tok, pos, hid, nxt, cad_one
 
+    @staticmethod
+    def _build_expansion_gather_indices(
+        plan: PivotExpansionPlan,
+        base_query_start_loc: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build GPU index tensors for expanded batch P from origin batch B.
+
+        Returns ``(flat_token_gather_idx, row_gather_idx, new_query_start_loc)``
+        where:
+        - ``row_gather_idx``  shape ``[P]``: maps each expanded row to its origin
+          row index in ``[0, B)``.
+        - ``flat_token_gather_idx`` shape ``[total_expanded_tokens]``: maps each
+          flat token position in the expanded layout back to a position in the
+          original flat token layout.
+        - ``new_query_start_loc`` shape ``[P+1]``: cumulative token offsets for
+          the expanded batch.
+        """
+        p_len = int(plan.expanded_batch_size)
+        sm = plan.packed_sm_origin
+        if sm is None:
+            sm = plan.expanded_to_origin
+        assert len(sm) == p_len
+
+        device = base_query_start_loc.device
+        row_gather_idx = torch.tensor(sm, dtype=torch.long, device=device)
+
+        origin_query_lens = (
+            base_query_start_loc[1:] - base_query_start_loc[:-1]
+        )
+        expanded_query_lens = origin_query_lens[row_gather_idx]
+
+        new_qsl = torch.zeros(
+            p_len + 1, dtype=base_query_start_loc.dtype, device=device
+        )
+        torch.cumsum(expanded_query_lens, dim=0, out=new_qsl[1:])
+        total_tokens = int(new_qsl[p_len].item())
+
+        origin_starts = base_query_start_loc[row_gather_idx]
+
+        # Vectorised: for each expanded token, compute its source index in
+        # the original flat token layout.  token_row_id maps each expanded
+        # token to its expanded-row index; origin offset then gives the
+        # source start for that row.
+        token_row_id = torch.repeat_interleave(
+            torch.arange(p_len, device=device),
+            expanded_query_lens,
+        )
+        flat_token_gather_idx = (
+            torch.arange(total_tokens, device=device)
+            - new_qsl[token_row_id]
+            + origin_starts[token_row_id]
+        )
+
+        return flat_token_gather_idx, row_gather_idx, new_qsl
+
     def _expand_tail_proposer_frontier_for_plan(
         self,
         *,
@@ -1172,84 +1227,60 @@ class PivotProposer:
     ]:
         """Repeat origin frontier tensors/metadata once per packed pivot row (length P).
 
-        Tail drafting must see ``cad.batch_size() == len(prefix_rows)``; after root
-        expansion, ``prefix_rows`` has length P while the incoming metadata is still
-        origin batch B. Row ``j`` copies origin ``packed_sm_origin[j]``.
+        Uses index-based gather instead of per-row torch.cat to avoid
+        materializing intermediate expanded tensors.
         """
+        import time as _time
+
+        _t0 = _time.perf_counter() if _spechive_debug_enabled() else 0.0
+
         cad = _hv_clone_cad(base_common_attn_metadata)
         qsl = cad.query_start_loc
         p_len = int(plan.expanded_batch_size)
-        sm = plan.packed_sm_origin
-        if sm is None:
-            sm = plan.expanded_to_origin
-        assert len(sm) == p_len
 
-        token_pieces: list[torch.Tensor] = []
-        hidden_pieces: list[torch.Tensor] = []
-        slot_pieces: list[torch.Tensor] = []
-        pos_1d_pieces: list[torch.Tensor] = []
-        pos_2d_pieces: list[torch.Tensor] = []
-        next_ints: list[int] = []
-        seq_rows: list[torch.Tensor] = []
-        block_rows: list[torch.Tensor] = []
-        rej_rows: list[torch.Tensor] = []
-        dcp_rows: list[torch.Tensor] = []
-        lip_rows: list[torch.Tensor] = []
+        flat_idx, row_idx, new_qsl = self._build_expansion_gather_indices(
+            plan, qsl
+        )
+        total_tokens = int(new_qsl[p_len].item())
+
+        out_tokens = base_target_token_ids[flat_idx]
+        out_hidden = base_target_hidden_states[flat_idx]
+        out_slot = cad.slot_mapping[flat_idx]
 
         positions_2d = base_target_positions.dim() > 1
-
-        for j in range(p_len):
-            o = int(sm[j])
-            s = int(qsl[o].item())
-            e = int(qsl[o + 1].item())
-            token_pieces.append(base_target_token_ids[s:e])
-            hidden_pieces.append(base_target_hidden_states[s:e])
-            slot_pieces.append(cad.slot_mapping[s:e])
-            if positions_2d:
-                pos_2d_pieces.append(base_target_positions[:, s:e])
-            else:
-                pos_1d_pieces.append(base_target_positions[s:e])
-            next_ints.append(int(base_next_token_ids[o].item()))
-            seq_rows.append(cad.seq_lens[o : o + 1])
-            block_rows.append(cad.block_table_tensor[o : o + 1])
-            if base_num_rejected_tokens_gpu is not None:
-                rej_rows.append(base_num_rejected_tokens_gpu[o : o + 1])
-            if cad.dcp_local_seq_lens is not None:
-                dcp_rows.append(cad.dcp_local_seq_lens[o : o + 1])
-            if cad.logits_indices_padded is not None:
-                lip_rows.append(cad.logits_indices_padded[o : o + 1])
-
-        out_tokens = torch.cat(token_pieces, dim=0)
-        out_hidden = torch.cat(hidden_pieces, dim=0)
-        out_slot = torch.cat(slot_pieces, dim=0)
         if positions_2d:
-            out_positions = torch.cat(pos_2d_pieces, dim=1)
+            out_positions = base_target_positions[:, flat_idx]
         else:
-            out_positions = torch.cat(pos_1d_pieces, dim=0)
-        out_next = torch.tensor(
-            next_ints, dtype=torch.int32, device=base_next_token_ids.device
-        )
-        out_seq_lens = torch.cat(seq_rows, dim=0)
-        out_block = torch.cat(block_rows, dim=0)
+            out_positions = base_target_positions[flat_idx]
 
-        new_qsl = torch.zeros(p_len + 1, dtype=qsl.dtype, device=qsl.device)
-        cur = 0
-        for j in range(p_len):
-            o = int(sm[j])
-            ql = int(qsl[o + 1].item() - qsl[o].item())
-            cur += ql
-            new_qsl[j + 1] = cur
-        assert cur == int(out_tokens.shape[0]), (
-            f"expanded tail frontier token count mismatch: total={cur} "
-            f"vs flat_len={int(out_tokens.shape[0])}"
-        )
+        out_next = base_next_token_ids[row_idx].to(torch.int32)
+        out_seq_lens = cad.seq_lens[row_idx]
+        out_block = cad.block_table_tensor[row_idx]
+
+        out_rej: torch.Tensor | None = None
+        if base_num_rejected_tokens_gpu is not None:
+            out_rej = base_num_rejected_tokens_gpu[row_idx]
+
+        out_dcp: torch.Tensor | None = None
+        if cad.dcp_local_seq_lens is not None:
+            out_dcp = cad.dcp_local_seq_lens[row_idx]
+
+        out_lip: torch.Tensor | None = None
+        if cad.logits_indices_padded is not None:
+            out_lip = cad.logits_indices_padded[row_idx]
 
         query_lens = new_qsl[1:] - new_qsl[:-1]
         max_q = int(query_lens.max().item())
 
-        out_rej = torch.cat(rej_rows, dim=0) if rej_rows else None
-        out_dcp = torch.cat(dcp_rows, dim=0) if dcp_rows else None
-        out_lip = torch.cat(lip_rows, dim=0) if lip_rows else None
+        if _spechive_debug_enabled():
+            _elapsed_us = (_time.perf_counter() - _t0) * 1e6
+            logger.info(
+                "PIVOT_DEBUG expand_frontier: P=%d total_tokens=%d "
+                "elapsed_us=%.1f (index-gather path)",
+                p_len,
+                total_tokens,
+                _elapsed_us,
+            )
 
         out_cad = cad.replace(
             query_start_loc=new_qsl,
@@ -1258,7 +1289,7 @@ class PivotProposer:
             block_table_tensor=out_block,
             slot_mapping=out_slot,
             num_reqs=p_len,
-            num_actual_tokens=int(out_tokens.shape[0]),
+            num_actual_tokens=total_tokens,
             max_query_len=max_q,
             max_seq_len=int(out_seq_lens.max().item()),
             dcp_local_seq_lens=out_dcp,
@@ -1415,7 +1446,6 @@ class PivotProposer:
         use_draft_probs: bool,
         enable_topk_expansion: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None, PivotExpansionPlan | None]:
-        need_confidence_probs = enable_topk_expansion and self._topk_selection > 1
         proposal_hidden_states, pivot_prefix_prefab = (
             self._resolve_hidden_states_for_proposal(
                 base_target_token_ids=base_target_token_ids,
@@ -1438,10 +1468,11 @@ class PivotProposer:
             prefix_rows=base_prefix_rows,
             chunk_len=1,
             sampling_metadata=sampling_metadata,
-            use_draft_probs=(use_draft_probs or need_confidence_probs),
+            use_draft_probs=use_draft_probs,
             prefix_prefab=pivot_prefix_prefab,
         )
         pivots = pivots.to(torch.int32)[:, :1]
+        batch_size = int(pivots.shape[0])
         delegate = self._main_delegate()
         root_topk = getattr(delegate, "last_root_topk_info", None)
         chosen_pivots, pivot_probs_rows, expansion_plan = self._build_pivot_expansion_plan(

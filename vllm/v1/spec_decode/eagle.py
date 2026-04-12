@@ -546,16 +546,23 @@ class SpecDecodeBaseProposer:
             and not sampling_metadata.all_greedy
         )
 
+    def _needs_root_topk(self) -> bool:
+        """Whether to compute root logits for pivot top-k selection only.
+
+        When True but ``_use_draft_probs_in_rejection`` is False, we can avoid
+        the full ``sample_next_token_and_probs_processed`` call and just do a
+        greedy sample from the logits, saving the ``[B, V]`` processed softmax.
+        """
+        return self._pivot_topk_selection_effective() > 1
+
     def _should_collect_draft_step_probs(self, sampling_metadata: SamplingMetadata) -> bool:
         """Whether to run processed-logits softmax and set last_draft_probs_flat.
 
-        Pivot top-k expansion reads per-step draft distributions even when the
-        target uses greedy decoding (all_greedy); plain draft_model speculative
-        decoding only needs probs when use_draft_probs_in_rejection and not greedy.
+        Returns True only when full per-step processed probs are needed (for
+        rejection sampling with draft probs). Pivot root top-k selection is
+        handled separately by ``_needs_root_topk()``.
         """
-        if self._use_draft_probs_in_rejection(sampling_metadata):
-            return True
-        return self._pivot_topk_selection_effective() > 1
+        return self._use_draft_probs_in_rejection(sampling_metadata)
 
     @staticmethod
     def _with_provisional_draft_prefix(
@@ -729,6 +736,16 @@ class SpecDecodeBaseProposer:
                         1, draft_token_ids.unsqueeze(1)
                     ).squeeze(1)
                     self.last_draft_logprobs = _lp.unsqueeze(1)
+            elif self._needs_root_topk():
+                logits0 = self.model.compute_logits(sample_hidden_states)
+                self._fill_last_root_topk_from_logits(logits0)
+                if _tetris_enabled:
+                    draft_token_ids, _lp = self._greedy_sample_with_logprobs(
+                        logits0
+                    )
+                    self.last_draft_logprobs = _lp.unsqueeze(1)
+                else:
+                    draft_token_ids = logits0.argmax(dim=-1)
             else:
                 if _tetris_enabled:
                     logits0 = self.model.compute_logits(sample_hidden_states)
@@ -762,6 +779,7 @@ class SpecDecodeBaseProposer:
             return torch.cat(draft_token_ids_list, dim=1)
 
         track_probs = self._should_collect_draft_step_probs(sampling_metadata)
+        _need_root_topk = self._needs_root_topk()
         probs_per_step: list[torch.Tensor] = []
         if track_probs:
             logits0 = self.model.compute_logits(sample_hidden_states)
@@ -777,6 +795,16 @@ class SpecDecodeBaseProposer:
                     1, draft_token_ids.unsqueeze(1)
                 ).squeeze(1)
                 _draft_logprobs_list.append(_lp)
+        elif _need_root_topk:
+            logits0 = self.model.compute_logits(sample_hidden_states)
+            self._fill_last_root_topk_from_logits(logits0)
+            if _tetris_enabled:
+                draft_token_ids, _lp = self._greedy_sample_with_logprobs(
+                    logits0
+                )
+                _draft_logprobs_list.append(_lp)
+            else:
+                draft_token_ids = logits0.argmax(dim=-1)
         else:
             if _tetris_enabled:
                 logits0 = self.model.compute_logits(sample_hidden_states)
