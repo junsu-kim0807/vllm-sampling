@@ -3610,6 +3610,22 @@ class GPUModelRunner(
                 expected_prefix_rows = _expand_list_rows_by_pivot_plan(
                     expected_prefix_rows, pivot_expansion_plan
                 )
+                (
+                    target_token_ids,
+                    target_positions,
+                    target_hidden_states,
+                    next_token_ids,
+                    common_attn_metadata,
+                    num_rejected_tokens_gpu,
+                ) = drafter._expand_tail_proposer_frontier_for_plan(
+                    plan=pivot_expansion_plan,
+                    base_target_token_ids=target_token_ids,
+                    base_target_positions=target_positions,
+                    base_target_hidden_states=target_hidden_states,
+                    base_next_token_ids=next_token_ids,
+                    base_common_attn_metadata=common_attn_metadata,
+                    base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                )
                 _hv_prof.end_stage("expand_collapse",
                                    invocation_idx=round_idx)
                 _hv_prof.snapshot_memory_after("expand_collapse",
