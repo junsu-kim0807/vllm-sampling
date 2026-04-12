@@ -1708,6 +1708,30 @@ class PivotProposer:
         prefix_rows: list[list[int]],
         candidate_tokens: torch.Tensor,
     ) -> DitRoundVerification:
+        # When topk expansion is active, prefix_rows is expanded (length P)
+        # while the base tensors / CAD still reflect the origin batch (B).
+        # Expand frontier inputs so the intermediate verifier sees matching
+        # batch dimensions.
+        plan = self._active_pivot_expansion_plan
+        if plan is not None and len(prefix_rows) != int(
+            base_common_attn_metadata.batch_size()
+        ):
+            (
+                base_target_token_ids,
+                base_target_positions,
+                base_target_hidden_states,
+                base_next_token_ids,
+                base_common_attn_metadata,
+                base_num_rejected_tokens_gpu,
+            ) = self._expand_tail_proposer_frontier_for_plan(
+                plan=plan,
+                base_target_token_ids=base_target_token_ids,
+                base_target_positions=base_target_positions,
+                base_target_hidden_states=base_target_hidden_states,
+                base_next_token_ids=base_next_token_ids,
+                base_common_attn_metadata=base_common_attn_metadata,
+                base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+            )
         verifier_hidden_states = base_target_hidden_states
         verifier_round_state = None
         if self._pivot_mode.verification_pipeline in (
