@@ -5452,6 +5452,10 @@ class GPUModelRunner(
                 )
 
             # -- Unified profiler: emit request + family metadata --
+            from vllm.v1.spec_decode.profiler_types import (
+                SpecDecodeRequestMetadataRecord,
+                SpecDecodeFamilyMetadataRecord,
+            )
             if use_spec_decode and spec_decode_metadata is not None:
                 _step_id = scheduler_output.spec_profile_step_id
                 _max_rps = getattr(
