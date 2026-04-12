@@ -30,10 +30,12 @@ class SpecDecodingStats:
     """
 
     num_spec_tokens: int
+    num_partial_spec_tokens: int = 0
     num_drafts: int = 0
     num_draft_tokens: int = 0
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
+    num_partial_accepted_tokens_per_pos: list[int] = field(default_factory=list)
 
     # Optional cost breakdown timing fields.
     draft_time_sec: float = 0.0
@@ -51,10 +53,17 @@ class SpecDecodingStats:
     expand_collapse_time_ms: float = 0.0
 
     @classmethod
-    def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
+    def new(
+        cls,
+        num_spec_tokens: int,
+        *,
+        num_partial_spec_tokens: int = 0,
+    ) -> "SpecDecodingStats":
         return cls(
             num_spec_tokens=num_spec_tokens,
+            num_partial_spec_tokens=num_partial_spec_tokens,
             num_accepted_tokens_per_pos=[0] * num_spec_tokens,
+            num_partial_accepted_tokens_per_pos=[0] * num_partial_spec_tokens,
         )
 
     def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
@@ -83,6 +92,9 @@ class SpecDecodingStats:
         self.compression_time_sec += compression_time_sec
         self.partial_verification_time_sec += partial_verification_time_sec
         self.num_partial_accepted_tokens += num_partial_accepted_tokens
+        assert num_partial_accepted_tokens <= self.num_partial_spec_tokens
+        for i in range(num_partial_accepted_tokens):
+            self.num_partial_accepted_tokens_per_pos[i] += 1
         self.full_verification_time_sec += full_verification_time_sec
         self.reject_sample_time_sec += reject_sample_time_sec
 
@@ -103,6 +115,7 @@ class SpecDecodingLogging:
         self.num_draft_tokens: list[int] = []
         self.num_accepted_tokens: list[int] = []
         self.accepted_tokens_per_pos_lists: list[list[int]] = []
+        self.partial_accepted_tokens_per_pos_lists: list[list[int]] = []
         self.draft_time_sec: list[float] = []
         self.compression_time_sec: list[float] = []
         self.partial_verification_time_sec: list[float] = []
@@ -117,6 +130,9 @@ class SpecDecodingLogging:
         self.num_accepted_tokens.append(spec_decoding_stats.num_accepted_tokens)
         self.accepted_tokens_per_pos_lists.append(
             spec_decoding_stats.num_accepted_tokens_per_pos
+        )
+        self.partial_accepted_tokens_per_pos_lists.append(
+            spec_decoding_stats.num_partial_accepted_tokens_per_pos
         )
         self.draft_time_sec.append(spec_decoding_stats.draft_time_sec)
         self.compression_time_sec.append(spec_decoding_stats.compression_time_sec)
@@ -159,6 +175,12 @@ class SpecDecodingLogging:
         pos_matrix = np.array(self.accepted_tokens_per_pos_lists)
         acceptance_rates = np.sum(pos_matrix, axis=0) / num_drafts
         rates_str = ", ".join(f"{p:.3f}" for p in acceptance_rates)
+        partial_rates_str = ""
+        if self.partial_accepted_tokens_per_pos_lists:
+            partial_pos_matrix = np.array(self.partial_accepted_tokens_per_pos_lists)
+            if partial_pos_matrix.size > 0:
+                partial_rates = np.sum(partial_pos_matrix, axis=0) / num_drafts
+                partial_rates_str = ", ".join(f"{p:.3f}" for p in partial_rates)
 
         # Optional cost breakdown
         total_draft_time = np.sum(self.draft_time_sec)
@@ -212,6 +234,11 @@ class SpecDecodingLogging:
                 mean_acceptance_length,
                 total_reject_sample_time,
             )
+            if partial_rates_str:
+                log_fn(
+                    "SpecDecoding intermediate per-position acceptance rate: %s",
+                    partial_rates_str,
+                )
         self.reset()
 
 
@@ -277,7 +304,12 @@ class SpecDecodingProm:
 
         assert speculative_config is not None
         num_spec_tokens = (
-            speculative_config.num_speculative_tokens
+            speculative_config.runner_num_speculative_tokens()
+            if self.spec_decoding_enabled
+            else 0
+        )
+        num_partial_spec_tokens = (
+            speculative_config.runner_num_partial_speculative_tokens()
             if self.spec_decoding_enabled
             else 0
         )
@@ -291,6 +323,20 @@ class SpecDecodingProm:
             int, list[prometheus_client.Counter]
         ] = {
             idx: [base_counter.labels(*lv, str(pos)) for pos in range(num_spec_tokens)]
+            for idx, lv in per_engine_labelvalues.items()
+        }
+        partial_base_counter = self._counter_cls(
+            name="vllm:spec_decode_num_partial_accepted_tokens_per_pos",
+            documentation="Accepted intermediate-verification tokens per draft position.",
+            labelnames=pos_labelnames,
+        )
+        self.counter_spec_decode_num_partial_accepted_tokens_per_pos: dict[
+            int, list[prometheus_client.Counter]
+        ] = {
+            idx: [
+                partial_base_counter.labels(*lv, str(pos))
+                for pos in range(num_partial_spec_tokens)
+            ]
             for idx, lv in per_engine_labelvalues.items()
         }
 
@@ -379,6 +425,10 @@ class SpecDecodingProm:
             self.counter_spec_decode_num_accepted_tokens_per_pos[engine_idx]
         ):
             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
+        for pos, counter in enumerate(
+            self.counter_spec_decode_num_partial_accepted_tokens_per_pos[engine_idx]
+        ):
+            counter.inc(spec_decoding_stats.num_partial_accepted_tokens_per_pos[pos])
         # Cumulative times: update Gauges so get_metrics() sees current total.
         if spec_decoding_stats.draft_time_sec > 0:
             self._cumulative_draft_time_sec[engine_idx] += spec_decoding_stats.draft_time_sec

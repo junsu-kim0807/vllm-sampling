@@ -214,8 +214,12 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
+        self.num_partial_spec_tokens = 0
         if speculative_config:
             self.num_spec_tokens = speculative_config.runner_num_speculative_tokens()
+            self.num_partial_spec_tokens = (
+                speculative_config.runner_num_partial_speculative_tokens()
+            )
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
@@ -1976,7 +1980,10 @@ class Scheduler(SchedulerInterface):
         if not self.log_stats or not num_draft_tokens:
             return None
         if spec_decoding_stats is None:
-            spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
+            spec_decoding_stats = SpecDecodingStats.new(
+                self.num_spec_tokens,
+                num_partial_spec_tokens=self.num_partial_spec_tokens,
+            )
         if num_invalid_spec_tokens:
             num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
         if cost_breakdown is not None and req_index is not None:

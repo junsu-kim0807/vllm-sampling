@@ -1411,6 +1411,21 @@ class SpeculativeConfig:
             return chunk_len + rounds * (chunk_len + 1)
         return self.num_speculative_tokens
 
+    def runner_num_partial_speculative_tokens(self) -> int:
+        """Accepted-prefix metric width for intermediate verification stages."""
+        if (
+            self.method == "adaptive_spechive"
+            and self.adaptive_spechive_mode == "hierarchical_verification"
+        ):
+            return self.adaptive_spechive_num_rounds * self.num_speculative_tokens
+        if (
+            self.method == "pivot"
+            and self.get_pivot_runtime_mode().verification_pipeline
+            in ("intermediate_then_target", "intermediate_tree_then_target_tree")
+        ):
+            return self.pivot_spechive_num_rounds * self.num_speculative_tokens
+        return 0
+
     def use_eagle(self) -> bool:
         return self.method in ("eagle", "eagle3", "mtp")
 

@@ -146,6 +146,7 @@ def test_pivot_runner_width_uses_intermediate_pipeline_contract() -> None:
         pivot_spechive_num_rounds=3,
     )
     assert spec.runner_num_speculative_tokens() == 4 + 3 * (4 + 1)
+    assert spec.runner_num_partial_speculative_tokens() == 3 * 4
 
 
 def test_pivot_tree_runner_width_uses_tree_pipeline_contract() -> None:
@@ -158,6 +159,7 @@ def test_pivot_tree_runner_width_uses_tree_pipeline_contract() -> None:
         pivot_spechive_num_rounds=3,
     )
     assert spec.runner_num_speculative_tokens() == 4 + 3 * (4 + 1)
+    assert spec.runner_num_partial_speculative_tokens() == 3 * 4
 
 
 def test_pivot_draft_engine_uses_model_based_gpu_tokens() -> None:

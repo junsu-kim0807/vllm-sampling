@@ -969,6 +969,7 @@ SPEC_NUM_DRAFTS = "vllm:spec_decode_num_drafts"
 SPEC_NUM_DRAFT_TOKENS = "vllm:spec_decode_num_draft_tokens"
 SPEC_NUM_ACCEPTED = "vllm:spec_decode_num_accepted_tokens"
 SPEC_ACCEPTED_PER_POS = "vllm:spec_decode_num_accepted_tokens_per_pos"
+SPEC_PARTIAL_ACCEPTED_PER_POS = "vllm:spec_decode_num_partial_accepted_tokens_per_pos"
 SPEC_DRAFT_TIME = "vllm:spec_decode_draft_time_seconds_total"
 SPEC_VERIFICATION_TIME = "vllm:spec_decode_verification_time_seconds_total"
 SPEC_REJECT_SAMPLE_TIME = "vllm:spec_decode_reject_sample_time_seconds_total"
@@ -1232,6 +1233,9 @@ def measure_dataset(
     num_draft_tokens = metric_delta(after, before, SPEC_NUM_DRAFT_TOKENS)
     num_accepted_tokens = metric_delta(after, before, SPEC_NUM_ACCEPTED)
     accepted_per_pos = vector_delta(after, before, SPEC_ACCEPTED_PER_POS)
+    partial_accepted_per_pos = vector_delta(after, before, SPEC_PARTIAL_ACCEPTED_PER_POS)
+    partial_accepted_per_pos = vector_delta(after, before, SPEC_PARTIAL_ACCEPTED_PER_POS)
+    partial_accepted_per_pos = vector_delta(after, before, SPEC_PARTIAL_ACCEPTED_PER_POS)
 
     num_drafts_val = int(num_drafts) if num_drafts is not None else 0
     num_draft_tokens_val = int(num_draft_tokens) if num_draft_tokens is not None else 0
@@ -1247,6 +1251,14 @@ def measure_dataset(
         (v / num_drafts_val) if num_drafts_val > 0 else 0.0
         for v in accepted_per_pos
     ]
+    intermediate_acceptance_rate_per_pos = [
+        (v / num_drafts_val) if num_drafts_val > 0 else 0.0
+        for v in partial_accepted_per_pos
+    ]
+    intermediate_acceptance_rate_per_pos = [
+        (v / num_drafts_val) if num_drafts_val > 0 else 0.0
+        for v in partial_accepted_per_pos
+    ]
 
     result: dict[str, Any] = {
         "num_prompts": len(prompts),
@@ -1259,6 +1271,8 @@ def measure_dataset(
         "avg_acceptance_rate": avg_acceptance_rate,
         "avg_acceptance_length": avg_acceptance_length,
         "acceptance_rate_per_pos": acceptance_rate_per_pos,
+        "target_acceptance_rate_per_pos": acceptance_rate_per_pos,
+        "intermediate_acceptance_rate_per_pos": intermediate_acceptance_rate_per_pos,
     }
 
     if profile_time:
@@ -1451,6 +1465,8 @@ def measure_dataset_multi_turn(
         "avg_acceptance_rate": avg_acceptance_rate,
         "avg_acceptance_length": avg_acceptance_length,
         "acceptance_rate_per_pos": acceptance_rate_per_pos,
+        "target_acceptance_rate_per_pos": acceptance_rate_per_pos,
+        "intermediate_acceptance_rate_per_pos": intermediate_acceptance_rate_per_pos,
         "num_turns_total": num_turns_total,
         "avg_turns_per_sample": (
             (num_turns_total / len(conversations)) if conversations else 0.0
@@ -1545,10 +1561,13 @@ def save_results(
         writer.writeheader()
         for row in all_rows:
             r = dict(row)
-            if "acceptance_rate_per_pos" in r and isinstance(
-                r["acceptance_rate_per_pos"], list
+            for key in (
+                "acceptance_rate_per_pos",
+                "target_acceptance_rate_per_pos",
+                "intermediate_acceptance_rate_per_pos",
             ):
-                r["acceptance_rate_per_pos"] = json.dumps(r["acceptance_rate_per_pos"])
+                if key in r and isinstance(r[key], list):
+                    r[key] = json.dumps(r[key])
             writer.writerow(r)
 
     with open(results_jsonl, "w", encoding="utf-8") as f:

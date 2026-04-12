@@ -747,7 +747,7 @@ def _verify_chunk_with_prefix(
         per_req_steps.append(chain_logits[verify_start:verify_end])
         bonus_rows.append(chain_logits[verify_end])
 
-    if _spechive_debug_enabled() and bsz <= 2 and chunk_len <= 2:
+    if _spechive_debug_enabled() and bsz <= 2 and chunk_len <= 4:
         ref_steps: list[list[torch.Tensor]] = [[] for _ in range(bsz)]
         for j in range(chunk_len):
             partial_roll = [

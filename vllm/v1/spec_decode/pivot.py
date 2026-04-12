@@ -416,7 +416,7 @@ class PivotProposer:
             "intermediate_tree_then_target_tree",
         ):
             self._intermediate = IntermediatePivotModelProposer(
-                _vllm_intermediate_as_draft(vllm_config, length=1),
+                _vllm_intermediate_as_draft(vllm_config, length=self._L),
                 device,
                 runner,
             )
@@ -501,12 +501,74 @@ class PivotProposer:
             self._eagle_head.initialize_cudagraph_keys(cudagraph_mode)
         self._intermediate.initialize_cudagraph_keys(cudagraph_mode)
 
-    def dummy_run(self, *args, **kwargs):
+    @torch.inference_mode()
+    def dummy_run(
+        self,
+        num_tokens: int,
+        use_cudagraphs: bool = True,
+        is_graph_capturing: bool = False,
+        slot_mappings: dict[str, torch.Tensor] | None = None,
+        origin_batch_size: int | None = None,
+    ) -> None:
+        """Warm drafter CUDA graphs for origin-B and packed-P row counts.
+
+        Linear fixed-capacity pivot (no eagle tree, top-k > 1) runs the draft on
+        origin batch rows for the root proposal and on packed P rows after top-k
+        expansion; both shapes must be registered with the drafter dispatcher.
+        """
         if self._draft is not None:
-            self._draft.dummy_run(*args, **kwargs)
+            self._draft.dummy_run(
+                num_tokens,
+                use_cudagraphs=use_cudagraphs,
+                is_graph_capturing=is_graph_capturing,
+                slot_mappings=slot_mappings,
+                origin_batch_size=origin_batch_size,
+            )
         if self._eagle_head is not None:
-            self._eagle_head.dummy_run(*args, **kwargs)
-        self._intermediate.dummy_run(*args, **kwargs)
+            self._eagle_head.dummy_run(
+                num_tokens,
+                use_cudagraphs=use_cudagraphs,
+                is_graph_capturing=is_graph_capturing,
+                slot_mappings=slot_mappings,
+                origin_batch_size=origin_batch_size,
+            )
+        self._intermediate.dummy_run(
+            num_tokens,
+            use_cudagraphs=use_cudagraphs,
+            is_graph_capturing=is_graph_capturing,
+            slot_mappings=slot_mappings,
+            origin_batch_size=origin_batch_size,
+        )
+
+        sc = self.vllm_config.speculative_config
+        assert sc is not None
+        if (not sc.pivot_use_eagle_tree) and int(sc.pivot_topk_selection) > 1:
+            b = origin_batch_size if origin_batch_size is not None else num_tokens
+            packed_num_tokens = sc.pivot_packed_batch_size_for_origin_batch(b)
+            if packed_num_tokens != b and packed_num_tokens != num_tokens:
+                if self._draft is not None:
+                    self._draft.dummy_run(
+                        packed_num_tokens,
+                        use_cudagraphs=use_cudagraphs,
+                        is_graph_capturing=is_graph_capturing,
+                        slot_mappings=slot_mappings,
+                        origin_batch_size=origin_batch_size,
+                    )
+                if self._eagle_head is not None:
+                    self._eagle_head.dummy_run(
+                        packed_num_tokens,
+                        use_cudagraphs=use_cudagraphs,
+                        is_graph_capturing=is_graph_capturing,
+                        slot_mappings=slot_mappings,
+                        origin_batch_size=origin_batch_size,
+                    )
+                self._intermediate.dummy_run(
+                    packed_num_tokens,
+                    use_cudagraphs=use_cudagraphs,
+                    is_graph_capturing=is_graph_capturing,
+                    slot_mappings=slot_mappings,
+                    origin_batch_size=origin_batch_size,
+                )
 
     def validate_same_kv_cache_group(self, kv_cache_config) -> None:
         if self._draft is not None:
@@ -1955,6 +2017,20 @@ class PivotProposer:
             num_draft_tokens,
             placeholder_token_id=PLACEHOLDER_TOKEN_ID,
         )
+        if _spechive_debug_enabled() and batch_size > 0:
+            accepted_per_pos = [0] * chunk_len
+            for accepted in accepted_lens:
+                for pos in range(min(int(accepted), chunk_len)):
+                    accepted_per_pos[pos] += 1
+            accepted_rates = [
+                accepted_per_pos[pos] / batch_size for pos in range(chunk_len)
+            ]
+            logger.info(
+                "PIVOT_DEBUG inter_accept_rate_per_pos: rows=%d chunk_len=%d rates=%s",
+                batch_size,
+                chunk_len,
+                [round(rate, 4) for rate in accepted_rates],
+            )
         if proposal.tree_plan is not None:
             reduced = collapse_family_tree_sampled_to_family_paths(
                 stage_out.sampled_token_ids,

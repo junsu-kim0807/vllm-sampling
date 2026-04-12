@@ -7089,9 +7089,6 @@ class GPUModelRunner(
                         and cudagraph_runtime_mode != CUDAGraphMode.NONE
                     )
                 ) and not self.speculative_config.enforce_eager
-                if _uses_pivot_linear_fixed_capacity_packing(self.speculative_config):
-                    use_cudagraphs = False
-
                 # Note(gnovack) - We need to disable cudagraphs for one of the two
                 # lora cases when cudagraph_specialize_lora is enabled. This is a
                 # short term mitigation for issue mentioned in
@@ -7107,6 +7104,7 @@ class GPUModelRunner(
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
                     slot_mappings=slot_mappings,
+                    origin_batch_size=num_reqs,
                 )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
@@ -7802,16 +7800,9 @@ class GPUModelRunner(
                 | PivotProposer
                 | ExtractHiddenStatesProposer,
             )
-            # Drafter capture keys are still origin-B sized; skip until drafter
-            # graphs are packed-P aware (same class of mismatch as target LoRA).
-            if not _uses_pivot_linear_fixed_capacity_packing(self.speculative_config):
-                self.drafter.initialize_cudagraph_keys(cudagraph_mode)
-            else:
-                logger.debug_once(
-                    "Skipping drafter CUDA graph key init for linear fixed-capacity "
-                    "pivot (drafter uses origin batch shape; verifier uses packed P).",
-                    scope="local",
-                )
+            # Linear fixed-capacity pivot uses origin-B rows for the root proposal and
+            # packed-P rows for tail proposal; PivotProposer.dummy_run warms both.
+            self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
     def calculate_reorder_batch_threshold(self) -> None:
         """

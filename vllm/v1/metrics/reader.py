@@ -95,7 +95,10 @@ def get_metrics_snapshot() -> list[Metric]:
                 )
         elif metric.type == "counter":
             samples = _get_samples(metric, "_total")
-            if metric.name == "vllm:spec_decode_num_accepted_tokens_per_pos":
+            if metric.name in (
+                "vllm:spec_decode_num_accepted_tokens_per_pos",
+                "vllm:spec_decode_num_partial_accepted_tokens_per_pos",
+            ):
                 #
                 # Ugly vllm:num_accepted_tokens_per_pos special case.
                 #
