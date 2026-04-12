@@ -164,6 +164,20 @@ class IntermediateModelStateProvider:
             prefix_rows=prefix_rows,
             roll_rows=None,
         )
+        # When the proposer has needs_extra_input_slots (e.g. draft_model with
+        # pass_hidden_states_to_model=False), set_inputs_first_pass will call
+        # extend_all_queries_by_N which shifts query_start_loc, seq_lens, and
+        # num_actual_tokens by +N per row.  The prefab tensors (pref_toks,
+        # pref_pos, pref_next) are NOT extended, so the prefab must store the
+        # PRE-set_inputs_first_pass CAD to keep metadata consistent with the
+        # stored tensors.  We also remap the model-output hidden states back
+        # to the pre-sifp layout so downstream _build_prefix_conditioned_inputs
+        # can index them correctly.
+        has_extra_slots: bool = getattr(
+            self.proposer, "needs_extra_input_slots", False
+        )
+        pre_sifp_cad = _hv_clone_cad(pref_cad) if has_extra_slots else None
+
         num_tokens, _, pref_cad = self.proposer.set_inputs_first_pass(  # type: ignore[attr-defined]
             target_token_ids=pref_toks,
             next_token_ids=pref_next,
@@ -220,12 +234,53 @@ class IntermediateModelStateProvider:
             else:
                 _, hidden_states = ret_hidden_states
         out_h = hidden_states.to(torch.float32)
+
+        if pre_sifp_cad is not None:
+            # The model output (out_h) is laid out according to the post-sifp
+            # qsl (which has extra slots interleaved per row).  Remap to
+            # pre-sifp layout so that token positions match pref_toks/pref_pos.
+            pre_qsl = pre_sifp_cad.query_start_loc
+            post_qsl = pref_cad.query_start_loc
+            pre_num_tokens = pre_sifp_cad.num_actual_tokens
+            batch_size = int(pre_sifp_cad.batch_size())
+            store_h = torch.empty(
+                pre_num_tokens,
+                out_h.shape[-1],
+                dtype=out_h.dtype,
+                device=out_h.device,
+            )
+            for b in range(batch_size):
+                orig_len = int(pre_qsl[b + 1].item()) - int(pre_qsl[b].item())
+                src_start = int(post_qsl[b].item())
+                dst_start = int(pre_qsl[b].item())
+                store_h[dst_start : dst_start + orig_len] = out_h[
+                    src_start : src_start + orig_len
+                ]
+            prefab_cad = pre_sifp_cad
+            prefab_h = store_h
+        else:
+            prefab_cad = pref_cad
+            prefab_h = out_h
+
+        if pre_sifp_cad is not None:
+            # Remapped prefab: flat tensors and CAD must agree on token count
+            # (post-SIFP out_h may be padded; prefab_h is exact).
+            _ntok = int(prefab_h.shape[0])
+            assert int(prefab_cad.query_start_loc[-1].item()) == _ntok
+            assert int(pref_toks.shape[0]) == _ntok
+            _pos_ntok = (
+                int(pref_pos.shape[0])
+                if pref_pos.dim() == 1
+                else int(pref_pos.shape[1])
+            )
+            assert _pos_ntok == _ntok
+
         return StagedHiddenStateBundle(
-            hidden_states=out_h,
+            hidden_states=prefab_h,
             aux_hidden_states=None,
-            batch_size=int(pref_cad.batch_size()),
+            batch_size=int(prefab_cad.batch_size()),
             owns_provisional_frontier=True,
-            prefix_prefab=(pref_toks, pref_pos, out_h, pref_next, pref_cad),
+            prefix_prefab=(pref_toks, pref_pos, prefab_h, pref_next, prefab_cad),
         )
 
     def bootstrap_from_current_prefix(
