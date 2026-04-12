@@ -1943,6 +1943,18 @@ class EngineArgs:
             enable_mfu_metrics=self.enable_mfu_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,
             enable_logging_iteration_details=self.enable_logging_iteration_details,
+            spec_decode_profile_mode=self.spec_decode_profile_mode,
+            spec_decode_profile_output_dir=self.spec_decode_profile_output_dir,
+            spec_decode_profile_timing_backend=self.spec_decode_profile_timing_backend,
+            spec_decode_profile_emit_scheduler_bridge=self.spec_decode_profile_emit_scheduler_bridge,
+            spec_decode_profile_include_token_ids=self.spec_decode_profile_include_token_ids,
+            spec_decode_profile_request_sample_rate=self.spec_decode_profile_request_sample_rate,
+            spec_decode_profile_max_reqs_per_step_record=self.spec_decode_profile_max_reqs_per_step_record,
+            spec_decode_profile_flush_interval=self.spec_decode_profile_flush_interval,
+            spec_decode_profile_max_steps=self.spec_decode_profile_max_steps,
+            spec_decode_profile_kernel_sample_rate=self.spec_decode_profile_kernel_sample_rate,
+            spec_decode_profile_gemm_ai_threshold=self.spec_decode_profile_gemm_ai_threshold,
+            spec_decode_profile_kernel_stage_filter=self.spec_decode_profile_kernel_stage_filter,
         )
 
         # Compilation config overrides

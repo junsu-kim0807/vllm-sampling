@@ -174,6 +174,17 @@ def create_vllm_config_for_draft_model(
         old.compilation_config,
         compile_cache_namespace=compile_cache_namespace,
     )
+    # dataclasses.replace() re-initialises init=False fields to their
+    # defaults, so static_forward_context / static_all_moe_layers become
+    # fresh empty containers.  We must share the *same* dicts so that
+    # layers registered by the draft model are visible in the main
+    # config's ForwardContext at runtime.
+    new_compilation.static_forward_context = (
+        old.compilation_config.static_forward_context
+    )
+    new_compilation.static_all_moe_layers = (
+        old.compilation_config.static_all_moe_layers
+    )
     new: VllmConfig = replace(
         old,
         quant_config=None,
