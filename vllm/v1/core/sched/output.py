@@ -238,6 +238,9 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Unified profiler: monotonic step counter issued by scheduler.
+    spec_profile_step_id: int = 0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

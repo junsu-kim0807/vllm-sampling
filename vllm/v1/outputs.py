@@ -268,6 +268,9 @@ class ModelRunnerOutput:
     # Staged speculative verification cost breakdown per batch.
     spec_decode_cost_breakdown: SpecDecodeCostBreakdown | None = None
 
+    # Unified profiler transport (worker -> scheduler).
+    spec_decode_profile_transport: "SpecDecodeProfileTransport | None" = None
+
     # Pivot: per-request accepted draft-token count after expanded-row collapse,
     # aligned with ``get_target_verification_accepted_draft_prefix_lens`` for
     # ``len(scheduled_spec_decode_tokens)`` (excludes bonus/recovery past num_draft).

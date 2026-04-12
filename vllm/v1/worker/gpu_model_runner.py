@@ -162,7 +162,6 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
-    get_spec_verify_draft_match_time_sec_and_reset,
 )
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.adaptive_spechive import (
@@ -565,7 +564,6 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
-    # Target forward time when VLLM_SPEC_PROFILE_TIME=1 (synced for GPU timing).
     full_verification_time_sec: float = 0.0
 
 
@@ -588,6 +586,17 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+
+        from vllm.v1.spec_decode.profiler import (
+            NullSpecDecodeProfiler,
+            create_spec_decode_profiler,
+        )
+        self._spec_profiler = create_spec_decode_profiler(
+            vllm_config, role="worker")
+        self._current_profile_ctx = None
+        self._null_profiler = NullSpecDecodeProfiler()
+        self._deep_profiler = getattr(
+            self._spec_profiler, "_deep_profiler", None)
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -3540,6 +3549,12 @@ class GPUModelRunner(
                             f"prefix_len={len(prefix_rows[b])}, got_len={got_len}"
                         ),
                     )
+            # -- Profiler: draft_forward per HV round --
+            _hv_prof = self._spec_profiler
+            _hv_prof.snapshot_memory_before("draft_forward",
+                                           invocation_idx=round_idx)
+            _hv_prof.start_stage("draft_forward",
+                                 invocation_idx=round_idx)
             proposal = drafter.propose_chunk_from_prefix(
                 base_target_token_ids=target_token_ids,
                 base_target_positions=target_positions,
@@ -3552,6 +3567,16 @@ class GPUModelRunner(
                 sampling_metadata=round_sm,
                 use_draft_probs=use_draft_probs,
             )
+            _hv_prof.end_stage("draft_forward",
+                               invocation_idx=round_idx)
+            _hv_prof.snapshot_memory_after("draft_forward",
+                                          invocation_idx=round_idx)
+            _hv_prof.snapshot_shape("draft_forward", {
+                "origin_batch_size": batch_size,
+                "effective_batch_size": int(proposal.tokens.shape[0]),
+                "num_tokens_processed": int(proposal.tokens.numel()),
+            }, invocation_idx=round_idx)
+
             root_only_check = validate_root_only_pivot_expansion(
                 prefix_rows=prefix_rows,
                 expansion_plan=proposal.expansion_plan,
@@ -3568,6 +3593,11 @@ class GPUModelRunner(
                 assert pivot_expansion_plan is not None, (
                     "prefix row count must match proposal without a pivot plan"
                 )
+                # -- Profiler: expand_collapse for pivot expansion --
+                _hv_prof.snapshot_memory_before("expand_collapse",
+                                               invocation_idx=round_idx)
+                _hv_prof.start_stage("expand_collapse",
+                                     invocation_idx=round_idx)
                 prefix_rows = _expand_list_rows_by_pivot_plan(
                     prefix_rows, pivot_expansion_plan
                 )
@@ -3580,6 +3610,48 @@ class GPUModelRunner(
                 expected_prefix_rows = _expand_list_rows_by_pivot_plan(
                     expected_prefix_rows, pivot_expansion_plan
                 )
+                _hv_prof.end_stage("expand_collapse",
+                                   invocation_idx=round_idx)
+                _hv_prof.snapshot_memory_after("expand_collapse",
+                                              invocation_idx=round_idx)
+                _exp_pct = (
+                    ((eff_bs - batch_size) / batch_size * 100.0)
+                    if batch_size > 0 else 0.0
+                )
+                _n_families = len(getattr(
+                    pivot_expansion_plan, "families", []))
+                _hv_prof.snapshot_shape("expand_collapse", {
+                    "origin_batch_size": batch_size,
+                    "effective_batch_size": eff_bs,
+                    "num_expanded_rows": eff_bs - batch_size,
+                    "uses_topk_expansion": True,
+                    "expansion_pct": _exp_pct,
+                    "num_families": _n_families,
+                }, invocation_idx=round_idx)
+                # Emit family metadata for each expansion family
+                from vllm.v1.spec_decode.profiler_types import (  # noqa: E402
+                    SpecDecodeFamilyMetadataRecord as _FamRec,
+                )
+                for _fi, _fam in enumerate(
+                        getattr(pivot_expansion_plan, "families", [])):
+                    _origin_b = getattr(_fam, "origin_row", -1)
+                    _origin_rid = (
+                        self.input_batch.req_ids[_origin_b]
+                        if 0 <= _origin_b < len(self.input_batch.req_ids)
+                        else ""
+                    )
+                    _hv_prof.emit_family_metadata(_FamRec(
+                        step_id=getattr(
+                            self._current_profile_ctx, "step_id", 0),
+                        family_id=f"{_origin_rid}:f{_fi}",
+                        origin_req_id=_origin_rid,
+                        family_stage="expand",
+                        family_width_before=1,
+                        family_width_after=len(getattr(
+                            _fam, "expanded_rows", [])),
+                        topk_k=len(getattr(_fam, "candidate_ranks", [])),
+                        expansion_pct=_exp_pct,
+                    ))
             self._dit_debug_assert(
                 eff_bs == len(prefix_rows),
                 "check_pivot_expanded_prefix_alignment",
@@ -3593,6 +3665,11 @@ class GPUModelRunner(
                     f"proposal_shape={tuple(proposal.tokens.shape)}"
                 ),
             )
+            # -- Profiler: intermediate_verify (inter-verifier forward) --
+            _hv_prof.snapshot_memory_before("intermediate_verify",
+                                           invocation_idx=round_idx)
+            _hv_prof.start_stage("intermediate_verify",
+                                 invocation_idx=round_idx)
             verification = drafter.verify_chunk_with_inter_verifier(
                 base_target_token_ids=target_token_ids,
                 base_target_positions=target_positions,
@@ -3603,6 +3680,31 @@ class GPUModelRunner(
                 prefix_rows=prefix_rows,
                 candidate_tokens=proposal.tokens,
             )
+            _hv_prof.end_stage("intermediate_verify",
+                               invocation_idx=round_idx)
+            _hv_prof.snapshot_memory_after("intermediate_verify",
+                                          invocation_idx=round_idx)
+            _hv_prof.snapshot_shape("intermediate_verify", {
+                "origin_batch_size": batch_size,
+                "effective_batch_size": eff_bs,
+                "num_tokens_processed": int(verification.logits_flat.shape[0]),
+                "sum_seq_lens": sum(len(r) for r in prefix_rows),
+            }, invocation_idx=round_idx)
+            # KV proxies for intermediate_verify
+            _iv_kv_lens = common_attn_metadata.seq_lens.tolist()
+            _iv_q_lens_cpu = common_attn_metadata.query_start_loc_cpu
+            _iv_q_lens = [
+                int(_iv_q_lens_cpu[i + 1] - _iv_q_lens_cpu[i])
+                for i in range(min(eff_bs, len(_iv_kv_lens)))
+            ]
+            _hv_prof.record_kv_proxies(
+                "intermediate_verify",
+                q_lens=_iv_q_lens,
+                kv_lens=[int(k) for k in _iv_kv_lens[:eff_bs]],
+                block_table=common_attn_metadata.block_table_tensor,
+                invocation_idx=round_idx,
+            )
+
             self._dit_debug_assert(
                 int(verification.logits_flat.shape[0]) == int(eff_bs * L),
                 "check1_chunk_verification_batchxL",
@@ -3611,6 +3713,9 @@ class GPUModelRunner(
                     f"got={verification.logits_flat.shape[0]}"
                 ),
             )
+            # -- Profiler: reject_sample (acceptance decision) --
+            _hv_prof.start_stage("reject_sample",
+                                 invocation_idx=round_idx)
             decision = drafter.run_inter_verification_acceptance(
                 proposal=proposal,
                 verification=verification,
@@ -3619,6 +3724,8 @@ class GPUModelRunner(
                 vocab_size=vocab_size,
                 use_draft_probs=use_draft_probs,
             )
+            _hv_prof.end_stage("reject_sample",
+                               invocation_idx=round_idx)
             before_lens = [len(r) for r in prefix_rows]
             for b, emitted in enumerate(decision.emitted_rows):
                 prefix_rows[b].extend(emitted)
@@ -3814,9 +3921,15 @@ class GPUModelRunner(
             "check_hv_probs_and_stage_alignment",
             detail="source_stage must be in {0,1}",
         )
+        # -- Profiler: expand_collapse for final collapse --
+        _hv_prof = self._spec_profiler
+        _hv_prof.start_stage("expand_collapse",
+                             invocation_idx=n_inner)
         out = _collapse_draft_tensor_rows_for_scheduler(
             out_exp, pivot_expansion_plan, batch_size
         )
+        _hv_prof.end_stage("expand_collapse",
+                           invocation_idx=n_inner)
         return out, bundle
 
     def run_hierarchical_tree_verification_rounds(
@@ -4899,6 +5012,34 @@ class GPUModelRunner(
         clear_kv_metadata = self.speculative_config is None
         spec_config = self.speculative_config
         full_verification_time_sec = 0.0
+
+        # -- Unified profiler: begin step --
+        _profiler = self._spec_profiler
+        _fwd_reason = ("spec_verify" if use_spec_decode else "decode")
+        _profile_ctx = _profiler.begin_step(
+            scheduler_output.spec_profile_step_id, _fwd_reason)
+        self._current_profile_ctx = _profile_ctx
+
+        # -- Unified profiler: batch metadata --
+        from vllm.v1.spec_decode.profiler_types import (  # noqa: E402
+            SpecDecodeBatchMetadataRecord,
+            SpecDecodeRequestMetadataRecord,
+            SpecDecodeFamilyMetadataRecord,
+        )
+        _profiler.emit_batch_metadata(SpecDecodeBatchMetadataRecord(
+            step_id=scheduler_output.spec_profile_step_id,
+            speculative_method=(
+                spec_config.method if spec_config is not None else ""),
+            batch_size=num_reqs,
+            total_num_scheduled_tokens=(
+                scheduler_output.total_num_scheduled_tokens),
+            num_tokens_unpadded=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded,
+            max_query_len=max_query_len,
+            speculative_decode_active=use_spec_decode,
+            cudagraph_mode=str(cudagraph_mode),
+        ))
+
         with (
             set_forward_context(
                 attn_metadata,
@@ -4916,26 +5057,73 @@ class GPUModelRunner(
                 scheduler_output, clear_metadata=clear_kv_metadata
             ) as kv_connector_output,
         ):
-            # When VLLM_SPEC_PROFILE_TIME=1, sync so we measure actual GPU time,
-            # not kernel launch latency only.
-            sync_for_verification_timing = (
-                use_spec_decode
-                and spec_config is not None
-                and os.environ.get("VLLM_SPEC_PROFILE_TIME", "0") == "1"
-            )
-            if sync_for_verification_timing:
-                torch.cuda.synchronize()
             t_forward_start = time.perf_counter()
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+
+            # -- Unified profiler: target_verify stage (only for spec verify) --
+            _do_deep = (
+                self._deep_profiler is not None
+                and _fwd_reason == "spec_verify"
+                and self._deep_profiler.should_profile_step(
+                    scheduler_output.spec_profile_step_id)
+                and self._deep_profiler.should_profile_stage("target_verify")
             )
-            if sync_for_verification_timing:
-                torch.cuda.synchronize()
-                full_verification_time_sec = time.perf_counter() - t_forward_start
+
+            if _fwd_reason == "spec_verify":
+                _profiler.snapshot_memory_before("target_verify")
+                _profiler.start_stage("target_verify")
+
+            if _do_deep:
+                with self._deep_profiler.profile_stage(
+                    "target_verify",
+                    ctx=_profile_ctx,
+                    origin_batch_size=num_reqs,
+                    effective_batch_size=num_reqs,
+                    num_tokens=num_tokens_unpadded,
+                ):
+                    model_output = self._model_forward(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+            else:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+
+            if _fwd_reason == "spec_verify":
+                _profiler.end_stage("target_verify")
+                _profiler.snapshot_memory_after("target_verify")
+                _tv_shape: dict[str, Any] = {
+                    "origin_batch_size": num_reqs,
+                    "effective_batch_size": num_reqs,
+                    "num_tokens_processed": num_tokens_unpadded,
+                }
+                _tv_cam = spec_decode_common_attn_metadata
+                if _tv_cam is not None:
+                    _tv_shape["max_seq_len"] = int(_tv_cam.max_seq_len)
+                    _tv_shape["sum_seq_lens"] = int(
+                        _tv_cam.seq_lens.sum().item())
+                _profiler.snapshot_shape("target_verify", _tv_shape)
+                if _tv_cam is not None:
+                    _q_lens = []
+                    _qloc_cpu = _tv_cam.query_start_loc_cpu
+                    for i in range(num_reqs):
+                        _q_lens.append(int(
+                            _qloc_cpu[i + 1] - _qloc_cpu[i]))
+                    _kv_lens = _tv_cam.seq_lens.tolist()
+                    _profiler.record_kv_proxies(
+                        "target_verify",
+                        q_lens=_q_lens,
+                        kv_lens=[int(k) for k in _kv_lens],
+                        block_table=_tv_cam.block_table_tensor,
+                    )
+
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -5054,16 +5242,19 @@ class GPUModelRunner(
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         spec_config = self.speculative_config
 
-        profiled_draft_time_sec = 0.0
-
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        # -- Profiler: reject_sample for target-level sampling/rejection --
+        if use_spec_decode:
+            self._spec_profiler.start_stage("reject_sample")
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if use_spec_decode:
+            self._spec_profiler.end_stage("reject_sample")
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -5099,8 +5290,6 @@ class GPUModelRunner(
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
-        profile_spec_time = os.environ.get("VLLM_SPEC_PROFILE_TIME", "0") == "1"
-        measure_draft_time = spec_config is not None and profile_spec_time
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
@@ -5123,14 +5312,30 @@ class GPUModelRunner(
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
-                    if measure_draft_time:
-                        torch.cuda.synchronize()
-                        t0 = time.perf_counter()
-                        propose_draft_token_ids(sampled_token_ids)
-                        torch.cuda.synchronize()
-                        profiled_draft_time_sec = time.perf_counter() - t0
-                    else:
-                        propose_draft_token_ids(sampled_token_ids)
+                    self._spec_profiler.snapshot_memory_before(
+                        "draft_forward")
+                    self._spec_profiler.start_stage("draft_forward")
+                    propose_draft_token_ids(sampled_token_ids)
+                    self._spec_profiler.end_stage("draft_forward")
+                    self._spec_profiler.snapshot_memory_after(
+                        "draft_forward")
+                    _df_shape: dict[str, Any] = {
+                        "origin_batch_size": len(
+                            self.input_batch.req_ids),
+                        "effective_batch_size": len(
+                            self.input_batch.req_ids),
+                        "num_tokens_processed": len(
+                            self.input_batch.req_ids) * (
+                            self.num_spec_tokens),
+                    }
+                    _df_cam = spec_decode_common_attn_metadata
+                    if _df_cam is not None:
+                        _df_shape["max_seq_len"] = int(
+                            _df_cam.max_seq_len)
+                        _df_shape["sum_seq_lens"] = int(
+                            _df_cam.seq_lens.sum().item())
+                    self._spec_profiler.snapshot_shape(
+                        "draft_forward", _df_shape)
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
                     next_token_ids, valid_sampled_tokens_count = (
@@ -5154,6 +5359,9 @@ class GPUModelRunner(
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
+        # -- Profiler: bookkeeping stage --
+        self._spec_profiler.start_stage("bookkeeping")
+        _bk_t0 = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -5172,18 +5380,28 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
+        self._spec_profiler.end_stage("bookkeeping")
+        if self._current_profile_ctx is not None:
+            self._current_profile_ctx.bookkeeping_metadata_build_ms = (
+                (time.perf_counter() - _bk_t0) * 1000.0)
 
         if propose_drafts_after_bookkeeping:
-            # ngram and other speculative decoding methods use the sampled
-            # tokens on the CPU, so they are run after bookkeeping.
-            if measure_draft_time:
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                propose_draft_token_ids(valid_sampled_token_ids)
-                torch.cuda.synchronize()
-                profiled_draft_time_sec = time.perf_counter() - t0
-            else:
-                propose_draft_token_ids(valid_sampled_token_ids)
+            self._spec_profiler.snapshot_memory_before("draft_forward")
+            self._spec_profiler.start_stage("draft_forward")
+            propose_draft_token_ids(valid_sampled_token_ids)
+            self._spec_profiler.end_stage("draft_forward")
+            self._spec_profiler.snapshot_memory_after("draft_forward")
+            _df2_shape: dict[str, Any] = {
+                "origin_batch_size": len(self.input_batch.req_ids),
+                "effective_batch_size": len(self.input_batch.req_ids),
+            }
+            _df2_cam = spec_decode_common_attn_metadata
+            if _df2_cam is not None:
+                _df2_shape["max_seq_len"] = int(_df2_cam.max_seq_len)
+                _df2_shape["sum_seq_lens"] = int(
+                    _df2_cam.seq_lens.sum().item())
+            self._spec_profiler.snapshot_shape(
+                "draft_forward", _df2_shape)
 
         # Clear KV connector metadata after draft model runs (if spec decode).
         # This was deferred from target model forward to allow draft model
@@ -5206,22 +5424,140 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
-            # Cost breakdown when VLLM_SPEC_PROFILE_TIME=1 (draft + target forward times).
+            # Populate legacy cost breakdown from unified profiler data.
             spec_decode_cost_breakdown = None
-            if use_spec_decode and spec_config is not None:
-                if profile_spec_time:
-                    num_reqs = len(req_ids_output_copy)
-                    reject_sample_time_sec = (
-                        get_spec_verify_draft_match_time_sec_and_reset()
+            _pctx_for_breakdown = self._current_profile_ctx
+            if (use_spec_decode and spec_config is not None
+                    and _pctx_for_breakdown is not None
+                    and _pctx_for_breakdown.stage_timings):
+                _st = _pctx_for_breakdown.stage_timings
+                _draft_ms = sum(_st.get("draft_forward", []))
+                _target_ms = sum(_st.get("target_verify", []))
+                _reject_ms = sum(_st.get("reject_sample", []))
+                _inter_ms = sum(_st.get("intermediate_verify", []))
+                _expand_ms = sum(_st.get("expand_collapse", []))
+                num_reqs = len(req_ids_output_copy)
+                _partial_acc = (
+                    _pctx_for_breakdown.partial_accepted_per_req
+                    if _pctx_for_breakdown.partial_accepted_per_req
+                    else [0] * num_reqs
+                )
+                spec_decode_cost_breakdown = SpecDecodeCostBreakdown(
+                    draft_time_sec=_draft_ms / 1000.0,
+                    compression_time_sec=_expand_ms / 1000.0,
+                    partial_verification_time_sec=_inter_ms / 1000.0,
+                    full_verification_time_sec=_target_ms / 1000.0,
+                    num_partial_accepted_per_req=_partial_acc,
+                    reject_sample_time_sec=_reject_ms / 1000.0,
+                )
+
+            # -- Unified profiler: emit request + family metadata --
+            if use_spec_decode and spec_decode_metadata is not None:
+                _step_id = scheduler_output.spec_profile_step_id
+                _max_rps = getattr(
+                    self._spec_profiler, "_max_reqs_per_step", None)
+                _incl_tids = getattr(
+                    self._spec_profiler, "_include_token_ids", False)
+                _pctx_rm = self._current_profile_ctx
+                _req_emitted = 0
+                for _ri, _rid in enumerate(req_ids_output_copy):
+                    if _max_rps is not None and _req_emitted >= _max_rps:
+                        break
+                    _sd_toks = (
+                        scheduler_output.scheduled_spec_decode_tokens
+                        .get(_rid))
+                    _n_draft = len(_sd_toks) if _sd_toks else 0
+                    _n_accepted = 0
+                    if (pivot_post_collapse_accepted is not None
+                            and _rid in pivot_post_collapse_accepted):
+                        _n_accepted = pivot_post_collapse_accepted[_rid]
+
+                    # Intermediate/staged fields from profile context
+                    _n_inter_verified = 0
+                    _n_inter_accepted = 0
+                    _n_partial_accepted = 0
+                    _staged_depth = 0
+                    _staged_used = False
+                    if _pctx_rm is not None:
+                        if (_pctx_rm.inter_verified_per_req
+                                and _ri < len(
+                                    _pctx_rm.inter_verified_per_req)):
+                            _n_inter_verified = (
+                                _pctx_rm.inter_verified_per_req[_ri])
+                        if (_pctx_rm.inter_accepted_per_req
+                                and _ri < len(
+                                    _pctx_rm.inter_accepted_per_req)):
+                            _n_inter_accepted = (
+                                _pctx_rm.inter_accepted_per_req[_ri])
+                        if (_pctx_rm.partial_accepted_per_req
+                                and _ri < len(
+                                    _pctx_rm.partial_accepted_per_req)):
+                            _n_partial_accepted = (
+                                _pctx_rm.partial_accepted_per_req[_ri])
+                        _staged_depth = _pctx_rm.staged_verification_depth
+                        _staged_used = _pctx_rm.staged_verification_used
+
+                    # Before/after computed tokens
+                    _n_comp_before = 0
+                    _n_comp_after = 0
+                    if _ri < len(self.input_batch.req_ids):
+                        _n_comp_before = int(
+                            self.input_batch.num_tokens_no_spec[_ri])
+                        _n_comp_after = _n_comp_before + _n_accepted
+
+                    _req_rec = SpecDecodeRequestMetadataRecord(
+                        step_id=_step_id,
+                        req_id=_rid,
+                        req_index=_ri,
+                        num_draft_tokens=_n_draft,
+                        num_accepted_tokens=_n_accepted,
+                        num_rejected_tokens=max(
+                            0, _n_draft - _n_accepted),
+                        num_intermediate_verified_tokens=(
+                            _n_inter_verified),
+                        num_intermediate_accepted_tokens=(
+                            _n_inter_accepted),
+                        num_partial_accepted_tokens=_n_partial_accepted,
+                        staged_verification_depth=_staged_depth,
+                        staged_verification_used=_staged_used,
+                        num_computed_tokens_before=_n_comp_before,
+                        num_computed_tokens_after=_n_comp_after,
                     )
-                    spec_decode_cost_breakdown = SpecDecodeCostBreakdown(
-                        draft_time_sec=profiled_draft_time_sec,
-                        compression_time_sec=0.0,
-                        partial_verification_time_sec=0.0,
-                        full_verification_time_sec=full_verification_time_sec,
-                        num_partial_accepted_per_req=[0] * num_reqs,
-                        reject_sample_time_sec=reject_sample_time_sec,
-                    )
+                    # Attach token IDs if configured
+                    if _incl_tids and _sd_toks:
+                        _req_rec.draft_token_ids = list(_sd_toks)
+                        if (_ri < len(valid_sampled_token_ids)
+                                and valid_sampled_token_ids[_ri]):
+                            _req_rec.accepted_token_ids = list(
+                                valid_sampled_token_ids[_ri])
+
+                    self._spec_profiler.emit_request_metadata(_req_rec)
+                    _req_emitted += 1
+
+                # Emit collapse-phase family metadata with winner info
+                if pivot_post_collapse_accepted is not None:
+                    for _rid, _acc_len in (
+                            pivot_post_collapse_accepted.items()):
+                        _collapse_reason = (
+                            "winner_selected" if _acc_len > 0
+                            else "all_rejected")
+                        self._spec_profiler.emit_family_metadata(
+                            SpecDecodeFamilyMetadataRecord(
+                                step_id=_step_id,
+                                family_id=f"{_rid}:collapse",
+                                origin_req_id=_rid,
+                                family_stage="collapse",
+                                winner_accept_len=_acc_len,
+                                collapse_reason=_collapse_reason,
+                            ))
+
+            # -- Unified profiler: finalize step --
+            _profile_transport = None
+            _pctx = self._current_profile_ctx
+            if _pctx is not None:
+                _profile_transport = self._spec_profiler.finalize_step(
+                    _pctx)
+                self._current_profile_ctx = None
 
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -5237,6 +5573,7 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
                 spec_decode_cost_breakdown=spec_decode_cost_breakdown,
                 pivot_post_collapse_accepted_draft_tokens=pivot_post_collapse_accepted,
+                spec_decode_profile_transport=_profile_transport,
             )
 
         if not self.use_async_scheduling:

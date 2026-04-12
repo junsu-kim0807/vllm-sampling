@@ -247,6 +247,8 @@ class Scheduler(SchedulerInterface):
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
 
+        self._spec_profile_step_counter: int = 0
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
                 "enable_return_routed_experts does not support context parallelism "
@@ -893,7 +895,9 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            spec_profile_step_id=self._spec_profile_step_counter,
         )
+        self._spec_profile_step_counter += 1
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1527,6 +1531,10 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
+        # Fold unified profiler stage times into spec_decoding_stats.
+        self._fold_batch_cost_from_transport(
+            spec_decoding_stats, model_runner_output)
+
         if (
             stats := self.make_stats(
                 spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
@@ -1928,6 +1936,33 @@ class Scheduler(SchedulerInterface):
         used_slots = ecm.cache_size - ecm.num_free_slots
         return used_slots / ecm.cache_size
 
+    def _fold_batch_cost_from_transport(
+        self,
+        spec_decoding_stats: SpecDecodingStats | None,
+        model_runner_output: "ModelRunnerOutput",
+    ) -> None:
+        """Fold unified profiler transport stage times into Prometheus stats."""
+        if spec_decoding_stats is None:
+            return
+        if not getattr(self.observability_config,
+                       "spec_decode_profile_emit_scheduler_bridge", True):
+            return
+        transport = getattr(
+            model_runner_output, "spec_decode_profile_transport", None)
+        if transport is None:
+            return
+        stage_ms = transport.stage_times_ms
+        spec_decoding_stats.draft_forward_time_ms += stage_ms.get(
+            "draft_forward", 0.0)
+        spec_decoding_stats.target_verify_time_ms += stage_ms.get(
+            "target_verify", 0.0)
+        spec_decoding_stats.intermediate_verify_time_ms += stage_ms.get(
+            "intermediate_verify", 0.0)
+        spec_decoding_stats.expand_collapse_time_ms += stage_ms.get(
+            "expand_collapse", 0.0)
+        spec_decoding_stats.reject_sample_time_sec += stage_ms.get(
+            "reject_sample", 0.0) / 1000.0
+
     def make_spec_decoding_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None,
@@ -1935,7 +1970,7 @@ class Scheduler(SchedulerInterface):
         num_accepted_tokens: int,
         num_invalid_spec_tokens: dict[str, int] | None,
         request_id: str,
-        cost_breakdown: SpecDecodeCostBreakdown | None = None,
+        cost_breakdown: "SpecDecodeCostBreakdown | None" = None,
         req_index: int | None = None,
     ) -> SpecDecodingStats | None:
         if not self.log_stats or not num_draft_tokens:

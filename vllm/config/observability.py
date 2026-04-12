@@ -76,6 +76,52 @@ class ObservabilityConfig:
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
 
+    # -- Unified speculative decode profiler --------------------------------
+
+    spec_decode_profile_mode: str = "disabled"
+    """Profiling mode for speculative decoding.
+    disabled  — no-op (default).
+    stage_cost — stage wall-time only.
+    shape_memory — shape snapshots + memory inflation tracking.
+    kernel_breakdown — deep kernel time decomposition (sampled steps).
+    all — all layers active."""
+
+    spec_decode_profile_output_dir: str | None = None
+    """Directory for profiler JSONL output.  Defaults to
+    /tmp/vllm_spec_profile if not set."""
+
+    spec_decode_profile_timing_backend: str = "cuda_event"
+    """cuda_event or device_sync."""
+
+    spec_decode_profile_emit_scheduler_bridge: bool = True
+    """Whether to emit scheduler-side bridge records."""
+
+    spec_decode_profile_include_token_ids: bool = False
+    """Include raw token IDs in metadata records (can be large)."""
+
+    spec_decode_profile_request_sample_rate: float = 1.0
+    """Fraction of requests to include in per-request metadata JSONL."""
+
+    spec_decode_profile_max_reqs_per_step_record: int | None = None
+    """Cap on per-step request metadata records (None = unlimited)."""
+
+    spec_decode_profile_flush_interval: int = 64
+    """JSONL buffer flush interval (records)."""
+
+    spec_decode_profile_max_steps: int | None = None
+    """Stop profiling after this many steps (None = unlimited)."""
+
+    spec_decode_profile_kernel_sample_rate: float = 0.01
+    """Fraction of steps to deep-profile with torch.profiler (Layer B)."""
+
+    spec_decode_profile_gemm_ai_threshold: float = 50.0
+    """Arithmetic intensity threshold for GEMM memory/compute split.
+    Device-dependent (default 50.0 for A100)."""
+
+    spec_decode_profile_kernel_stage_filter: list[str] | None = None
+    """Restrict deep profiling to listed stages only, e.g.
+    ["target_verify"]. None = profile all stages on sampled steps."""
+
     @cached_property
     def collect_model_forward_time(self) -> bool:
         """Whether to collect model forward time for the request."""
@@ -149,4 +195,20 @@ class ObservabilityConfig:
             raise ValueError(
                 "collect_detailed_traces requires `--otlp-traces-endpoint` to be set."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _auto_promote_legacy_spec_profile(self):
+        """Bridge legacy VLLM_SPEC_PROFILE_TIME=1 to unified profiler."""
+        import os
+        if (os.environ.get("VLLM_SPEC_PROFILE_TIME", "0") == "1"
+                and self.spec_decode_profile_mode == "disabled"):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "VLLM_SPEC_PROFILE_TIME=1 detected; auto-enabling "
+                "spec_decode_profile_mode='stage_cost'. "
+                "Please migrate to --spec-decode-profile-mode=stage_cost."
+            )
+            self.spec_decode_profile_mode = "stage_cost"
         return self

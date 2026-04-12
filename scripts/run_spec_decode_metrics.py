@@ -323,7 +323,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--profile-time",
         action="store_true",
-        help="Set VLLM_SPEC_PROFILE_TIME=1 and report average draft/verification time.",
+        help=(
+            "[Legacy] Alias for --spec-decode-profile-mode=stage_cost. "
+            "Kept for backward compatibility."
+        ),
+    )
+    p.add_argument(
+        "--spec-decode-profile-mode",
+        type=str,
+        default="disabled",
+        choices=["disabled", "stage_cost", "shape_memory", "kernel_breakdown", "all"],
+        help=(
+            "Unified speculative-decoding profiler mode. "
+            "'stage_cost' enables per-stage wall-time collection "
+            "(draft_forward, intermediate_verify, target_verify, "
+            "expand_collapse, reject_sample, bookkeeping). "
+            "'shape_memory' adds memory/shape snapshots. "
+            "'kernel_breakdown' enables sampled deep kernel profiling. "
+            "'all' enables everything. Default: disabled."
+        ),
     )
     p.add_argument(
         "--results-root",
@@ -922,6 +940,12 @@ SPEC_DRAFT_TIME = "vllm:spec_decode_draft_time_seconds_total"
 SPEC_VERIFICATION_TIME = "vllm:spec_decode_verification_time_seconds_total"
 SPEC_REJECT_SAMPLE_TIME = "vllm:spec_decode_reject_sample_time_seconds_total"
 
+# Unified profiler stage-level metrics (cumulative ms, set as Gauge).
+SPEC_DRAFT_FORWARD_MS = "vllm:spec_decode_draft_forward_ms_total"
+SPEC_TARGET_VERIFY_MS = "vllm:spec_decode_target_verify_ms_total"
+SPEC_INTERMEDIATE_VERIFY_MS = "vllm:spec_decode_intermediate_verify_ms_total"
+SPEC_EXPAND_COLLAPSE_MS = "vllm:spec_decode_expand_collapse_ms_total"
+
 
 def chunked(items: list[Any], batch_size: int):
     for i in range(0, len(items), batch_size):
@@ -1072,12 +1096,15 @@ def run_warmup(
             if num_drafts_val > 0 or num_draft_tokens_val > 0:
                 saw_draft = True
 
-            # profile_time이 켜져 있으면 verification_time으로 직접 확인.
-            # 꺼져 있으면 speculative generate에서 draft가 발생했다는 것 자체를
-            # verifier path도 탔다는 proxy로 본다.
+            # profiling이 켜져 있으면 verification_time 또는 unified target_verify
+            # metric으로 확인. 꺼져 있으면 draft 발생 자체를 proxy로 본다.
             if profile_time:
                 if verification_time_val is not None and verification_time_val > 0:
                     saw_verify = True
+                else:
+                    tv_delta = metric_delta(after, before, SPEC_TARGET_VERIFY_MS)
+                    if tv_delta is not None and float(tv_delta) > 0:
+                        saw_verify = True
             else:
                 if saw_draft:
                     saw_verify = True
@@ -1234,9 +1261,35 @@ def measure_dataset(
         else:
             result["avg_reject_sample_time_s"] = None
 
+        _collect_unified_stage_metrics(result, after, before, num_drafts_val)
+
     if collect_responses:
         result["response_records"] = response_records
     return result
+
+
+def _collect_unified_stage_metrics(
+    result: dict[str, Any],
+    after: dict[str, Any],
+    before: dict[str, Any],
+    num_drafts: int,
+) -> None:
+    """Collect unified profiler stage-level cost breakdown (ms) into result dict."""
+    stage_metrics = {
+        "draft_forward_ms": SPEC_DRAFT_FORWARD_MS,
+        "target_verify_ms": SPEC_TARGET_VERIFY_MS,
+        "intermediate_verify_ms": SPEC_INTERMEDIATE_VERIFY_MS,
+        "expand_collapse_ms": SPEC_EXPAND_COLLAPSE_MS,
+    }
+    for field, metric_name in stage_metrics.items():
+        delta = metric_delta(after, before, metric_name)
+        val = float(delta) if delta is not None else None
+        result[field] = val
+        avg_field = f"avg_{field}"
+        if num_drafts > 0 and val is not None:
+            result[avg_field] = val / num_drafts
+        else:
+            result[avg_field] = None
 
 
 def measure_dataset_multi_turn(
@@ -1404,6 +1457,8 @@ def measure_dataset_multi_turn(
         else:
             result["avg_reject_sample_time_s"] = None
 
+        _collect_unified_stage_metrics(result, after, before, num_drafts_val)
+
     if collect_responses:
         result["response_records"] = response_records
     return result
@@ -1489,6 +1544,8 @@ def write_pair_info(
     tensor_parallel_size: int,
     dataset_keys: list[str],
     batch_sizes: list[int],
+    *,
+    profile_mode: str = "disabled",
 ) -> None:
     os.makedirs(pair_dir, exist_ok=True)
     payload = {
@@ -1503,6 +1560,7 @@ def write_pair_info(
         "dtype": args.dtype,
         "seed": args.seed,
         "profile_time": args.profile_time,
+        "spec_decode_profile_mode": profile_mode,
     }
     path = os.path.join(pair_dir, "pair_info.json")
     with open(path, "w", encoding="utf-8") as f:
@@ -1522,16 +1580,25 @@ if __name__ == "__main__":
         )
     random.seed(args.seed)
 
-    if args.profile_time:
-        os.environ["VLLM_SPEC_PROFILE_TIME"] = "1"
+    # Resolve profiler mode: --profile-time is a backward-compat alias.
+    profile_mode = args.spec_decode_profile_mode
+    if args.profile_time and profile_mode == "disabled":
+        profile_mode = "stage_cost"
+    profiling_enabled = profile_mode != "disabled"
+
+    if profiling_enabled:
         os.environ["VLLM_SPEC_VERIFY_DRAFT_MATCH"] = "1"
         print(
-            "[profile_time] VLLM_SPEC_PROFILE_TIME=1, VLLM_SPEC_VERIFY_DRAFT_MATCH=1 "
-            "(draft/verification timing and draft–verification match sampling enabled)"
+            f"[profiler] spec_decode_profile_mode={profile_mode}, "
+            "VLLM_SPEC_VERIFY_DRAFT_MATCH=1"
         )
     else:
-        os.environ["VLLM_SPEC_PROFILE_TIME"] = "0"
         os.environ["VLLM_SPEC_VERIFY_DRAFT_MATCH"] = "0"
+    # Keep legacy env var in sync for ObservabilityConfig auto-promote path.
+    if args.profile_time:
+        os.environ["VLLM_SPEC_PROFILE_TIME"] = "1"
+    else:
+        os.environ["VLLM_SPEC_PROFILE_TIME"] = "0"
     if args.debug:
         os.environ["VLLM_SPEC_DIT_DEBUG"] = "1"
         os.environ["VLLM_SPEC_DIT_DEBUG_SUMMARY"] = "1"
@@ -1548,7 +1615,7 @@ if __name__ == "__main__":
     print("[args] draft_model =", args.draft_model)
     print("[args] target_models =", target_models)
     print("[args] tp_map =", tp_map)
-    print("[args] profile_time =", args.profile_time)
+    print("[args] spec_decode_profile_mode =", profile_mode)
     print("[args] debug =", args.debug)
     print("[args] results_root =", args.results_root)
 
@@ -1651,7 +1718,7 @@ if __name__ == "__main__":
         print(f"[model-pair] draft={args.draft_model} | target={target_model} | tp={tp}")
 
         try:
-            llm = LLM(
+            llm_kwargs: dict[str, Any] = dict(
                 model=target_model,
                 tensor_parallel_size=tp,
                 trust_remote_code=args.trust_remote_code,
@@ -1666,6 +1733,9 @@ if __name__ == "__main__":
                 disable_custom_all_reduce=args.disable_custom_all_reduce,
                 max_num_seqs=max_num_seqs,
             )
+            if profiling_enabled:
+                llm_kwargs["spec_decode_profile_mode"] = profile_mode
+            llm = LLM(**llm_kwargs)
         except ValueError as e:
             msg = str(e)
             if (
@@ -1720,7 +1790,7 @@ if __name__ == "__main__":
                         top_k=args.top_k,
                         method=args.method,
                         num_spec_tokens=args.num_spec_tokens,
-                        profile_time=args.profile_time,
+                        profile_time=profiling_enabled,
                     )
                     metrics = measure_dataset_multi_turn(
                         llm=llm,
@@ -1731,7 +1801,7 @@ if __name__ == "__main__":
                         temperature=args.temperature,
                         top_p=args.top_p,
                         top_k=args.top_k,
-                        profile_time=args.profile_time,
+                        profile_time=profiling_enabled,
                         verbose=args.verbose,
                         collect_responses=bool(
                             responses_jsonl_path and not args.no_responses
@@ -1763,7 +1833,7 @@ if __name__ == "__main__":
                         top_k=args.top_k,
                         method=args.method,
                         num_spec_tokens=args.num_spec_tokens,
-                        profile_time=args.profile_time,
+                        profile_time=profiling_enabled,
                     )
 
                     metrics = measure_dataset(
@@ -1775,7 +1845,7 @@ if __name__ == "__main__":
                         temperature=args.temperature,
                         top_p=args.top_p,
                         top_k=args.top_k,
-                        profile_time=args.profile_time,
+                        profile_time=profiling_enabled,
                         verbose=args.verbose,
                         draft_model=args.draft_model,
                         target_model=target_model,
@@ -1810,7 +1880,8 @@ if __name__ == "__main__":
                     "avg_acceptance_length": metrics["avg_acceptance_length"],
                     "acceptance_rate_per_pos": metrics["acceptance_rate_per_pos"],
                 }
-                if args.profile_time:
+                if profiling_enabled:
+                    # Legacy timing fields
                     row["draft_time_s"] = metrics.get("draft_time_s")
                     row["verification_time_s"] = metrics.get("verification_time_s")
                     row["avg_draft_time_s"] = metrics.get("avg_draft_time_s")
@@ -1819,6 +1890,13 @@ if __name__ == "__main__":
                     row["avg_reject_sample_time_s"] = metrics.get(
                         "avg_reject_sample_time_s"
                     )
+                    # Unified profiler stage cost breakdown (ms)
+                    for stage_field in (
+                        "draft_forward_ms", "target_verify_ms",
+                        "intermediate_verify_ms", "expand_collapse_ms",
+                    ):
+                        row[stage_field] = metrics.get(stage_field)
+                        row[f"avg_{stage_field}"] = metrics.get(f"avg_{stage_field}")
                 else:
                     row["draft_time_s"] = None
                     row["verification_time_s"] = None
@@ -1836,7 +1914,7 @@ if __name__ == "__main__":
                     f"avg_acceptance_rate={row['avg_acceptance_rate']:.4f} "
                     f"avg_acceptance_length={row['avg_acceptance_length']:.4f}"
                 )
-                if args.profile_time:
+                if profiling_enabled:
                     ad = row.get("avg_draft_time_s")
                     av = row.get("avg_verification_time_s")
                     if ad is not None and av is not None:
@@ -1846,8 +1924,8 @@ if __name__ == "__main__":
                         )
                     elif row.get("draft_time_s") is None and row.get("verification_time_s") is None:
                         print(
-                            "[warning] draft/verification times are null. "
-                            "Ensure --profile-time was passed and not --disable-log-stats."
+                            "[warning] stage times are null. "
+                            "Check --spec-decode-profile-mode and --disable-log-stats."
                         )
                     rs = row.get("reject_sample_time_s")
                     ars = row.get("avg_reject_sample_time_s")
@@ -1857,6 +1935,15 @@ if __name__ == "__main__":
                             f"         reject_sample_time_s={rs:.6f} "
                             f"avg_reject_sample_time_s={ars_str}"
                         )
+                    # Print unified stage cost breakdown
+                    stage_parts: list[str] = []
+                    for sn in ("draft_forward_ms", "target_verify_ms",
+                               "intermediate_verify_ms", "expand_collapse_ms"):
+                        v = row.get(f"avg_{sn}")
+                        if v is not None:
+                            stage_parts.append(f"avg_{sn}={v:.4f}")
+                    if stage_parts:
+                        print(f"         {' '.join(stage_parts)}")
 
         pair_dir = get_pair_output_dir(args.results_root, args.draft_model, target_model)
         pair_csv = os.path.join(pair_dir, "metrics.csv")
@@ -1869,6 +1956,7 @@ if __name__ == "__main__":
             tensor_parallel_size=tp,
             dataset_keys=dataset_keys,
             batch_sizes=batch_sizes,
+            profile_mode=profile_mode,
         )
         if responses_jsonl_path and pair_response_records:
             save_responses_jsonl(

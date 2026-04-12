@@ -44,6 +44,12 @@ class SpecDecodingStats:
     # Rejection sampling: total time (sec) spent in rejection sampler.
     reject_sample_time_sec: float = 0.0
 
+    # Unified profiler stage times (ms, accumulated per step).
+    draft_forward_time_ms: float = 0.0
+    target_verify_time_ms: float = 0.0
+    intermediate_verify_time_ms: float = 0.0
+    expand_collapse_time_ms: float = 0.0
+
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
         return cls(
@@ -323,6 +329,40 @@ class SpecDecodingProm:
             gauge_reject_sample_time, per_engine_labelvalues
         )
 
+        # Unified profiler stage-level cumulative times (ms).
+        self._cumul_draft_forward_ms: dict[int, float] = {
+            i: 0.0 for i in per_engine_labelvalues}
+        self._cumul_target_verify_ms: dict[int, float] = {
+            i: 0.0 for i in per_engine_labelvalues}
+        self._cumul_intermediate_verify_ms: dict[int, float] = {
+            i: 0.0 for i in per_engine_labelvalues}
+        self._cumul_expand_collapse_ms: dict[int, float] = {
+            i: 0.0 for i in per_engine_labelvalues}
+        self.gauge_draft_forward_ms = make_per_engine(
+            prometheus_client.Gauge(
+                name="vllm:spec_decode_draft_forward_ms_total",
+                documentation="Cumulative draft forward time (ms).",
+                labelnames=labelnames,
+            ), per_engine_labelvalues)
+        self.gauge_target_verify_ms = make_per_engine(
+            prometheus_client.Gauge(
+                name="vllm:spec_decode_target_verify_ms_total",
+                documentation="Cumulative target verify time (ms).",
+                labelnames=labelnames,
+            ), per_engine_labelvalues)
+        self.gauge_intermediate_verify_ms = make_per_engine(
+            prometheus_client.Gauge(
+                name="vllm:spec_decode_intermediate_verify_ms_total",
+                documentation="Cumulative intermediate verify time (ms).",
+                labelnames=labelnames,
+            ), per_engine_labelvalues)
+        self.gauge_expand_collapse_ms = make_per_engine(
+            prometheus_client.Gauge(
+                name="vllm:spec_decode_expand_collapse_ms_total",
+                documentation="Cumulative expand/collapse time (ms).",
+                labelnames=labelnames,
+            ), per_engine_labelvalues)
+
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
             return
@@ -360,6 +400,28 @@ class SpecDecodingProm:
             self.gauge_spec_decode_reject_sample_time[engine_idx].set(
                 self._cumulative_reject_sample_time_sec[engine_idx]
             )
+
+        # Unified profiler stage times (ms).
+        df = spec_decoding_stats.draft_forward_time_ms
+        if df > 0:
+            self._cumul_draft_forward_ms[engine_idx] += df
+            self.gauge_draft_forward_ms[engine_idx].set(
+                self._cumul_draft_forward_ms[engine_idx])
+        tv = spec_decoding_stats.target_verify_time_ms
+        if tv > 0:
+            self._cumul_target_verify_ms[engine_idx] += tv
+            self.gauge_target_verify_ms[engine_idx].set(
+                self._cumul_target_verify_ms[engine_idx])
+        iv = spec_decoding_stats.intermediate_verify_time_ms
+        if iv > 0:
+            self._cumul_intermediate_verify_ms[engine_idx] += iv
+            self.gauge_intermediate_verify_ms[engine_idx].set(
+                self._cumul_intermediate_verify_ms[engine_idx])
+        ec = spec_decoding_stats.expand_collapse_time_ms
+        if ec > 0:
+            self._cumul_expand_collapse_ms[engine_idx] += ec
+            self.gauge_expand_collapse_ms[engine_idx].set(
+                self._cumul_expand_collapse_ms[engine_idx])
 
 
 def make_per_engine(

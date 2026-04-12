@@ -658,6 +658,7 @@ def build_python_command(
     *,
     test: bool,
     test_samples: int,
+    profile_mode: str = "stage_cost",
     method: str = "speculative",
     eagle_model: str | None = None,
     eagle_draft_tp: int | None = None,
@@ -700,7 +701,7 @@ def build_python_command(
         f"--results-root {shquote(str(root_for_dataset))}",
         f"--results-csv {shquote(f'aggregate__{slug}.csv')}",
         f"--results-jsonl {shquote(f'aggregate__{slug}.jsonl')}",
-        "--profile-time",
+        f"--spec-decode-profile-mode {profile_mode}",
         "--trust-remote-code",
         "--enable-chunked-prefill",
         f"--method {method}",
@@ -833,6 +834,7 @@ def render_job_script(
     *,
     test: bool,
     test_samples: int,
+    profile_mode: str = "stage_cost",
     method: str = "speculative",
     eagle_model: str | None = None,
     eagle_draft_tp: int | None = None,
@@ -905,6 +907,7 @@ def render_job_script(
         debug=debug,
         test=test,
         test_samples=test_samples,
+        profile_mode=profile_mode,
         method=method,
         eagle_model=eagle_model,
         eagle_draft_tp=eagle_draft_tp,
@@ -1187,6 +1190,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "When --spec-method=tetris: minimum batch size before TETRIS "
             "activates; smaller batches use standard spec-decode (default: always on)."
+        ),
+    )
+    parser.add_argument(
+        "--profile-mode",
+        type=str,
+        default="stage_cost",
+        choices=["disabled", "stage_cost", "shape_memory", "kernel_breakdown", "all"],
+        help=(
+            "Speculative-decoding profiler mode for generated jobs. "
+            "Default: stage_cost (per-stage wall-time cost breakdown)."
         ),
     )
     parser.add_argument("--verbose", action="store_true")
@@ -1617,6 +1630,7 @@ def main() -> None:
                     debug=debug_enabled,
                     test=test,
                     test_samples=test_samples,
+                    profile_mode=args.profile_mode,
                     method=method,
                     eagle_model=eagle_model,
                     eagle_draft_tp=eagle_draft_tp,
@@ -1828,6 +1842,7 @@ def main() -> None:
                             debug=debug_enabled,
                             test=False,
                             test_samples=5,
+                            profile_mode=args.profile_mode,
                             method=args.spec_method,
                             adaptive_spechive_intermediate_model=im_model,
                             adaptive_spechive_mode=args.adaptive_spechive_mode,
@@ -1908,6 +1923,7 @@ def main() -> None:
                             debug=debug_enabled,
                             test=False,
                             test_samples=5,
+                            profile_mode=args.profile_mode,
                             method=args.spec_method,
                             adaptive_spechive_intermediate_model=im_model,
                             adaptive_spechive_mode=args.adaptive_spechive_mode,
@@ -2002,6 +2018,7 @@ def main() -> None:
                     debug=debug_enabled,
                     test=test,
                     test_samples=test_samples,
+                    profile_mode=args.profile_mode,
                     method=args.spec_method,
                     adaptive_spechive_intermediate_model=im_model,
                     adaptive_spechive_mode=args.adaptive_spechive_mode,
