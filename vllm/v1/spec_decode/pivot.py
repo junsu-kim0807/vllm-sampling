@@ -1476,7 +1476,14 @@ class PivotProposer:
         elif not self._pivot_spechive:
             self._active_pivot_expansion_plan = None
 
+        _ec_prof = (
+            getattr(self.runner, "_spec_profiler", None)
+            if self.runner is not None
+            else None
+        )
         if expansion_plan is not None:
+            if _ec_prof is not None:
+                _ec_prof.start_stage("expand_collapse", invocation_idx=0)
             exp_prefix = self._expand_prefix_rows_for_plan(
                 base_prefix_rows, expansion_plan
             )
@@ -1506,6 +1513,8 @@ class PivotProposer:
             for j in range(int(out.shape[0])):
                 if not expansion_plan.packed_row_is_active[j]:
                     out[j].fill_(PLACEHOLDER_TOKEN_ID)
+        if expansion_plan is not None and _ec_prof is not None:
+            _ec_prof.end_stage("expand_collapse", invocation_idx=0)
         return out, probs, expansion_plan
 
     def _propose_via_eagle_tree(
@@ -2012,7 +2021,21 @@ class PivotProposer:
             expansion_plan.expanded_batch_size if expansion_plan is not None else None,
         )
         self.clear_draft_probs()
-        return _collapse_draft_rows_for_scheduler(out, expansion_plan, batch_size)
+        if expansion_plan is None:
+            return _collapse_draft_rows_for_scheduler(out, expansion_plan, batch_size)
+        _cl_prof = (
+            getattr(self.runner, "_spec_profiler", None)
+            if self.runner is not None
+            else None
+        )
+        if _cl_prof is not None:
+            _cl_prof.start_stage("expand_collapse", invocation_idx=1)
+        collapsed = _collapse_draft_rows_for_scheduler(
+            out, expansion_plan, batch_size
+        )
+        if _cl_prof is not None:
+            _cl_prof.end_stage("expand_collapse", invocation_idx=1)
+        return collapsed
 
     def on_target_verification(
         self,
