@@ -383,6 +383,7 @@ class PivotProposer:
         self._L = int(spec.num_speculative_tokens)
         self._topk_selection = int(spec.pivot_topk_selection)
         self._expansion_pct = float(spec.pivot_expansion_pct)
+        self._min_batch_for_expansion = int(spec.pivot_min_batch_for_expansion)
         self._pivot_mode = mode
         self._pivot_spechive = (
             mode.verification_pipeline in (
@@ -1731,8 +1732,10 @@ class PivotProposer:
         sampling_metadata: SamplingMetadata,
         use_draft_probs: bool,
     ) -> DitRoundProposal:
+        origin_bs = int(base_common_attn_metadata.batch_size())
         enable_topk = (
             self._topk_selection > 1
+            and origin_bs >= self._min_batch_for_expansion
             and all(len(r) == 0 for r in prefix_rows)
             and not self._is_waiting_for_target_collapse
             and not (
@@ -2026,6 +2029,7 @@ class PivotProposer:
             return out
 
         batch_size = int(common_attn_metadata.batch_size())
+        expand_ok = batch_size >= self._min_batch_for_expansion
         if self._pivot_use_eagle_tree:
             out, draft_probs_flat, expansion_plan = self._propose_via_eagle_tree(
                 target_token_ids=target_token_ids,
@@ -2049,7 +2053,7 @@ class PivotProposer:
                 base_prefix_rows=[[] for _ in range(batch_size)],
                 chunk_len=self._L,
                 use_draft_probs=use_draft_probs,
-                enable_topk_expansion=True,
+                enable_topk_expansion=expand_ok,
             )
         source_stage_rows = [
             [0, *([1] * max(0, self._L - 1))] for _ in range(int(out.shape[0]))

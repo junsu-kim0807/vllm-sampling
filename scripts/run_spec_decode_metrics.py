@@ -114,6 +114,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--min_batch_for_expansion",
+        type=int,
+        default=8,
+        help=(
+            "When --method=pivot: top-K expansion is only applied when "
+            "batch_size >= this threshold (default: 8)."
+        ),
+    )
+    p.add_argument(
         "--spechive",
         action="store_true",
         help=(
@@ -1725,6 +1734,7 @@ if __name__ == "__main__":
                 "num_speculative_tokens": args.num_spec_tokens,
                 "pivot_topk_selection": args.topk_selection,
                 "pivot_expansion_pct": args.expansion_pct,
+                "pivot_min_batch_for_expansion": args.min_batch_for_expansion,
                 "pivot_spechive": args.spechive,
                 "pivot_spechive_num_rounds": args.round,
                 "max_model_len": args.max_model_len,

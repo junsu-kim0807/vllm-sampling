@@ -261,6 +261,8 @@ class SpeculativeConfig:
     """Pivot first-token expansion width; supported values are 2 or 5."""
     pivot_expansion_pct: float = Field(default=0.2, gt=0.0, le=1.0)
     """Fraction of requests expanded with top-k first-token proposals."""
+    pivot_min_batch_for_expansion: int = Field(default=8, ge=1)
+    """Top-K expansion is only applied when batch_size >= this threshold."""
     pivot_spechive: bool = False
     """Enable pivot staged D=>I rounds followed by authoritative D=>T verification."""
     pivot_spechive_num_rounds: int = Field(default=1, ge=1)
@@ -1459,13 +1461,15 @@ class SpeculativeConfig:
             im = self.intermediate_model
             topk = self.pivot_topk_selection
             pct = self.pivot_expansion_pct
+            min_b = self.pivot_min_batch_for_expansion
             psp = self.pivot_spechive
             rounds = self.pivot_spechive_num_rounds
             use_tree = self.pivot_use_eagle_tree
             return (
                 "SpeculativeConfig("
                 f"{method=}, {model=}, {im=}, {num_spec_tokens=}, "
-                f"{topk=}, {pct=}, {psp=}, {rounds=}, {use_tree=}, "
+                f"{topk=}, {pct=}, {min_b=}, {psp=}, {rounds=}, "
+                f"{use_tree=}, "
                 f"proposal_engine={mode.proposal_engine}, "
                 f"verification_pipeline={mode.verification_pipeline}, "
                 f"hidden_state_source={mode.hidden_state_source})"
