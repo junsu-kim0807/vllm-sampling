@@ -345,6 +345,29 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--spec-decode-profile-output-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory for unified spec-decode profiler JSONL "
+            "(spec_decode_<kind>.<writer_id>.jsonl). "
+            "When profiling is enabled and this is unset, defaults to "
+            "<pair_dir>/spec_decode_profile under --results-root. "
+            "If unset in engine code, vLLM uses /tmp/vllm_spec_profile "
+            "(not next to metrics.jsonl)."
+        ),
+    )
+    p.add_argument(
+        "--spec-decode-profile-flush-interval",
+        type=int,
+        default=None,
+        help=(
+            "Flush each JSONL kind after this many appended records "
+            "(engine default is typically 64). Lower values write more often. "
+            "Workers also flush remaining lines on shutdown when closed cleanly."
+        ),
+    )
+    p.add_argument(
         "--results-root",
         type=str,
         default="results/profile",
@@ -1467,6 +1490,16 @@ def measure_dataset_multi_turn(
 
 def free_llm(llm: Any) -> None:
     try:
+        llm_eng = getattr(llm, "llm_engine", None)
+        if llm_eng is not None:
+            ec = getattr(llm_eng, "engine_core", None)
+            if ec is not None:
+                shutdown_fn = getattr(ec, "shutdown", None)
+                if shutdown_fn is not None:
+                    shutdown_fn()
+    except Exception:
+        pass
+    try:
         del llm
     except Exception:
         pass
@@ -1547,6 +1580,7 @@ def write_pair_info(
     batch_sizes: list[int],
     *,
     profile_mode: str = "disabled",
+    spec_decode_profile_output_dir: str | None = None,
 ) -> None:
     os.makedirs(pair_dir, exist_ok=True)
     payload = {
@@ -1563,6 +1597,8 @@ def write_pair_info(
         "profile_time": args.profile_time,
         "spec_decode_profile_mode": profile_mode,
     }
+    if spec_decode_profile_output_dir is not None:
+        payload["spec_decode_profile_output_dir"] = spec_decode_profile_output_dir
     path = os.path.join(pair_dir, "pair_info.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
@@ -1718,6 +1754,23 @@ if __name__ == "__main__":
         print("=" * 80)
         print(f"[model-pair] draft={args.draft_model} | target={target_model} | tp={tp}")
 
+        pair_dir = get_pair_output_dir(args.results_root, args.draft_model, target_model)
+        os.makedirs(pair_dir, exist_ok=True)
+
+        spec_profile_out_dir: str | None = None
+        if profiling_enabled:
+            spec_profile_out_dir = (
+                args.spec_decode_profile_output_dir
+                or os.path.join(pair_dir, "spec_decode_profile")
+            )
+            os.makedirs(spec_profile_out_dir, exist_ok=True)
+            print(
+                "[profiler] unified spec-decode JSONL directory: "
+                f"{spec_profile_out_dir}\n"
+                "         (tensor_parallel_size>1 => one writer_id / worker process; "
+                "filenames like spec_decode_stage_cost.worker_<pid>.jsonl)"
+            )
+
         try:
             llm_kwargs: dict[str, Any] = dict(
                 model=target_model,
@@ -1736,6 +1789,12 @@ if __name__ == "__main__":
             )
             if profiling_enabled:
                 llm_kwargs["spec_decode_profile_mode"] = profile_mode
+                assert spec_profile_out_dir is not None
+                llm_kwargs["spec_decode_profile_output_dir"] = spec_profile_out_dir
+                if args.spec_decode_profile_flush_interval is not None:
+                    llm_kwargs["spec_decode_profile_flush_interval"] = (
+                        args.spec_decode_profile_flush_interval
+                    )
             llm = LLM(**llm_kwargs)
         except ValueError as e:
             msg = str(e)
@@ -1946,7 +2005,6 @@ if __name__ == "__main__":
                     if stage_parts:
                         print(f"         {' '.join(stage_parts)}")
 
-        pair_dir = get_pair_output_dir(args.results_root, args.draft_model, target_model)
         pair_csv = os.path.join(pair_dir, "metrics.csv")
         pair_jsonl = os.path.join(pair_dir, "metrics.jsonl")
         save_results(target_rows, pair_csv, pair_jsonl)
@@ -1958,6 +2016,7 @@ if __name__ == "__main__":
             dataset_keys=dataset_keys,
             batch_sizes=batch_sizes,
             profile_mode=profile_mode,
+            spec_decode_profile_output_dir=spec_profile_out_dir,
         )
         if responses_jsonl_path and pair_response_records:
             save_responses_jsonl(

@@ -919,6 +919,13 @@ class Worker(WorkerBase):
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            spec_prof = getattr(model_runner, "_spec_profiler", None)
+            if spec_prof is not None:
+                close_fn = getattr(spec_prof, "close", None)
+                if close_fn is not None:
+                    close_fn()
         if self.profiler is not None:
             self.profiler.shutdown()
 
