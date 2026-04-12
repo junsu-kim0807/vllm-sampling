@@ -190,6 +190,8 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     HybridProposalBundle,
     PivotExpandedTreePlan,
     PivotExpansionPlan,
+    _split_flat_tokens_by_lengths,
+    _split_probs_by_lengths,
     expand_hybrid_bundle_for_pivot_expansion,
     pivot_expansion_indices_fit_prepare_batch,
 )
@@ -391,6 +393,75 @@ def _collapse_draft_tensor_rows_for_scheduler(
             )
         out[o].copy_(out_exp[j])
     return out
+
+
+def _clamp_hybrid_bundle_to_max_counts(
+    bundle: HybridProposalBundle,
+    max_per_row: np.ndarray,
+) -> HybridProposalBundle:
+    """Truncate expanded-row draft tokens to at most *max_per_row* each.
+
+    When intermediate verification accepts different numbers of tokens for
+    different expanded rows, the bundle's per-row counts can diverge from
+    the scheduler's collapsed (origin-based) counts.  This helper rebuilds
+    the flat token tensor so that every row has at most the origin's
+    scheduled count, keeping the bundle and metadata in sync.
+    """
+    pb_ndt = bundle.num_draft_tokens
+    clamped: list[int] = [
+        min(int(pb_ndt[j]), int(max_per_row[j])) for j in range(len(pb_ndt))
+    ]
+    if clamped == list(pb_ndt):
+        return bundle
+    tok_rows = _split_flat_tokens_by_lengths(
+        bundle.draft_token_ids, pb_ndt
+    )
+    new_flat_parts: list[torch.Tensor] = []
+    for j, row in enumerate(tok_rows):
+        c = clamped[j]
+        if c > 0:
+            new_flat_parts.append(row[:c])
+    if new_flat_parts:
+        new_flat = torch.cat(new_flat_parts, dim=0)
+    else:
+        new_flat = bundle.draft_token_ids.new_empty(
+            (0,), dtype=bundle.draft_token_ids.dtype
+        )
+    device = new_flat.device
+    cu = torch.cumsum(
+        torch.tensor(clamped, dtype=torch.int32, device=device), dim=0
+    ).to(torch.int32)
+    new_probs = None
+    if bundle.draft_probs is not None:
+        prob_rows = _split_probs_by_lengths(bundle.draft_probs, pb_ndt)
+        new_prob_parts: list[torch.Tensor] = []
+        for j, row in enumerate(prob_rows):
+            c = clamped[j]
+            if c > 0:
+                new_prob_parts.append(row[:c])
+        if new_prob_parts:
+            new_probs = torch.cat(new_prob_parts, dim=0)
+    new_src = None
+    if bundle.source_stage is not None:
+        src_rows = _split_flat_tokens_by_lengths(
+            bundle.source_stage, pb_ndt
+        )
+        new_src_parts: list[torch.Tensor] = []
+        for j, row in enumerate(src_rows):
+            c = clamped[j]
+            if c > 0:
+                new_src_parts.append(row[:c])
+        if new_src_parts:
+            new_src = torch.cat(new_src_parts, dim=0)
+    return dataclass_replace(
+        bundle,
+        draft_token_ids=new_flat,
+        draft_probs=new_probs,
+        num_draft_tokens=clamped,
+        cu_num_draft_tokens=cu,
+        max_spec_len=max(clamped) if clamped else bundle.max_spec_len,
+        source_stage=new_src,
+    )
 
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
@@ -2055,6 +2126,19 @@ class GPUModelRunner(
                 else:
                     num_draft_meta = num_draft_tokens[pivot_plan.expanded_to_origin]
                     cu_meta = cu_num_tokens[pivot_plan.expanded_to_origin]
+                # Expanded rows may have fewer tokens than their origin's
+                # collapsed count (intermediate verification can reject tokens
+                # for some candidates while accepting for others).  Clamp the
+                # per-row schedule count to the bundle's actual count so the
+                # metadata stays in sync with the flat token tensor.
+                pb_ndt = np.array(pb.num_draft_tokens, dtype=np.int32)
+                needs_clamp = np.any(num_draft_meta != pb_ndt)
+                if needs_clamp:
+                    num_draft_meta = np.minimum(num_draft_meta, pb_ndt)
+                    pb = _clamp_hybrid_bundle_to_max_counts(
+                        pb, num_draft_meta
+                    )
+                    self.pending_hybrid_spec_bundle = pb
                 spec_decode_metadata = self._calc_spec_decode_metadata(
                     num_draft_meta,
                     cu_meta,
