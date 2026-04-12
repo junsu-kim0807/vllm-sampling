@@ -5623,11 +5623,11 @@ class GPUModelRunner(
                 ),
             )
         elif isinstance(draft_token_ids, torch.Tensor):
-            num_spec = (
-                spec_config.num_speculative_tokens
-                if spec_config is not None
-                else draft_token_ids.shape[1]
-            )
+            # Use the actual tensor width so that methods whose propose output
+            # is wider than num_speculative_tokens (e.g. pivot+spechive where
+            # runner_num_speculative_tokens() > num_speculative_tokens) are not
+            # silently truncated.
+            num_spec = draft_token_ids.shape[1]
             if spec_config is not None and getattr(spec_config, "tetris", False):
                 logger.warning_once(
                     "TETRIS is enabled but draft logprobs are missing "
@@ -5640,7 +5640,8 @@ class GPUModelRunner(
                 extra = getattr(spec_config, "tetris_extra_proposals", 0)
                 num_spec = max(1, num_spec - extra)
             draft_token_ids = [
-                draft_token_ids[i, :num_spec].tolist()
+                [tok for tok in draft_token_ids[i, :num_spec].tolist()
+                 if tok != PLACEHOLDER_TOKEN_ID]
                 for i in range(draft_token_ids.shape[0])
             ]
         # ---- end TETRIS ----------------------------------------------------
