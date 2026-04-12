@@ -3458,11 +3458,12 @@ class GPUModelRunner(
         self.set_pending_hybrid_spec_bundle(bundle)
         if (
             bundle is not None
+            and self._dit_debug_enabled
             and self.speculative_config is not None
             and self.speculative_config.method == "pivot"
             and spec_decode_metadata is not None
         ):
-            logger.warning(
+            logger.info(
                 "PIVOT_DEBUG publish_bundle: bundle_rows=%d metadata_rows=%d",
                 len(bundle.num_draft_tokens),
                 len(spec_decode_metadata.num_draft_tokens),
@@ -4207,10 +4208,11 @@ class GPUModelRunner(
             )
             if remapped is None:
                 if (
-                    self.speculative_config is not None
+                    self._dit_debug_enabled
+                    and self.speculative_config is not None
                     and self.speculative_config.method == "pivot"
                 ):
-                    logger.warning(
+                    logger.info(
                         "PIVOT_DEBUG sample: metadata_rows=%d bundle_rows=%d "
                         "bundle_req_ids=%s detail=%s",
                         len(spec_decode_metadata.num_draft_tokens),
@@ -4239,10 +4241,11 @@ class GPUModelRunner(
             )
             if validated_bundle is None:
                 if (
-                    self.speculative_config is not None
+                    self._dit_debug_enabled
+                    and self.speculative_config is not None
                     and self.speculative_config.method == "pivot"
                 ):
-                    logger.warning(
+                    logger.info(
                         "PIVOT_DEBUG sample: metadata_rows=%d bundle_rows=%d "
                         "bundle_req_ids=%s detail=%s",
                         len(spec_decode_metadata.num_draft_tokens),
@@ -4301,7 +4304,8 @@ class GPUModelRunner(
             else None
         )
         log_pivot_accept_len = (
-            self.speculative_config is not None
+            self._dit_debug_enabled
+            and self.speculative_config is not None
             and self.speculative_config.method == "pivot"
             and spec_decode_metadata is not None
             and (tree_plan is not None or expansion_plan is not None)
@@ -4382,7 +4386,7 @@ class GPUModelRunner(
                 origin_b = int(expansion_plan.origin_batch_size)
             elif tree_plan is not None:
                 origin_b = int(tree_plan.origin_batch_size)
-            logger.warning(
+            logger.info(
                 "PIVOT_DEBUG accept_len: pre_collapse_mean=%.4f pre_rows=%d "
                 "post_collapse_mean=%.4f post_rows=%d origin_batch=%d "
                 "expanded_batch=%d tree=%s post_nd_aligned=%s",

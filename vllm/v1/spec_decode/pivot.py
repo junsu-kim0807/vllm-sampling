@@ -29,6 +29,7 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.adaptive_cascade import (
     _hv_clone_cad,
     _propose_chunk_from_prefix,
+    _spechive_debug_enabled,
     _verify_chunk_with_prefix,
 )
 from vllm.v1.spec_decode.adaptive_spechive import (
@@ -801,16 +802,17 @@ class PivotProposer:
 
         selected_set = set(self._select_low_confidence_indices(pivot_probs))
         selected_sorted = sorted(selected_set)[:num_expand]
-        logger.warning(
-            "PIVOT_DEBUG plan: B=%d K=%d pct=%.3f num_expand=%d P=%d p_extra=%d selected=%s",
-            B,
-            K,
-            self._expansion_pct,
-            num_expand,
-            P,
-            p_extra,
-            selected_sorted,
-        )
+        if _spechive_debug_enabled():
+            logger.info(
+                "PIVOT_DEBUG plan: B=%d K=%d pct=%.3f num_expand=%d P=%d p_extra=%d selected=%s",
+                B,
+                K,
+                self._expansion_pct,
+                num_expand,
+                P,
+                p_extra,
+                selected_sorted,
+            )
 
         packed_to_origin = [-1] * P
         packed_sm_origin = [0] * P
@@ -909,17 +911,18 @@ class PivotProposer:
         top1_prob = root_topk.topk_probs[:, 0]
         selected_set = set(self._select_low_confidence_indices_from_top1_prob(top1_prob))
         selected_sorted = sorted(selected_set)[:num_expand]
-        logger.warning(
-            "PIVOT_DEBUG plan: B=%d K=%d pct=%.3f num_expand=%d P=%d p_extra=%d selected=%s "
-            "(root_topk)",
-            B,
-            K,
-            self._expansion_pct,
-            num_expand,
-            P,
-            p_extra,
-            selected_sorted,
-        )
+        if _spechive_debug_enabled():
+            logger.info(
+                "PIVOT_DEBUG plan: B=%d K=%d pct=%.3f num_expand=%d P=%d p_extra=%d selected=%s "
+                "(root_topk)",
+                B,
+                K,
+                self._expansion_pct,
+                num_expand,
+                P,
+                p_extra,
+                selected_sorted,
+            )
 
         packed_to_origin = [-1] * P
         packed_sm_origin = [0] * P
@@ -1339,12 +1342,13 @@ class PivotProposer:
                     base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
                 )
                 assert int(tail_cad.batch_size()) == len(full_prefix_rows) == batch_size
-                logger.warning(
-                    "PIVOT_DEBUG tail_contract: prefix_rows=%d cad_rows=%d next_rows=%d",
-                    len(full_prefix_rows),
-                    int(tail_cad.batch_size()),
-                    int(tail_next.shape[0]),
-                )
+                if _spechive_debug_enabled():
+                    logger.info(
+                        "PIVOT_DEBUG tail_contract: prefix_rows=%d cad_rows=%d next_rows=%d",
+                        len(full_prefix_rows),
+                        int(tail_cad.batch_size()),
+                        int(tail_next.shape[0]),
+                    )
                 proposal_hidden_states, tail_prefix_prefab = (
                     self._resolve_hidden_states_for_proposal(
                         base_target_token_ids=tail_tok,
@@ -1460,15 +1464,16 @@ class PivotProposer:
                 root_topk,
                 self.vllm_config.model_config.get_vocab_size(),
             )
-        logger.warning(
-            "PIVOT_DEBUG root: verification_rows=%d has_plan=%s expanded_batch=%s "
-            "used_root_topk=%s used_full_probs=%s",
-            int(pivots.shape[0]),
-            expansion_plan is not None,
-            expansion_plan.expanded_batch_size if expansion_plan is not None else None,
-            pivot_probs is None and root_topk is not None,
-            pivot_probs is not None,
-        )
+        if _spechive_debug_enabled():
+            logger.info(
+                "PIVOT_DEBUG root: verification_rows=%d has_plan=%s expanded_batch=%s "
+                "used_root_topk=%s used_full_probs=%s",
+                int(pivots.shape[0]),
+                expansion_plan is not None,
+                expansion_plan.expanded_batch_size if expansion_plan is not None else None,
+                pivot_probs is None and root_topk is not None,
+                pivot_probs is not None,
+            )
         if expansion_plan is not None:
             self._active_pivot_expansion_plan = expansion_plan
             if self._pivot_spechive:
@@ -2013,13 +2018,14 @@ class PivotProposer:
             "num_intermediate_rounds_since_target": self._num_intermediate_rounds_since_target,
         }
         _phb = self._staged_hybrid_bundle
-        logger.warning(
-            "PIVOT_DEBUG stage: origin_batch=%d bundle_rows=%d has_plan=%s expanded_batch=%s",
-            batch_size,
-            len(_phb.num_draft_tokens) if _phb is not None else 0,
-            expansion_plan is not None,
-            expansion_plan.expanded_batch_size if expansion_plan is not None else None,
-        )
+        if _spechive_debug_enabled():
+            logger.info(
+                "PIVOT_DEBUG stage: origin_batch=%d bundle_rows=%d has_plan=%s expanded_batch=%s",
+                batch_size,
+                len(_phb.num_draft_tokens) if _phb is not None else 0,
+                expansion_plan is not None,
+                expansion_plan.expanded_batch_size if expansion_plan is not None else None,
+            )
         self.clear_draft_probs()
         if expansion_plan is None:
             return _collapse_draft_rows_for_scheduler(out, expansion_plan, batch_size)
