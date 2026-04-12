@@ -70,9 +70,10 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help=(
-            "When --method=tetris: number of extra draft tokens beyond base_k. "
-            "The drafter produces K = num_spec_tokens tokens total; "
-            "capacity = (K - extra) * batch_size. "
+            "When --method=tetris: extra draft tokens beyond base_k. "
+            "base_k = num_spec_tokens (what you'd use in vanilla). "
+            "Drafter automatically generates K = base_k + extra tokens; "
+            "capacity = base_k * batch_size. "
             "Paper experiments used 1, 2, or 3 (default: 2)."
         ),
     )

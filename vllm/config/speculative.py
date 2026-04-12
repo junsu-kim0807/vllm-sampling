@@ -174,21 +174,30 @@ class SpeculativeConfig:
     Reference: https://arxiv.org/pdf/2502.15197
     """
     tetris_extra_proposals: int = 0
-    """Number of *extra* draft tokens beyond the base speculative length.
+    """Number of *extra* draft tokens the drafter generates beyond ``base_k``.
 
-    The drafter produces ``K = num_speculative_tokens`` tokens per request,
-    where ``K = base_k + tetris_extra_proposals``.  The verification capacity
-    is ``base_k × batch_size = (K − extra) × B``.
+    When ``tetris=True`` and ``extra_proposals > 0``:
+      - ``base_k`` = the user-specified ``num_speculative_tokens``
+      - The drafter actually generates ``K = base_k + extra_proposals`` tokens
+      - Verification capacity = ``base_k × batch_size``
 
-    Set this to a positive value (paper experiments: 1, 2, 3) so the drafter
-    explores deeper drafts while TETRIS trims the budget to ``base_k × B``.
-    With ``extra_proposals = 0`` the capacity equals the full grid and TETRIS
+    The ``__post_init__`` method automatically raises
+    ``num_speculative_tokens`` from ``base_k`` to ``K`` so the drafter loop
+    runs for the wider length.  The original ``base_k`` is saved to
+    ``tetris_base_k`` for use by the selection algorithm.
+
+    Paper experiments used extra_proposals = 1, 2, or 3.
+    With ``extra_proposals = 0`` capacity equals the full grid and TETRIS
     is a no-op versus vanilla speculative decoding."""
     tetris_turn_on_batch_size: int | None = None
     """Minimum number of concurrently decoded requests required before TETRIS
     is activated.  When the live batch is smaller than this threshold, plain
     speculative decoding is used (no TETRIS selection).  ``None`` means
     TETRIS is always active when ``tetris=True``."""
+    tetris_base_k: int | None = None
+    """Populated automatically by ``__post_init__``.  Stores the original
+    ``num_speculative_tokens`` value (= base_k) before it was expanded by
+    ``tetris_extra_proposals``.  Do not set manually."""
     # --------------------------------------------------------------------------
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -757,6 +766,30 @@ class SpeculativeConfig:
                             f"num_speculative_tokens:{self.num_speculative_tokens}"
                             f" must be divisible by {n_predict=}"
                         )
+
+                # --- TETRIS: expand num_speculative_tokens by extra_proposals ---
+                # User specifies base_k via num_speculative_tokens; when TETRIS
+                # is active we bump the drafter length to K = base_k + extra so
+                # the selection algorithm has a wider grid to choose from while
+                # the verification budget stays at base_k × B.
+                if (
+                    self.tetris
+                    and self.tetris_extra_proposals > 0
+                    and self.num_speculative_tokens is not None
+                ):
+                    base_k = self.num_speculative_tokens
+                    self.tetris_base_k = base_k
+                    self.num_speculative_tokens = base_k + self.tetris_extra_proposals
+                    logger.info(
+                        "TETRIS: expanding num_speculative_tokens from "
+                        "base_k=%d to K=%d (extra_proposals=%d).",
+                        base_k,
+                        self.num_speculative_tokens,
+                        self.tetris_extra_proposals,
+                    )
+                elif self.tetris and self.num_speculative_tokens is not None:
+                    self.tetris_base_k = self.num_speculative_tokens
+                # --- end TETRIS expansion ---
 
                 if self.speculative_token_tree is None:
                     if self.num_speculative_tokens is None:

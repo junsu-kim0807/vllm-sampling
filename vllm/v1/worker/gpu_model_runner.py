@@ -5955,7 +5955,8 @@ class GPUModelRunner(
             draft_token_ids = apply_tetris(
                 draft_token_ids=draft_token_ids,
                 draft_token_logprobs=self.drafter.last_draft_logprobs,
-                num_speculative_tokens=spec_config.num_speculative_tokens,
+                base_k=getattr(spec_config, "tetris_base_k", None)
+                or spec_config.num_speculative_tokens,
                 extra_proposals=getattr(
                     spec_config, "tetris_extra_proposals", 0
                 ),
@@ -5964,10 +5965,6 @@ class GPUModelRunner(
                 ),
             )
         elif isinstance(draft_token_ids, torch.Tensor):
-            # Use the actual tensor width so that methods whose propose output
-            # is wider than num_speculative_tokens (e.g. pivot+spechive where
-            # runner_num_speculative_tokens() > num_speculative_tokens) are not
-            # silently truncated.
             num_spec = draft_token_ids.shape[1]
             if spec_config is not None and getattr(spec_config, "tetris", False):
                 logger.warning_once(
@@ -5978,8 +5975,12 @@ class GPUModelRunner(
                     "proposer path that does not record per-step logprobs.",
                     scope="local",
                 )
-                extra = getattr(spec_config, "tetris_extra_proposals", 0)
-                num_spec = max(1, num_spec - extra)
+                base_k = getattr(spec_config, "tetris_base_k", None)
+                if base_k is not None:
+                    num_spec = base_k
+                else:
+                    extra = getattr(spec_config, "tetris_extra_proposals", 0)
+                    num_spec = max(1, num_spec - extra)
             draft_token_ids = [
                 [tok for tok in draft_token_ids[i, :num_spec].tolist()
                  if tok != PLACEHOLDER_TOKEN_ID]

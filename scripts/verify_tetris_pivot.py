@@ -74,8 +74,9 @@ def smoke_tetris() -> bool:
         return True
 
     device = torch.device("cpu")
-    b, K, extra = 3, 5, 2
-    base_k = K - extra  # 3
+    base_k, extra = 3, 2
+    K = base_k + extra  # 5 (what the drafter generates)
+    b = 3
     logp = torch.randn(b, K, device=device)
 
     # select_proposals with sub-full capacity
@@ -86,11 +87,11 @@ def smoke_tetris() -> bool:
 
     tok = torch.randint(0, 1000, (b, K), device=device)
 
-    # apply_tetris with extra_proposals > 0 (capacity = base_k * B < B*K)
+    # apply_tetris with base_k=3, extra=2 → capacity = 3*3 = 9 < 5*3 = 15
     trimmed = apply_tetris(
         tok,
         logp,
-        num_speculative_tokens=K,
+        base_k=base_k,
         extra_proposals=extra,
         turn_on_batch_size=None,
     )
@@ -100,11 +101,11 @@ def smoke_tetris() -> bool:
         if row:
             assert row == tok[i, : len(row)].tolist()
 
-    # apply_tetris with extra=0 → full grid → all K (no-op)
+    # apply_tetris with extra=0 → capacity = K*B = full grid (no-op)
     trimmed_noop = apply_tetris(
         tok,
         logp,
-        num_speculative_tokens=K,
+        base_k=K,
         extra_proposals=0,
         turn_on_batch_size=None,
     )
@@ -114,7 +115,7 @@ def smoke_tetris() -> bool:
     fallback = apply_tetris(
         tok,
         logp,
-        num_speculative_tokens=K,
+        base_k=base_k,
         extra_proposals=extra,
         turn_on_batch_size=100,  # b=3 < 100
     )
@@ -166,6 +167,7 @@ def e2e_tetris(*, target_model: str, draft_model: str) -> bool:
         print(f"[tetris] e2e SKIP: {e}")
         return True
 
+    # User specifies base_k=3; __post_init__ auto-expands to K=3+2=5.
     llm = LLM(
         model=target_model,
         enforce_eager=True,
@@ -174,7 +176,7 @@ def e2e_tetris(*, target_model: str, draft_model: str) -> bool:
         speculative_config={
             "method": "draft_model",
             "model": draft_model,
-            "num_speculative_tokens": 5,
+            "num_speculative_tokens": 3,
             "max_model_len": 512,
             "tetris": True,
             "tetris_extra_proposals": 2,

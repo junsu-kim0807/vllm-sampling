@@ -14,12 +14,12 @@ draft tokens across the entire batch to actually send to the target model
 for verification, subject to a total *capacity* constraint.
 
 Key formula (from the paper):
-    actual_draft_len (K) = base_k + extra_proposals
-    capacity = base_k × batch_size = (K − extra_proposals) × batch_size
+    K = base_k + extra_proposals   (drafter generates K tokens)
+    capacity = base_k × batch_size (verification budget)
 
-The drafter produces K tokens per request, but the target model only
-verifies capacity = base_k × B of them.  TETRIS decides *which* prefix
-depths to keep per request so the expected accepted tokens is maximised.
+The config layer (`SpeculativeConfig.__post_init__`) automatically expands
+``num_speculative_tokens`` from ``base_k`` to ``K`` and stores the original
+value in ``tetris_base_k``.  This module receives ``base_k`` directly.
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ def select_proposals(
         capacity: Total number of draft-token verification slots for the
             batch.  Must satisfy ``0 < capacity <= B * K``.
         draft_token_logprobs: Float tensor of shape
-            ``[batch_size, max_spec_len]`` containing the log-probability
+            ``[batch_size, K]`` containing the log-probability
             (under the draft model) of each selected draft token.
         num_draft_tokens: List of length ``batch_size`` with the number of
             valid draft tokens per request.
@@ -145,7 +145,7 @@ def select_proposals(
 def apply_tetris(
     draft_token_ids: torch.Tensor,
     draft_token_logprobs: torch.Tensor,
-    num_speculative_tokens: int,
+    base_k: int,
     extra_proposals: int = 0,
     turn_on_batch_size: Optional[int] = None,
 ) -> list[list[int]]:
@@ -155,19 +155,17 @@ def apply_tetris(
     ragged ``list[list[int]]`` where each inner list has been trimmed to the
     TETRIS-optimal length for that request.
 
-    The drafter generates ``K = num_speculative_tokens`` tokens per request
-    (including ``extra_proposals`` additional positions).  The verification
-    budget is ``base_k × batch_size`` where ``base_k = K − extra_proposals``.
+    The drafter generates ``K = base_k + extra_proposals`` tokens per request.
+    The verification budget is ``base_k × batch_size``.
 
     Args:
         draft_token_ids: Integer tensor ``[batch_size, K]``.
         draft_token_logprobs: Float tensor ``[batch_size, K]``
             of log-probabilities of the selected draft tokens at each step.
-        num_speculative_tokens: Total draft length K produced by the drafter,
-            equal to ``base_k + extra_proposals``.
+        base_k: The vanilla speculative length (verification budget per
+            request).  ``capacity = base_k × batch_size``.
         extra_proposals: Number of extra draft tokens beyond base_k.
-            ``capacity = (K − extra_proposals) × B``.  Must be
-            ``0 <= extra_proposals < num_speculative_tokens``.
+            The drafter produced ``K = base_k + extra_proposals`` tokens.
         turn_on_batch_size: If set, TETRIS is only active when
             ``batch_size >= turn_on_batch_size``.
 
@@ -176,16 +174,14 @@ def apply_tetris(
         request *i*, truncated to the TETRIS-optimal length.
     """
     batch_size = draft_token_ids.shape[0]
-    K = num_speculative_tokens
-    base_k = K - extra_proposals
+    K = draft_token_ids.shape[1]  # actual draft length from drafter
 
     if base_k <= 0:
         logger.warning_once(
-            "TETRIS: extra_proposals (%d) >= num_speculative_tokens (%d); "
-            "base_k would be %d. Falling back to full draft length.",
-            extra_proposals,
-            K,
+            "TETRIS: base_k=%d is invalid. Falling back to full draft "
+            "length K=%d.",
             base_k,
+            K,
             scope="local",
         )
         base_k = K
@@ -206,16 +202,14 @@ def apply_tetris(
         ]
 
     # Paper formula: capacity = base_k × batch_size
-    # The drafter produced K = base_k + extra tokens; TETRIS selects from
-    # the wider K-token grid but caps verification at base_k × B slots.
     capacity = base_k * batch_size
     total_slots = K * batch_size
 
     if capacity >= total_slots:
         logger.info_once(
             "TETRIS: capacity (%d) >= total draft slots (%d). "
-            "extra_proposals=%d is 0 or base_k >= K; selection is equivalent "
-            "to vanilla. Set extra_proposals > 0 for TETRIS to have effect. "
+            "extra_proposals=%d is 0 so selection is equivalent to vanilla. "
+            "Set extra_proposals > 0 for TETRIS to have effect. "
             "Set %s=1 for per-step stats.",
             capacity,
             total_slots,
