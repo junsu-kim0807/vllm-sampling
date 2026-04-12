@@ -379,6 +379,102 @@ def _build_prefix_conditioned_inputs(
     )
 
 
+def _canonicalize_reused_prefix_frontier(
+    proposer: SpecDecodeBaseProposer,
+    *,
+    cad: CommonAttentionMetadata,
+    target_token_ids: torch.Tensor,
+    target_positions: torch.Tensor,
+    target_hidden_states: torch.Tensor,
+    next_token_ids: torch.Tensor,
+) -> tuple[
+    CommonAttentionMetadata,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Normalize reused prefix-prefab inputs back to the pre-SIFP layout.
+
+    Reused staged prefabs must present a frontier where token/position/hidden
+    tensors and CAD all describe the same flat query layout. When an older or
+    partially patched producer leaks a post-`set_inputs_first_pass` CAD/hidden
+    pair together with pre-SIFP tokens/positions, rebuild the CAD/hidden view
+    expected by `_build_prefix_conditioned_inputs`.
+    """
+    tok_n = int(target_token_ids.shape[0])
+    pos_n = (
+        int(target_positions.shape[0])
+        if target_positions.dim() == 1
+        else int(target_positions.shape[1])
+    )
+    hid_n = int(target_hidden_states.shape[0])
+    qsl_n = int(cad.query_start_loc[-1].item())
+    if qsl_n == tok_n and pos_n == tok_n and hid_n == tok_n:
+        return cad, target_token_ids, target_positions, target_hidden_states, next_token_ids
+
+    extra_slots = int(getattr(proposer, "net_num_new_slots_per_request", 0))
+    batch_size = int(cad.batch_size())
+    expected_post = tok_n + batch_size * extra_slots
+    if (
+        extra_slots <= 0
+        or batch_size <= 0
+        or qsl_n != expected_post
+        or hid_n != expected_post
+        or pos_n != tok_n
+    ):
+        return cad, target_token_ids, target_positions, target_hidden_states, next_token_ids
+
+    qsl = cad.query_start_loc
+    offsets = extra_slots * torch.arange(
+        len(qsl), dtype=qsl.dtype, device=qsl.device
+    )
+    pre_qsl = qsl - offsets
+    if int(pre_qsl[-1].item()) != tok_n:
+        return cad, target_token_ids, target_positions, target_hidden_states, next_token_ids
+
+    hidden_pieces: list[torch.Tensor] = []
+    slot_pieces: list[torch.Tensor] = []
+    max_query_len = 1
+    for b in range(batch_size):
+        dst_start = int(pre_qsl[b].item())
+        dst_end = int(pre_qsl[b + 1].item())
+        orig_len = dst_end - dst_start
+        src_start = int(qsl[b].item())
+        src_end = src_start + orig_len
+        hidden_pieces.append(target_hidden_states[src_start:src_end])
+        slot_pieces.append(cad.slot_mapping[src_start:src_end])
+        max_query_len = max(max_query_len, orig_len)
+
+    pre_hidden = torch.cat(hidden_pieces, dim=0)
+    pre_slot = torch.cat(slot_pieces, dim=0)
+    pre_seq_lens = cad.seq_lens - extra_slots
+    pre_cad = cad.replace(
+        query_start_loc=pre_qsl,
+        query_start_loc_cpu=pre_qsl.detach().cpu(),
+        seq_lens=pre_seq_lens,
+        num_actual_tokens=tok_n,
+        max_query_len=max_query_len,
+        max_seq_len=int(pre_seq_lens.max().item()),
+        slot_mapping=pre_slot,
+        _seq_lens_cpu=pre_seq_lens.detach().cpu()
+        if cad._seq_lens_cpu is not None
+        else None,
+        _num_computed_tokens_cpu=None,
+        _num_computed_tokens_cache=None,
+    )
+    _spechive_debug_assert(
+        int(pre_cad.query_start_loc[-1].item()) == tok_n
+        and int(pre_hidden.shape[0]) == tok_n,
+        "check_reused_prefab_frontier_canonicalization",
+        detail=(
+            f"tok_n={tok_n}, pos_n={pos_n}, hid_n={hid_n}, "
+            f"post_qsl_end={qsl_n}, extra_slots={extra_slots}"
+        ),
+    )
+    return pre_cad, target_token_ids, target_positions, pre_hidden, next_token_ids
+
+
 def _forward_prefix_conditioned_logits(
     proposer: SpecDecodeBaseProposer,
     *,
@@ -392,6 +488,20 @@ def _forward_prefix_conditioned_logits(
     roll_rows: list[list[int]] | None = None,
 ) -> tuple[torch.Tensor, CommonAttentionMetadata, list[int], list[int], list[int]]:
     """Run one prefix-conditioned forward and return query-row logits."""
+    (
+        cad,
+        target_token_ids,
+        target_positions,
+        target_hidden_states,
+        next_token_ids,
+    ) = _canonicalize_reused_prefix_frontier(
+        proposer,
+        cad=cad,
+        target_token_ids=target_token_ids,
+        target_positions=target_positions,
+        target_hidden_states=target_hidden_states,
+        next_token_ids=next_token_ids,
+    )
     (
         pref_toks,
         pref_pos,
@@ -516,6 +626,20 @@ def _propose_chunk_from_prefix(
     if prefix_prefab is not None:
         pref_toks, pref_pos, pref_hidden, pref_next, pref_cad = prefix_prefab
         pref_cad = _hv_clone_cad(pref_cad)
+        (
+            pref_cad,
+            pref_toks,
+            pref_pos,
+            pref_hidden,
+            pref_next,
+        ) = _canonicalize_reused_prefix_frontier(
+            proposer,
+            cad=pref_cad,
+            target_token_ids=pref_toks,
+            target_positions=pref_pos,
+            target_hidden_states=pref_hidden,
+            next_token_ids=pref_next,
+        )
     else:
         (
             pref_toks,
