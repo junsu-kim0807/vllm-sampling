@@ -191,6 +191,7 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     HybridProposalBundle,
     PivotExpandedTreePlan,
     PivotExpansionPlan,
+    RootTopKInfo,
     _split_flat_tokens_by_lengths,
     _split_probs_by_lengths,
     expand_hybrid_bundle_for_pivot_expansion,
@@ -4683,6 +4684,48 @@ class GPUModelRunner(
                 self._dit_debug_emit_summary(reason="target_verification_done")
         return sampler_output
 
+    @staticmethod
+    def _req_id_row_index_map(req_ids_snapshot: tuple[str, ...]) -> dict[str, int]:
+        """Map req_id -> first row index in the profile snapshot (O(B) once)."""
+        m: dict[str, int] = {}
+        for i, rid in enumerate(req_ids_snapshot):
+            if rid not in m:
+                m[rid] = i
+        return m
+
+    @staticmethod
+    def _first_draft_topk_for_profile_row(
+        row_idx: int,
+        topk_info: RootTopKInfo,
+        k: int = 5,
+    ) -> tuple[list[int] | None, list[float] | None, int]:
+        if row_idx < 0:
+            return None, None, 0
+        b = int(topk_info.topk_token_ids.shape[0])
+        if row_idx >= b:
+            return None, None, 0
+        kcols = int(topk_info.topk_token_ids.shape[1])
+        k_eff = min(k, kcols)
+        ids = topk_info.topk_token_ids[row_idx, :k_eff].detach().cpu().tolist()
+        probs = topk_info.topk_probs[row_idx, :k_eff].detach().cpu().tolist()
+        return ids, probs, k_eff
+
+    def _reset_profile_first_draft_topk_for_step(self) -> None:
+        d = getattr(self, "drafter", None)
+        if d is not None and hasattr(d, "reset_profile_first_draft_topk"):
+            d.reset_profile_first_draft_topk()
+
+    def _get_profile_first_draft_topk_bundle(
+        self,
+    ) -> tuple[RootTopKInfo | None, tuple[str, ...] | None]:
+        d = getattr(self, "drafter", None)
+        if d is None:
+            return None, None
+        getter = getattr(d, "get_profile_first_draft_topk", None)
+        if not callable(getter):
+            return None, None
+        return getter()
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -5604,6 +5647,9 @@ class GPUModelRunner(
         self._draft_token_req_ids = None
         self.input_batch.prev_sampled_token_ids = None
 
+        if use_spec_decode and self._current_profile_ctx is not None:
+            self._reset_profile_first_draft_topk_for_step()
+
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
@@ -5793,6 +5839,16 @@ class GPUModelRunner(
                 _incl_tids = getattr(
                     self._spec_profiler, "_include_token_ids", False)
                 _pctx_rm = self._current_profile_ctx
+                _topk_bundle_info, _topk_snap = (
+                    self._get_profile_first_draft_topk_bundle())
+                _topk_idx_map = (
+                    self._req_id_row_index_map(_topk_snap)
+                    if _topk_snap is not None else {})
+                _topk_rows_ok = (
+                    _topk_bundle_info is not None
+                    and _topk_snap is not None
+                    and _topk_bundle_info.topk_token_ids.shape[0] == len(
+                        _topk_snap))
                 _req_emitted = 0
                 for _ri, _rid in enumerate(req_ids_output_copy):
                     if _max_rps is not None and _req_emitted >= _max_rps:
@@ -5839,6 +5895,24 @@ class GPUModelRunner(
                             self.input_batch.num_tokens_no_spec[_ri])
                         _n_comp_after = _n_comp_before + _n_accepted
 
+                    _fd_tid: list[int] | None = None
+                    _fd_conf: list[float] | None = None
+                    _fd_k = 0
+                    _fd_src: str | None = None
+                    if _topk_rows_ok and _topk_bundle_info is not None:
+                        _row = _topk_idx_map.get(_rid)
+                        if _row is not None:
+                            _fd_tid, _fd_conf, _fd_k = (
+                                self._first_draft_topk_for_profile_row(
+                                    _row, _topk_bundle_info))
+                            if _fd_tid is not None:
+                                _fd_src = "profile_first_draft_topk"
+                    if _fd_src is None:
+                        _fd_src = "unavailable"
+                        _fd_tid = None
+                        _fd_conf = None
+                        _fd_k = 0
+
                     _req_rec = SpecDecodeRequestMetadataRecord(
                         step_id=_step_id,
                         req_id=_rid,
@@ -5856,6 +5930,10 @@ class GPUModelRunner(
                         staged_verification_used=_staged_used,
                         num_computed_tokens_before=_n_comp_before,
                         num_computed_tokens_after=_n_comp_after,
+                        first_draft_topk_token_ids=_fd_tid,
+                        first_draft_topk_confidences=_fd_conf,
+                        first_draft_topk_k=_fd_k,
+                        first_draft_topk_source=_fd_src,
                     )
                     # Attach token IDs if configured
                     if _incl_tids and _sd_toks:

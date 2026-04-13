@@ -133,6 +133,9 @@ class SpecDecodeBaseProposer:
         self.last_draft_probs_flat: torch.Tensor | None = None
         # Pivot root top-k only (optional side channel; avoids full-vocab tensors).
         self.last_root_topk_info: RootTopKInfo | None = None
+        # Step-scoped unified-profiler cache (not cleared by clear_draft_probs).
+        self.profile_first_draft_topk_info: RootTopKInfo | None = None
+        self.profile_first_draft_topk_req_ids: tuple[str, ...] | None = None
 
         # persistent buffers for cuda graph
         self.input_ids = torch.zeros(
@@ -508,6 +511,80 @@ class SpecDecodeBaseProposer:
         self.last_draft_probs_flat = None
         self.last_root_topk_info = None
 
+    def reset_profile_first_draft_topk(self) -> None:
+        self.profile_first_draft_topk_info = None
+        self.profile_first_draft_topk_req_ids = None
+
+    def get_profile_first_draft_topk(
+        self,
+    ) -> tuple[RootTopKInfo | None, tuple[str, ...] | None]:
+        return self.profile_first_draft_topk_info, self.profile_first_draft_topk_req_ids
+
+    def _should_capture_profile_first_draft_topk(self) -> bool:
+        runner = getattr(self, "runner", None)
+        if runner is None:
+            return False
+        prof = getattr(runner, "_spec_profiler", None)
+        if prof is None:
+            return False
+        mode = getattr(prof, "mode", None)
+        return bool(getattr(mode, "metadata_enabled", False))
+
+    def _profile_req_ids_snapshot(self, batch_size: int) -> tuple[str, ...]:
+        ib = getattr(self.runner, "input_batch", None)
+        if ib is None or len(ib.req_ids) < batch_size:
+            return ()
+        return tuple(ib.req_ids[:batch_size])
+
+    def _fill_profile_first_draft_topk_from_logits(
+        self,
+        logits: torch.Tensor,
+        req_ids_snapshot: tuple[str, ...],
+        k: int = 5,
+    ) -> None:
+        if not self._should_capture_profile_first_draft_topk():
+            return
+        if self.profile_first_draft_topk_info is not None:
+            return
+        if logits.dim() != 2:
+            return
+        b = logits.shape[0]
+        if len(req_ids_snapshot) != b:
+            return
+        k_eff = min(k, int(logits.shape[-1]))
+        logits_f = logits.float()
+        lse = torch.logsumexp(logits_f, dim=-1, keepdim=True)
+        vals, idx = torch.topk(logits_f, k=k_eff, dim=-1)
+        logp = vals - lse
+        probs = logp.exp()
+        self.profile_first_draft_topk_info = RootTopKInfo(
+            topk_token_ids=idx.to(torch.long),
+            topk_probs=probs,
+        )
+        self.profile_first_draft_topk_req_ids = req_ids_snapshot
+
+    def _maybe_capture_profile_first_draft_topk(
+        self,
+        sample_hidden_states: torch.Tensor,
+        batch_size: int,
+        logits: torch.Tensor | None,
+    ) -> None:
+        """Capture first-position top-k for profiling once per step (metadata mode).
+
+        If ``logits`` is None but capture is enabled and cache empty, runs
+        ``compute_logits(sample_hidden_states)``.
+        """
+        req_ids = self._profile_req_ids_snapshot(batch_size)
+        if len(req_ids) != batch_size:
+            return
+        if logits is None:
+            if not self._should_capture_profile_first_draft_topk():
+                return
+            if self.profile_first_draft_topk_info is not None:
+                return
+            logits = self.model.compute_logits(sample_hidden_states)
+        self._fill_profile_first_draft_topk_from_logits(logits, req_ids)
+
     def _pivot_topk_selection_effective(self) -> int:
         """Pivot top-k width for this proposer.
 
@@ -717,13 +794,18 @@ class SpecDecodeBaseProposer:
         if self.parallel_drafting:
             draft_token_ids = self._greedy_sample(sample_hidden_states)
             # Parallel path skips processed probs; pivot still needs root q(·).
+            logits_root: torch.Tensor | None = None
             if self._pivot_topk_selection_effective() > 1:
                 logits_root = self.model.compute_logits(sample_hidden_states)
                 self._fill_last_root_topk_from_logits(logits_root)
+            self._maybe_capture_profile_first_draft_topk(
+                sample_hidden_states, batch_size, logits_root)
             return draft_token_ids.view(-1, self.num_speculative_tokens)
         if self.num_speculative_tokens == 1:
+            logits_for_profile: torch.Tensor | None = None
             if self._should_collect_draft_step_probs(sampling_metadata):
                 logits0 = self.model.compute_logits(sample_hidden_states)
+                logits_for_profile = logits0
                 self._fill_last_root_topk_from_logits(logits0)
                 draft_token_ids, probs0 = sample_next_token_and_probs_processed(
                     runner_sampler,
@@ -738,6 +820,7 @@ class SpecDecodeBaseProposer:
                     self.last_draft_logprobs = _lp.unsqueeze(1)
             elif self._needs_root_topk():
                 logits0 = self.model.compute_logits(sample_hidden_states)
+                logits_for_profile = logits0
                 self._fill_last_root_topk_from_logits(logits0)
                 if _tetris_enabled:
                     draft_token_ids, _lp = self._greedy_sample_with_logprobs(
@@ -749,10 +832,13 @@ class SpecDecodeBaseProposer:
             else:
                 if _tetris_enabled:
                     logits0 = self.model.compute_logits(sample_hidden_states)
+                    logits_for_profile = logits0
                     draft_token_ids, _lp = self._greedy_sample_with_logprobs(logits0)
                     self.last_draft_logprobs = _lp.unsqueeze(1)
                 else:
                     draft_token_ids = self._greedy_sample(sample_hidden_states)
+            self._maybe_capture_profile_first_draft_topk(
+                sample_hidden_states, batch_size, logits_for_profile)
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -767,6 +853,8 @@ class SpecDecodeBaseProposer:
         if isinstance(attn_metadata, TreeAttentionMetadata):
             # Draft using tree attention - requires full logits for top-k
             logits = self.model.compute_logits(sample_hidden_states)
+            self._maybe_capture_profile_first_draft_topk(
+                sample_hidden_states, batch_size, logits)
             draft_token_ids_list = self.propose_tree(
                 batch_size=batch_size,
                 logits=logits,
@@ -783,6 +871,8 @@ class SpecDecodeBaseProposer:
         probs_per_step: list[torch.Tensor] = []
         if track_probs:
             logits0 = self.model.compute_logits(sample_hidden_states)
+            self._maybe_capture_profile_first_draft_topk(
+                sample_hidden_states, batch_size, logits0)
             self._fill_last_root_topk_from_logits(logits0)
             draft_token_ids, p0 = sample_next_token_and_probs_processed(
                 runner_sampler,
@@ -797,6 +887,8 @@ class SpecDecodeBaseProposer:
                 _draft_logprobs_list.append(_lp)
         elif _need_root_topk:
             logits0 = self.model.compute_logits(sample_hidden_states)
+            self._maybe_capture_profile_first_draft_topk(
+                sample_hidden_states, batch_size, logits0)
             self._fill_last_root_topk_from_logits(logits0)
             if _tetris_enabled:
                 draft_token_ids, _lp = self._greedy_sample_with_logprobs(
@@ -806,12 +898,16 @@ class SpecDecodeBaseProposer:
             else:
                 draft_token_ids = logits0.argmax(dim=-1)
         else:
+            logits_for_profile: torch.Tensor | None = None
             if _tetris_enabled:
                 logits0 = self.model.compute_logits(sample_hidden_states)
+                logits_for_profile = logits0
                 draft_token_ids, _lp = self._greedy_sample_with_logprobs(logits0)
                 _draft_logprobs_list.append(_lp)
             else:
                 draft_token_ids = self._greedy_sample(sample_hidden_states)
+            self._maybe_capture_profile_first_draft_topk(
+                sample_hidden_states, batch_size, logits_for_profile)
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types

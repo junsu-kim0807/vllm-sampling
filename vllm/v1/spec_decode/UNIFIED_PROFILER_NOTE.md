@@ -110,6 +110,21 @@ For each stage invocation, six values are recorded:
 - `num_intermediate_accepted_tokens_per_req`: **Sum** over expanded rows per origin
 - `num_partial_accepted_per_req`: **Winner-aware** (first expanded row per origin)
 
+## First-draft top-k in `request_metadata`
+
+Per request and per speculative step, optional fields describe the drafter’s **first speculative position** distribution:
+
+- `first_draft_topk_token_ids`, `first_draft_topk_confidences`, `first_draft_topk_k`
+- `first_draft_topk_source`: `"profile_first_draft_topk"` when aligned data exists, or `"unavailable"` when not.
+
+**Stable cache:** Values come from a step-scoped **profile cache** (`profile_first_draft_topk_*` on `SpecDecodeBaseProposer`), not from `last_root_topk_info` (pivot scratch, cleared/overwritten by inner rounds). `clear_draft_probs()` does **not** clear the profile cache; the runner resets it once per step after profiler `begin_step` and before the first draft proposal.
+
+**Row alignment:** The cache stores `RootTopKInfo` plus a **req_id snapshot** taken when the cache is filled. At emission, the runner builds a **`req_id → row index` map once** from that snapshot and attaches top-k per output `req_id` in **O(1)** per request. `last_root_topk_info` without a matching snapshot is **never** used for these fields (avoids wrong row alignment after pivot/bundle remaps).
+
+**Probabilities:** On the Eagle/draft base path, confidences use **`logsumexp` + `topk` on logits** (equivalent softmax mass on the reported top-k without materializing full softmax).
+
+**Coverage:** Populated for **EAGLE**, **draft_model**, **pivot** (wrapper freeze after root proposal), and **adaptive_spechive** (delegates to the same draft proposer). **Medusa**, **ngram**, **suffix**, and **extract_hidden_states** do not fill the cache yet; records use `first_draft_topk_source="unavailable"`.
+
 ## Offline analysis recipe
 
 1. Join `stage_shape` + `stage_memory` on `(step_id, stage_name)`

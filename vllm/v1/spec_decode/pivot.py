@@ -444,6 +444,70 @@ class PivotProposer:
             intermediate_delegate=self._intermediate,
             needs_intermediate_provider=self._pivot_spechive,
         )
+        # Frozen after root draft proposal (survives inner HV overwrites of
+        # ``last_root_topk_info`` on delegates).
+        self._profile_first_draft_topk_info: RootTopKInfo | None = None
+        self._profile_first_draft_topk_req_ids: tuple[str, ...] | None = None
+
+    def reset_profile_first_draft_topk(self) -> None:
+        self._profile_first_draft_topk_info = None
+        self._profile_first_draft_topk_req_ids = None
+        for _del in (self._draft, self._eagle_head, self._intermediate):
+            if _del is not None and hasattr(_del, "reset_profile_first_draft_topk"):
+                _del.reset_profile_first_draft_topk()
+
+    def get_profile_first_draft_topk(
+        self,
+    ) -> tuple[RootTopKInfo | None, tuple[str, ...] | None]:
+        if (
+            self._profile_first_draft_topk_info is not None
+            and self._profile_first_draft_topk_req_ids is not None
+        ):
+            return self._profile_first_draft_topk_info, self._profile_first_draft_topk_req_ids
+        for _del in (self._draft, self._eagle_head):
+            if _del is not None and hasattr(_del, "get_profile_first_draft_topk"):
+                topk, snap = _del.get_profile_first_draft_topk()
+                if topk is not None and snap is not None:
+                    return topk, snap
+        return None, None
+
+    def _freeze_profile_first_draft_topk_after_root(
+        self, delegate: object, batch_size: int
+    ) -> None:
+        """Snapshot profile top-k at root-proposal time for unified metadata emission."""
+        if self.runner is None or batch_size <= 0:
+            return
+        prof = getattr(self.runner, "_spec_profiler", None)
+        mode = getattr(prof, "mode", None) if prof is not None else None
+        if mode is None or not getattr(mode, "metadata_enabled", False):
+            return
+        get_fn = getattr(delegate, "get_profile_first_draft_topk", None)
+        if callable(get_fn):
+            topk, snap = get_fn()
+            if (
+                topk is not None
+                and snap is not None
+                and len(snap) == batch_size
+                and topk.topk_token_ids.shape[0] == batch_size
+            ):
+                self._profile_first_draft_topk_info = RootTopKInfo(
+                    topk_token_ids=topk.topk_token_ids.detach().clone(),
+                    topk_probs=topk.topk_probs.detach().clone(),
+                )
+                self._profile_first_draft_topk_req_ids = snap
+                return
+        ib = getattr(self.runner, "input_batch", None)
+        if ib is None or len(ib.req_ids) < batch_size:
+            return
+        snap = tuple(str(ib.req_ids[i]) for i in range(batch_size))
+        rt = getattr(delegate, "last_root_topk_info", None)
+        if rt is None or rt.topk_token_ids.shape[0] != batch_size:
+            return
+        self._profile_first_draft_topk_info = RootTopKInfo(
+            topk_token_ids=rt.topk_token_ids.detach().clone(),
+            topk_probs=rt.topk_probs.detach().clone(),
+        )
+        self._profile_first_draft_topk_req_ids = snap
 
     def should_force_target_verification_round(self) -> bool:
         """Hook for future outer-step policy. Inner D=>I rounds are fixed by config."""
@@ -1530,6 +1594,7 @@ class PivotProposer:
         batch_size = int(pivots.shape[0])
         delegate = self._main_delegate()
         root_topk = getattr(delegate, "last_root_topk_info", None)
+        self._freeze_profile_first_draft_topk_after_root(delegate, batch_size)
         chosen_pivots, pivot_probs_rows, expansion_plan = self._build_pivot_expansion_plan(
             initial_pivots=pivots,
             pivot_probs=pivot_probs,
@@ -1691,6 +1756,8 @@ class PivotProposer:
         )
         pivots = pivots.to(torch.int32)[:, :1]
         rt = getattr(self._eagle_head, "last_root_topk_info", None)
+        self._freeze_profile_first_draft_topk_after_root(
+            self._eagle_head, batch_size)
         chosen_pivots, _, expansion_plan = self._build_pivot_expansion_plan(
             initial_pivots=pivots,
             pivot_probs=pivot_probs,

@@ -643,3 +643,45 @@ class TestSchedulerFold:
         stats.draft_forward_time_ms = 1.0
         # No transport — should not change stats.
         assert stats.draft_forward_time_ms == 1.0
+
+
+# ---------------------------------------------------------------------------
+# First-draft top-k metadata helpers
+# ---------------------------------------------------------------------------
+
+
+class TestFirstDraftTopkMetadataHelpers:
+    def test_req_id_row_index_map_first_wins(self):
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+        m = GPUModelRunner._req_id_row_index_map(("r0", "r1", "r0"))
+        assert m == {"r0": 0, "r1": 1}
+
+    def test_first_draft_topk_for_profile_row(self):
+        import torch
+
+        from vllm.v1.spec_decode.spec_stage_runtime import RootTopKInfo
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+        tid = torch.tensor([[10, 20, 30], [40, 50, 60]], dtype=torch.long)
+        pr = torch.tensor(
+            [[0.5, 0.3, 0.2], [0.7, 0.2, 0.1]], dtype=torch.float32
+        )
+        info = RootTopKInfo(topk_token_ids=tid, topk_probs=pr)
+        ids, conf, k = GPUModelRunner._first_draft_topk_for_profile_row(
+            1, info, k=2)
+        assert ids == [40, 50]
+        assert conf == pytest.approx([0.7, 0.2])
+        assert k == 2
+
+    def test_request_metadata_record_first_draft_fields_json(self):
+        rec = SpecDecodeRequestMetadataRecord(
+            req_id="a",
+            first_draft_topk_token_ids=[1, 2],
+            first_draft_topk_confidences=[0.9, 0.1],
+            first_draft_topk_k=2,
+            first_draft_topk_source="profile_first_draft_topk",
+        )
+        d = asdict(rec)
+        assert d["first_draft_topk_k"] == 2
+        assert d["first_draft_topk_source"] == "profile_first_draft_topk"

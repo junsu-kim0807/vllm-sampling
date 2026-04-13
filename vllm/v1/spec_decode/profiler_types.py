@@ -257,6 +257,12 @@ class SpecDecodeRequestMetadataRecord:
     draft_token_ids: list[int] | None = None
     accepted_token_ids: list[int] | None = None
 
+    # First speculative position top-k (profile cache; req_id-aligned via snapshot)
+    first_draft_topk_token_ids: list[int] | None = None
+    first_draft_topk_confidences: list[float] | None = None
+    first_draft_topk_k: int = 0
+    first_draft_topk_source: str | None = None
+
 
 @dataclass
 class SpecDecodeBatchMetadataRecord:
