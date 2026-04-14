@@ -4409,10 +4409,11 @@ class GPUModelRunner(
                         bundle.bundle_row_req_ids,
                         remap_info,
                     )
-                logger.warning(
-                    "Dropping hybrid bundle (row alignment to spec metadata failed): %s",
-                    remap_info,
-                )
+                if self._is_dit_debug_enabled():
+                    logger.warning(
+                        "Dropping hybrid bundle (row alignment to spec metadata failed): %s",
+                        remap_info,
+                    )
                 self.pending_pivot_expansion_plan = None
                 discard_pending_state = getattr(
                     self.drafter, "discard_pending_hierarchical_verification_state", None
