@@ -29,7 +29,6 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.adaptive_cascade import (
     _build_hybrid_bundle_from_rows,
     _flatten_prob_rows_for_output,
-    _hv_clone_cad,
     _propose_chunk_from_prefix,
     _spechive_debug_enabled,
     _verify_chunk_with_prefix,
@@ -158,24 +157,36 @@ def _collapse_draft_rows_for_scheduler(
 ) -> torch.Tensor:
     if plan is None:
         return out_exp
-    cap = int(out_exp.shape[1])
-    out = torch.full(
-        (origin_batch_size, cap),
-        PLACEHOLDER_TOKEN_ID,
-        dtype=torch.int32,
-        device=out_exp.device,
-    )
-    for origin in range(origin_batch_size):
-        if plan.origin_to_base_row is not None:
-            row_idx = int(plan.origin_to_base_row[origin])
-        else:
-            row_idx = next(
-                idx
-                for idx, orig in enumerate(plan.expanded_to_origin)
-                if orig == origin
+    if origin_batch_size <= 0:
+        return out_exp[:0]
+
+    if (
+        plan.uses_fixed_capacity_packing
+        and plan.origin_to_base_row is not None
+        and len(plan.origin_to_base_row) >= origin_batch_size
+        and all(int(plan.origin_to_base_row[o]) == o for o in range(origin_batch_size))
+    ):
+        return out_exp[:origin_batch_size]
+
+    row_ids: list[int] = []
+    if (
+        plan.origin_to_base_row is not None
+        and len(plan.origin_to_base_row) >= origin_batch_size
+    ):
+        row_ids = [int(plan.origin_to_base_row[o]) for o in range(origin_batch_size)]
+    else:
+        expanded_to_origin = plan.expanded_to_origin
+        for origin in range(origin_batch_size):
+            row_ids.append(
+                next(
+                    idx
+                    for idx, orig in enumerate(expanded_to_origin)
+                    if int(orig) == origin
+                )
             )
-        out[origin].copy_(out_exp[row_idx])
-    return out
+
+    idx = torch.tensor(row_ids, dtype=torch.long, device=out_exp.device)
+    return out_exp.index_select(0, idx)
 
 
 def _pivot_hybrid_bundle_row_req_ids(
@@ -1353,49 +1364,88 @@ class PivotProposer:
 
         _t0 = _time.perf_counter() if _spechive_debug_enabled() else 0.0
 
-        cad = _hv_clone_cad(base_common_attn_metadata)
+        cad = base_common_attn_metadata
+        _prof = (
+            getattr(self.runner, "_spec_profiler", None)
+            if self.runner is not None
+            else None
+        )
+        base_qsl_tail: int | None = None
+        base_seq_sum: int | None = None
+        if _spechive_debug_enabled():
+            base_qsl_tail = int(cad.query_start_loc[-1].item())
+            base_seq_sum = int(cad.seq_lens.sum().item())
         qsl = cad.query_start_loc
         p_len = int(plan.expanded_batch_size)
 
+        if _prof is not None:
+            _prof.start_stage("expand_frontier_gather")
         flat_idx, row_idx, new_qsl = self._build_expansion_gather_indices(
             plan, qsl
         )
         total_tokens = int(new_qsl[p_len].item())
 
-        out_tokens = base_target_token_ids[flat_idx]
-        out_hidden = base_target_hidden_states[flat_idx]
-        out_slot = cad.slot_mapping[flat_idx]
+        out_tokens = base_target_token_ids.index_select(0, flat_idx)
+        out_hidden = base_target_hidden_states.index_select(0, flat_idx)
+        out_slot = cad.slot_mapping.index_select(0, flat_idx)
 
         positions_2d = base_target_positions.dim() > 1
         if positions_2d:
-            out_positions = base_target_positions[:, flat_idx]
+            out_positions = base_target_positions.index_select(1, flat_idx)
         else:
-            out_positions = base_target_positions[flat_idx]
+            out_positions = base_target_positions.index_select(0, flat_idx)
 
-        out_next = base_next_token_ids[row_idx].to(torch.int32)
-        out_seq_lens = cad.seq_lens[row_idx]
-        out_block = cad.block_table_tensor[row_idx]
+        out_next = base_next_token_ids.index_select(0, row_idx).to(torch.int32)
+        out_seq_lens = cad.seq_lens.index_select(0, row_idx)
+        out_block = cad.block_table_tensor.index_select(0, row_idx)
 
         out_rej: torch.Tensor | None = None
         if base_num_rejected_tokens_gpu is not None:
-            out_rej = base_num_rejected_tokens_gpu[row_idx]
+            out_rej = base_num_rejected_tokens_gpu.index_select(0, row_idx)
 
         out_dcp: torch.Tensor | None = None
         if cad.dcp_local_seq_lens is not None:
-            out_dcp = cad.dcp_local_seq_lens[row_idx]
+            out_dcp = cad.dcp_local_seq_lens.index_select(0, row_idx)
 
         out_lip: torch.Tensor | None = None
         if cad.logits_indices_padded is not None:
-            out_lip = cad.logits_indices_padded[row_idx]
+            out_lip = cad.logits_indices_padded.index_select(0, row_idx)
+        if _prof is not None:
+            _prof.end_stage("expand_frontier_gather")
 
         query_lens = new_qsl[1:] - new_qsl[:-1]
-        max_q = int(query_lens.max().item())
+        max_q = int(query_lens.max().item()) if p_len > 0 else 0
+
+        out_qsl_cpu = None
+        out_seq_lens_cpu = None
+        if _prof is not None:
+            _prof.start_stage("expand_metadata_cpu")
+        if cad.query_start_loc_cpu is not None and cad._seq_lens_cpu is not None:
+            sm = (
+                plan.packed_sm_origin
+                if plan.packed_sm_origin is not None
+                else plan.expanded_to_origin
+            )
+            row_idx_cpu = torch.tensor(sm, dtype=torch.long)
+            origin_qsl_cpu = cad.query_start_loc_cpu
+            origin_query_lens_cpu = origin_qsl_cpu[1:] - origin_qsl_cpu[:-1]
+            expanded_query_lens_cpu = origin_query_lens_cpu.index_select(0, row_idx_cpu)
+            out_qsl_cpu = torch.empty(p_len + 1, dtype=origin_qsl_cpu.dtype)
+            out_qsl_cpu[0] = 0
+            if p_len > 0:
+                torch.cumsum(expanded_query_lens_cpu, dim=0, out=out_qsl_cpu[1:])
+            out_seq_lens_cpu = cad._seq_lens_cpu.index_select(0, row_idx_cpu)
+        if _prof is not None:
+            _prof.end_stage("expand_metadata_cpu")
 
         if _spechive_debug_enabled():
             _elapsed_us = (_time.perf_counter() - _t0) * 1e6
+            assert base_qsl_tail is not None and base_seq_sum is not None
+            assert int(cad.query_start_loc[-1].item()) == base_qsl_tail
+            assert int(cad.seq_lens.sum().item()) == base_seq_sum
             logger.info(
                 "PIVOT_DEBUG expand_frontier: P=%d total_tokens=%d "
-                "elapsed_us=%.1f (index-gather path)",
+                "elapsed_us=%.1f (index-gather path, no CAD clone)",
                 p_len,
                 total_tokens,
                 _elapsed_us,
@@ -1403,21 +1453,19 @@ class PivotProposer:
 
         out_cad = cad.replace(
             query_start_loc=new_qsl,
-            query_start_loc_cpu=new_qsl.detach().cpu(),
+            query_start_loc_cpu=out_qsl_cpu,
             seq_lens=out_seq_lens,
             block_table_tensor=out_block,
             slot_mapping=out_slot,
             num_reqs=p_len,
             num_actual_tokens=total_tokens,
             max_query_len=max_q,
-            max_seq_len=int(out_seq_lens.max().item()),
+            max_seq_len=int(out_seq_lens.max().item()) if p_len > 0 else 0,
             dcp_local_seq_lens=out_dcp,
             dcp_local_seq_lens_cpu=None,
             logits_indices_padded=out_lip,
             num_logits_indices=None,
-            _seq_lens_cpu=out_seq_lens.detach().cpu()
-            if cad._seq_lens_cpu is not None
-            else None,
+            _seq_lens_cpu=out_seq_lens_cpu,
             _num_computed_tokens_cpu=None,
             _num_computed_tokens_cache=None,
         )

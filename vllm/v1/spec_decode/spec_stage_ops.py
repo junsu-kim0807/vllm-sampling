@@ -327,7 +327,13 @@ def select_pivot_expanded_rows_to_origin(
     *,
     num_draft_tokens: list[int] | None = None,
 ) -> list[int]:
-    """Select one expanded row per origin using collapse tie-break rules."""
+    """Select one expanded row per origin using collapse tie-break rules.
+
+    Tie-break order:
+    1) larger accepted prefix length
+    2) larger first-token probability
+    3) smaller candidate rank
+    """
     if sampled_token_ids.shape[0] < expansion_plan.expanded_batch_size:
         return list(range(int(sampled_token_ids.shape[0])))
     if not expansion_plan.expanded_to_origin:
@@ -351,6 +357,89 @@ def select_pivot_expanded_rows_to_origin(
         if expansion_plan.origin_batch_size > 0
         else max(expansion_plan.expanded_to_origin) + 1
     )
+
+    # Fixed-capacity fast path: build [B, W] candidate table and perform tie-break
+    # with tensor ops. Keep general Python loop fallback below.
+    if (
+        expansion_plan.uses_fixed_capacity_packing
+        and expansion_plan.origin_to_family_rows is not None
+        and expansion_plan.origin_to_base_row is not None
+        and len(expansion_plan.origin_to_family_rows) >= b_origin
+        and len(expansion_plan.origin_to_base_row) >= b_origin
+    ):
+        device = sampled_token_ids.device
+        accepted_lens_t = torch.tensor(accepted_lens, dtype=torch.int32, device=device)
+
+        row_to_prob = torch.full(
+            (expansion_plan.expanded_batch_size,),
+            float("-inf"),
+            device=device,
+            dtype=torch.float32,
+        )
+        row_to_rank = torch.full(
+            (expansion_plan.expanded_batch_size,),
+            10**9,
+            device=device,
+            dtype=torch.int32,
+        )
+        for fam in expansion_plan.families:
+            for local_idx, row_idx in enumerate(fam.expanded_rows):
+                j = int(row_idx)
+                if 0 <= j < expansion_plan.expanded_batch_size:
+                    row_to_prob[j] = float(fam.first_token_probs[local_idx])
+                    row_to_rank[j] = int(fam.candidate_ranks[local_idx])
+
+        family_rows = expansion_plan.origin_to_family_rows
+        base_rows = expansion_plan.origin_to_base_row
+        # origin_to_family_rows contains only extra rows; include base row explicitly.
+        max_w = 1 + max((len(rows) for rows in family_rows[:b_origin]), default=0)
+        idx_cpu = torch.zeros((b_origin, max_w), dtype=torch.long)
+        valid_cpu = torch.zeros((b_origin, max_w), dtype=torch.bool)
+        for o in range(b_origin):
+            base = int(base_rows[o]) if o < len(base_rows) else -1
+            col = 0
+            if 0 <= base < expansion_plan.expanded_batch_size:
+                idx_cpu[o, col] = base
+                valid_cpu[o, col] = _pivot_packed_row_is_active(expansion_plan, base)
+                col += 1
+
+            rows = family_rows[o]
+            for row_idx in rows:
+                if col >= max_w:
+                    break
+                j = int(row_idx)
+                if 0 <= j < expansion_plan.expanded_batch_size:
+                    idx_cpu[o, col] = j
+                    valid_cpu[o, col] = _pivot_packed_row_is_active(expansion_plan, j)
+                else:
+                    idx_cpu[o, col] = 0
+                    valid_cpu[o, col] = False
+                col += 1
+
+        idx = idx_cpu.to(device=device)
+        valid = valid_cpu.to(device=device)
+
+        acc = accepted_lens_t.index_select(0, idx.view(-1)).view(b_origin, max_w)
+        prob = row_to_prob.index_select(0, idx.view(-1)).view(b_origin, max_w)
+        rank = row_to_rank.index_select(0, idx.view(-1)).view(b_origin, max_w)
+
+        neg_inf_i = torch.full_like(acc, -1)
+        neg_inf_f = torch.full_like(prob, float("-inf"))
+        huge_i = torch.full_like(rank, 10**9)
+        acc = torch.where(valid, acc, neg_inf_i)
+        prob = torch.where(valid, prob, neg_inf_f)
+        rank = torch.where(valid, rank, huge_i)
+
+        best_acc = acc.max(dim=1, keepdim=True).values
+        acc_mask = acc == best_acc
+        prob2 = torch.where(acc_mask, prob, neg_inf_f)
+        best_prob = prob2.max(dim=1, keepdim=True).values
+        prob_mask = acc_mask & (prob == best_prob)
+        neg_rank = torch.where(prob_mask, -rank, torch.full_like(rank, -(10**9)))
+        best_col = neg_rank.argmax(dim=1)
+        selected = idx[torch.arange(b_origin, device=device), best_col]
+        return [int(x) for x in selected.tolist()]
+
     origin_to_family = {fam.origin_row: fam for fam in expansion_plan.families}
     selected_rows: list[int] = []
     for o in range(b_origin):

@@ -379,22 +379,33 @@ def _collapse_draft_tensor_rows_for_scheduler(
     """Scheduler/drafter return value is origin-batch rows; bundle may be B'."""
     if plan is None:
         return out_exp
-    device, cap = out_exp.device, out_exp.shape[1]
-    out = torch.full(
-        (batch_size, cap),
-        PLACEHOLDER_TOKEN_ID,
-        dtype=torch.int32,
-        device=device,
-    )
-    for o in range(batch_size):
-        if plan.origin_to_base_row is not None and plan.origin_to_base_row[o] >= 0:
-            j = int(plan.origin_to_base_row[o])
-        else:
-            j = next(
-                idx for idx, orig in enumerate(plan.expanded_to_origin) if orig == o
+    if batch_size <= 0:
+        return out_exp[:0]
+
+    # Fixed-capacity pivot invariant: base rows are [0, B) in origin order.
+    if (
+        plan.uses_fixed_capacity_packing
+        and plan.origin_to_base_row is not None
+        and len(plan.origin_to_base_row) >= batch_size
+        and all(int(plan.origin_to_base_row[o]) == o for o in range(batch_size))
+    ):
+        return out_exp[:batch_size]
+
+    row_ids: list[int] = []
+    if (
+        plan.origin_to_base_row is not None
+        and len(plan.origin_to_base_row) >= batch_size
+    ):
+        row_ids = [int(plan.origin_to_base_row[o]) for o in range(batch_size)]
+    else:
+        expanded_to_origin = plan.expanded_to_origin
+        for o in range(batch_size):
+            row_ids.append(
+                next(idx for idx, orig in enumerate(expanded_to_origin) if int(orig) == o)
             )
-        out[o].copy_(out_exp[j])
-    return out
+
+    idx = torch.tensor(row_ids, dtype=torch.long, device=out_exp.device)
+    return out_exp.index_select(0, idx)
 
 
 def _clamp_hybrid_bundle_to_max_counts(
@@ -3834,6 +3845,8 @@ class GPUModelRunner(
                                                invocation_idx=round_idx)
                 _hv_prof.start_stage("expand_collapse",
                                      invocation_idx=round_idx)
+                _hv_prof.start_stage("expand_prefix_rows",
+                                     invocation_idx=round_idx)
                 prefix_rows = _expand_list_rows_by_pivot_plan(
                     prefix_rows, pivot_expansion_plan
                 )
@@ -3854,6 +3867,8 @@ class GPUModelRunner(
                 expected_prefix_rows = _expand_list_rows_by_pivot_plan(
                     expected_prefix_rows, pivot_expansion_plan
                 )
+                _hv_prof.end_stage("expand_prefix_rows",
+                                   invocation_idx=round_idx)
                 (
                     target_token_ids,
                     target_positions,
@@ -4215,9 +4230,13 @@ class GPUModelRunner(
         _hv_prof = self._spec_profiler
         _hv_prof.start_stage("expand_collapse",
                              invocation_idx=n_inner)
+        _hv_prof.start_stage("collapse_scheduler_rows",
+                             invocation_idx=n_inner)
         out = _collapse_draft_tensor_rows_for_scheduler(
             out_exp, pivot_expansion_plan, batch_size
         )
+        _hv_prof.end_stage("collapse_scheduler_rows",
+                           invocation_idx=n_inner)
         _hv_prof.end_stage("expand_collapse",
                            invocation_idx=n_inner)
         return out, bundle
@@ -4569,6 +4588,7 @@ class GPUModelRunner(
                     ),
                 )
         elif expansion_plan is not None:
+            self._spec_profiler.start_stage("collapse_after_target_select")
             selected_rows = select_pivot_expanded_rows_to_origin(
                 sampler_output.sampled_token_ids,
                 expansion_plan,
@@ -4579,6 +4599,7 @@ class GPUModelRunner(
                 expansion_plan,
                 num_draft_tokens=num_draft_for_collapse,
             )
+            self._spec_profiler.end_stage("collapse_after_target_select")
         if log_pivot_accept_len and pre_collapse_accept_mean is not None:
             post_nd = _post_collapse_num_draft_per_origin(
                 expansion_plan,
@@ -5859,10 +5880,24 @@ class GPUModelRunner(
                         scheduler_output.scheduled_spec_decode_tokens
                         .get(_rid))
                     _n_draft = len(_sd_toks) if _sd_toks else 0
+                    # Non-pivot default:
+                    # parse_output row is [accepted draft tokens..., bonus/recovery],
+                    # so accepted draft-prefix length is len(row) - 1.
                     _n_accepted = 0
+                    if (_n_draft > 0 and not self.use_async_scheduling
+                            and _ri < len(valid_sampled_token_ids)):
+                        _gen_ids = valid_sampled_token_ids[_ri]
+                        if _gen_ids:
+                            _n_accepted = max(
+                                0, min(_n_draft, len(_gen_ids) - 1))
+                    # Pivot override: use post-collapse accepted draft-prefix len.
                     if (pivot_post_collapse_accepted is not None
                             and _rid in pivot_post_collapse_accepted):
-                        _n_accepted = pivot_post_collapse_accepted[_rid]
+                        _n_accepted = int(
+                            min(
+                                _n_draft,
+                                pivot_post_collapse_accepted[_rid],
+                            ))
 
                     # Intermediate/staged fields from profile context
                     _n_inter_verified = 0
