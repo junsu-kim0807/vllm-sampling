@@ -3486,12 +3486,13 @@ class GPUModelRunner(
             )
             if callable(discard_pending_state):
                 discard_pending_state()
-        suffix = f" ({detail})" if detail else ""
-        logger.warning(
-            "Clearing pending pivot hybrid bundle/plan at prepare boundary: %s%s",
-            reason,
-            suffix,
-        )
+        if self._is_dit_debug_enabled():
+            suffix = f" ({detail})" if detail else ""
+            logger.warning(
+                "Clearing pending pivot hybrid bundle/plan at prepare boundary: %s%s",
+                reason,
+                suffix,
+            )
 
     def take_pending_hybrid_spec_bundle(self) -> HybridProposalBundle | None:
         bundle = self.pending_hybrid_spec_bundle
