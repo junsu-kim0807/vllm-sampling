@@ -38,8 +38,11 @@ RESULTS_ROOT = REPO_ROOT / "results" / "spec_decode"
 USER_NAME = os.environ.get("USER") or getpass.getuser()
 
 if USER_NAME == "junsuk87":
-    REPO_DIR = "/project/def-pnair/junsu/kv_cache/vllm-sampling"
-    VENV_DIR = "/project/def-pnair/junsu/kv_cache"
+    REPO_DIR = "/scratch/junsuk87/vllm-sampling"
+    VENV_DIR = "/scratch/junsuk87/venvs/vllm"
+    # REPO_DIR = "/project/def-pnair/junsu/kv_cache/vllm-sampling"
+    # VENV_DIR = "/project/def-pnair/junsu/kv_cache"
+
 elif USER_NAME == "jhwoo36":
     REPO_DIR = "/home/jhwoo36/scratch/vllm-sampling"
     VENV_DIR = "/home/jhwoo36/scratch/venvs/vllm"
@@ -606,8 +609,8 @@ def job_header(job_name: str, gpu_count: int, time_limit: str, log_dir: Path) ->
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task={12*gpu_count}
-#SBATCH --account=rrg-pnair_gpu
-#SBATCH --qos=rrg-pnair
+#SBATCH --account=def-pnair_gpu
+#SBATCH --qos=def-pnair
 #SBATCH --gres=gpu:h100:{gpu_count}
 #SBATCH --mem-per-gpu=80G
 #SBATCH --time={time_limit}
@@ -1107,7 +1110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--warmup-iters", type=int, default=10)
+    parser.add_argument("--warmup-iters", type=int, default=3)
     parser.add_argument("--warmup-max-tokens", type=int, default=1024)
     parser.add_argument(
         "--magicdec-method",
@@ -1432,41 +1435,41 @@ def main() -> None:
         speculative_pairs.extend(
             [   
                 # Qwen 3.5
-                make_pair_config(
-                    "qwen35_0p8b",
-                    "qwen3_30b_a3b",
-                    pair_id="qwen35_0p8b_to_qwen3_30b_a3b",
-                    tp_size=4,
-                    gpu_count=4,
-                    note="Qwen3.5 0.8B draft -> 30B-A3B target",
-                ),
+                # make_pair_config(
+                #     "qwen35_0p8b",
+                #     "qwen3_30b_a3b",
+                #     pair_id="qwen35_0p8b_to_qwen3_30b_a3b",
+                #     tp_size=4,
+                #     gpu_count=4,
+                #     note="Qwen3.5 0.8B draft -> 30B-A3B target",
+                # ),
 
-                make_pair_config(
-                    "qwen35_2b",
-                    "qwen3_30b_a3b",
-                    pair_id="qwen35_2b_to_qwen3_30b_a3b",
-                    tp_size=4,
-                    gpu_count=4,
-                    note="Qwen3.5 2B draft -> 30B-A3B target",
-                ),
+                # make_pair_config(
+                #     "qwen35_2b",
+                #     "qwen3_30b_a3b",
+                #     pair_id="qwen35_2b_to_qwen3_30b_a3b",
+                #     tp_size=4,
+                #     gpu_count=4,
+                #     note="Qwen3.5 2B draft -> 30B-A3B target",
+                # ),
                 
-                make_pair_config(
-                    "qwen35_4b",
-                    "qwen3_30b_a3b",
-                    pair_id="qwen35_4b_to_qwen3_30b_a3b",
-                    tp_size=4,
-                    gpu_count=4,
-                    note="Qwen3.5 4B draft -> 30B-A3B target",
-                ),
+                # make_pair_config(
+                #     "qwen35_4b",
+                #     "qwen3_30b_a3b",
+                #     pair_id="qwen35_4b_to_qwen3_30b_a3b",
+                #     tp_size=4,
+                #     gpu_count=4,
+                #     note="Qwen3.5 4B draft -> 30B-A3B target",
+                # ),
                 
-                make_pair_config(
-                    "qwen35_9b",
-                    "qwen3_30b_a3b",
-                    pair_id="qwen35_9b_to_qwen3_30b_a3b",
-                    tp_size=4,
-                    gpu_count=4,
-                    note="Qwen3.5 9B draft -> 30B-A3B target",
-                ),
+                # make_pair_config(
+                #     "qwen35_9b",
+                #     "qwen3_30b_a3b",
+                #     pair_id="qwen35_9b_to_qwen3_30b_a3b",
+                #     tp_size=4,
+                #     gpu_count=4,
+                #     note="Qwen3.5 9B draft -> 30B-A3B target",
+                # ),
                 
                 # make_pair_config(
                 #     "qwen25_0p5b_instruct",
@@ -1555,7 +1558,7 @@ def main() -> None:
         test_samples = 5
         warmup_iters = args.warmup_iters
         warmup_max_tokens = args.warmup_max_tokens
-        num_spec = 7
+        num_spec = 3
         max_model_len = args.max_model_len
 
         written_scripts: list[Path] = []
@@ -1974,7 +1977,7 @@ def main() -> None:
         batch_sizes = args.batch_sizes
         warmup_iters = args.warmup_iters
         warmup_max_tokens = args.warmup_max_tokens
-        num_spec = 7
+        num_spec = 3
         max_model_len = args.max_model_len
 
     tag = batch_tag(batch_sizes)

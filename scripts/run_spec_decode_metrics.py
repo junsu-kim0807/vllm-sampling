@@ -1233,9 +1233,9 @@ def measure_dataset(
     num_draft_tokens = metric_delta(after, before, SPEC_NUM_DRAFT_TOKENS)
     num_accepted_tokens = metric_delta(after, before, SPEC_NUM_ACCEPTED)
     accepted_per_pos = vector_delta(after, before, SPEC_ACCEPTED_PER_POS)
-    partial_accepted_per_pos = vector_delta(after, before, SPEC_PARTIAL_ACCEPTED_PER_POS)
-    partial_accepted_per_pos = vector_delta(after, before, SPEC_PARTIAL_ACCEPTED_PER_POS)
-    partial_accepted_per_pos = vector_delta(after, before, SPEC_PARTIAL_ACCEPTED_PER_POS)
+    partial_accepted_per_pos = vector_delta(
+        after, before, SPEC_PARTIAL_ACCEPTED_PER_POS
+    )
 
     num_drafts_val = int(num_drafts) if num_drafts is not None else 0
     num_draft_tokens_val = int(num_draft_tokens) if num_draft_tokens is not None else 0
@@ -1250,10 +1250,6 @@ def measure_dataset(
     acceptance_rate_per_pos = [
         (v / num_drafts_val) if num_drafts_val > 0 else 0.0
         for v in accepted_per_pos
-    ]
-    intermediate_acceptance_rate_per_pos = [
-        (v / num_drafts_val) if num_drafts_val > 0 else 0.0
-        for v in partial_accepted_per_pos
     ]
     intermediate_acceptance_rate_per_pos = [
         (v / num_drafts_val) if num_drafts_val > 0 else 0.0
@@ -1438,6 +1434,9 @@ def measure_dataset_multi_turn(
     num_draft_tokens = metric_delta(after, before, SPEC_NUM_DRAFT_TOKENS)
     num_accepted_tokens = metric_delta(after, before, SPEC_NUM_ACCEPTED)
     accepted_per_pos = vector_delta(after, before, SPEC_ACCEPTED_PER_POS)
+    partial_accepted_per_pos = vector_delta(
+        after, before, SPEC_PARTIAL_ACCEPTED_PER_POS
+    )
 
     num_drafts_val = int(num_drafts) if num_drafts is not None else 0
     num_draft_tokens_val = int(num_draft_tokens) if num_draft_tokens is not None else 0
@@ -1452,6 +1451,10 @@ def measure_dataset_multi_turn(
     acceptance_rate_per_pos = [
         (v / num_drafts_val) if num_drafts_val > 0 else 0.0
         for v in accepted_per_pos
+    ]
+    intermediate_acceptance_rate_per_pos = [
+        (v / num_drafts_val) if num_drafts_val > 0 else 0.0
+        for v in partial_accepted_per_pos
     ]
 
     result: dict[str, Any] = {
