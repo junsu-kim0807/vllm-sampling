@@ -10,6 +10,7 @@ Examples:
   python scripts/generate_sd_script.py --verify --datasets aime25
 
 Modes:
+  --eager  : add --enforce-eager to generated metrics command (combine with any mode)
   default  : generate regular jobs from PAIRS
   --test   : smoke test jobs
   --batch  : vary batch size
@@ -688,6 +689,7 @@ def build_python_command(
     spec_bench_category: str | None = None,
     mt_bench_dataset_path: str | None = None,
     results_subdir: Path | None = None,
+    enforce_eager: bool = False,
 ) -> str:
     tag = batch_tag(batch_sizes)
     base_root = RESULTS_ROOT / method / tag / dataset.name
@@ -825,6 +827,8 @@ def build_python_command(
         parts.append("--verbose")
     if debug:
         parts.append("--debug")
+    if enforce_eager:
+        parts.append("--enforce-eager")
 
     return " \\\n  ".join(parts)
 
@@ -867,6 +871,7 @@ def render_job_script(
     jobs_subdir: Path | None = None,
     results_subdir: Path | None = None,
     job_name_suffix: str = "",
+    enforce_eager: bool = False,
 ) -> str:
     slug = pair_slug(pair.draft_model, pair.target_model)
     tag = batch_tag(batch_sizes)
@@ -937,6 +942,7 @@ def render_job_script(
         spec_bench_category=spec_bench_category,
         mt_bench_dataset_path=mt_bench_dataset_path,
         results_subdir=results_subdir,
+        enforce_eager=enforce_eager,
     )
 
     body = f"""
@@ -1131,6 +1137,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--eager",
+        action="store_true",
+        help=(
+            "Pass --enforce-eager to run_spec_decode_metrics.py in generated "
+            "Slurm scripts (disable CUDA graph / compile for easier debugging)."
+        ),
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--dtype", default="auto")
@@ -1731,6 +1745,7 @@ def main() -> None:
                     jobs_subdir=batch_dir,
                     results_subdir=result_subdir,
                     job_name_suffix=suffix,
+                    enforce_eager=args.eager,
                 )
                 write_job_script(script_path, script_text)
                 written_scripts.append(script_path)
@@ -1958,6 +1973,7 @@ def main() -> None:
                             results_subdir=results_subdir,
                             job_name_suffix=suffix,
                             time_limit_override="1:00:00",
+                            enforce_eager=args.eager,
                         )
                         write_job_script(script_path, script_text)
                         written_scripts.append(script_path)
@@ -2039,6 +2055,7 @@ def main() -> None:
                             results_subdir=results_subdir,
                             job_name_suffix=suffix,
                             time_limit_override="1:00:00",
+                            enforce_eager=args.eager,
                         )
                         write_job_script(script_path, script_text)
                         written_scripts.append(script_path)
@@ -2133,6 +2150,7 @@ def main() -> None:
                     jobs_subdir=pair_subdir,
                     results_subdir=results_subdir,
                     job_name_suffix=suffix,
+                    enforce_eager=args.eager,
                 )
                 write_job_script(script_path, script_text)
                 num_written += 1
