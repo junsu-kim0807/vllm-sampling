@@ -84,6 +84,74 @@ class PivotExpansionPlan:
     """Shape ``[P]``; inactive rows ``-1``."""
     row_gather_idx_cpu: torch.Tensor | None = None
     """Long tensor ``[P]`` on CPU; equals ``packed_sm_origin`` row-major gather indices."""
+    # --- Tensor-only expansion metadata (linear fixed P; ``families`` may be empty) ---
+    packed_row_is_base_t: torch.Tensor | None = None
+    """Shape ``[P]``; bool packed as 0/1 int8 or bool tensor (same semantics as list)."""
+    family_origin_rows_t: torch.Tensor | None = None
+    """Shape ``[F]`` long; origin row index per expansion family."""
+    family_expanded_rows_t: torch.Tensor | None = None
+    """Shape ``[F, R]`` long; packed row indices per family, ``-1`` padding."""
+    family_candidate_ranks_t: torch.Tensor | None = None
+    """Shape ``[F, R]`` int32; tie-break rank aligned with ``family_expanded_rows_t``."""
+    family_first_token_ids_t: torch.Tensor | None = None
+    """Shape ``[F, R]`` int32; first-token id per expanded row slot."""
+    family_first_token_probs_t: torch.Tensor | None = None
+    """Shape ``[F, R]`` float32; draft prob per expanded row slot."""
+    origin_to_family_rows_t: torch.Tensor | None = None
+    """Shape ``[B, M]`` long; extra packed row indices per origin, ``-1`` padding."""
+    origin_to_family_rows_count_t: torch.Tensor | None = None
+    """Shape ``[B]`` int32; valid entries per row in ``origin_to_family_rows_t``."""
+    origin_to_base_row_t: torch.Tensor | None = None
+    """Shape ``[B]`` long; base packed row index for each origin."""
+
+
+def pivot_plan_sm_origin_cpu_long(plan: PivotExpansionPlan) -> torch.Tensor:
+    """Packed row ``j`` -> scheduler origin in ``[0, B)`` (CPU long ``[P]``)."""
+    if plan.row_gather_idx_cpu is not None and int(plan.row_gather_idx_cpu.shape[0]) == int(
+        plan.expanded_batch_size
+    ):
+        return plan.row_gather_idx_cpu.detach().to(torch.long).contiguous()
+    if plan.packed_sm_origin_t is not None:
+        return plan.packed_sm_origin_t.detach().cpu().to(torch.long).contiguous()
+    sm = plan.packed_sm_origin if plan.packed_sm_origin is not None else plan.expanded_to_origin
+    return torch.tensor(sm, dtype=torch.long)
+
+
+def pivot_plan_origin_to_base_row_cpu_long(plan: PivotExpansionPlan) -> torch.Tensor:
+    """Origin ``o`` in ``[0, B)`` -> packed row index of that origin's **base** row (CPU long ``[B]``).
+
+    Prefer explicit ``origin_to_base_row_t`` / ``origin_to_base_row``; otherwise derive
+    the first packed row per origin from ``pivot_plan_sm_origin_cpu_long`` (tensor-only
+    safe; list ``expanded_to_origin`` may be empty).
+    """
+    b = int(plan.origin_batch_size)
+    if b <= 0:
+        sm0 = pivot_plan_sm_origin_cpu_long(plan)
+        if sm0.numel() == 0:
+            return torch.empty(0, dtype=torch.long)
+        b = int(sm0.max().item()) + 1
+
+    if plan.origin_to_base_row_t is not None and int(plan.origin_to_base_row_t.shape[0]) >= b:
+        return plan.origin_to_base_row_t[:b].detach().cpu().to(torch.long).contiguous()
+
+    if plan.origin_to_base_row is not None and len(plan.origin_to_base_row) >= b:
+        return torch.tensor(plan.origin_to_base_row[:b], dtype=torch.long)
+
+    sm = pivot_plan_sm_origin_cpu_long(plan)
+    out = torch.full((b,), -1, dtype=torch.long)
+    for j in range(int(sm.shape[0])):
+        o = int(sm[j].item())
+        if 0 <= o < b and int(out[o].item()) < 0:
+            out[o] = j
+    return out
+
+
+def pivot_plan_uses_tensor_only_family_meta(plan: PivotExpansionPlan) -> bool:
+    return bool(
+        plan.uses_fixed_capacity_packing
+        and plan.family_expanded_rows_t is not None
+        and (not plan.families)
+    )
 
 
 @dataclass(frozen=True)
@@ -342,12 +410,13 @@ def pivot_expansion_indices_fit_prepare_batch(
         return False
     if plan.expanded_batch_size <= 0:
         return False
-    if len(plan.expanded_to_origin) != plan.expanded_batch_size:
-        return False
-    # Fixed-capacity packed layout
+    p = int(plan.expanded_batch_size)
+    if len(plan.expanded_to_origin) != p:
+        if plan.packed_sm_origin_t is None or int(plan.packed_sm_origin_t.shape[0]) != p:
+            return False
+    # Fixed-capacity packed layout (list-backed packed_sm_origin)
     if plan.packed_sm_origin is not None:
-        p = plan.packed_batch_size
-        if p != plan.expanded_batch_size or len(plan.packed_sm_origin) != p:
+        if plan.packed_batch_size != p or len(plan.packed_sm_origin) != p:
             return False
         if plan.origin_batch_size != num_reqs:
             return False
@@ -401,10 +470,73 @@ def pivot_expansion_indices_fit_prepare_batch(
                     return False
                 if int(sm[o]) != o:
                     return False
-            if any(int(plan.expanded_to_origin[j]) != int(sm[j]) for j in range(p)):
+            if len(plan.expanded_to_origin) == p and any(
+                int(plan.expanded_to_origin[j]) != int(sm[j]) for j in range(p)
+            ):
+                return False
+        return True
+    # Tensor-only packed layout (linear fixed P; no list ``packed_sm_origin``)
+    if (
+        plan.packed_sm_origin_t is not None
+        and plan.packed_to_origin_t is not None
+        and plan.packed_row_is_active_t is not None
+        and plan.packed_row_is_base_t is not None
+    ):
+        if plan.packed_batch_size != p or int(plan.packed_sm_origin_t.shape[0]) != p:
+            return False
+        if plan.origin_batch_size != num_reqs:
+            return False
+        if (
+            plan.uses_fixed_capacity_packing
+            and expected_packed_size is not None
+            and p != expected_packed_size
+        ):
+            return False
+        sm = plan.packed_sm_origin_t
+        if bool((sm < 0).any().item()) or bool((sm >= num_reqs).any().item()):
+            return False
+        pto = plan.packed_to_origin_t
+        act = plan.packed_row_is_active_t
+        isb = plan.packed_row_is_base_t
+        if int(pto.shape[0]) != p or int(act.shape[0]) != p or int(isb.shape[0]) != p:
+            return False
+        for j in range(p):
+            active = bool(act[j].item())
+            po = int(pto[j].item())
+            if active and (po < 0 or po >= num_reqs):
+                return False
+            if not active and po != -1:
+                return False
+        if plan.uses_fixed_capacity_packing:
+            otb = plan.origin_to_base_row_t
+            if otb is None or int(otb.shape[0]) != num_reqs:
+                return False
+            ar = torch.arange(num_reqs, device=otb.device, dtype=otb.dtype)
+            if not torch.equal(otb, ar):
+                return False
+            if int(isb[:num_reqs].sum().item()) != num_reqs:
+                return False
+            for o in range(num_reqs):
+                if not bool(isb[o].item()):
+                    return False
+            for j in range(num_reqs, p):
+                if bool(isb[j].item()):
+                    return False
+            for o in range(num_reqs):
+                if not bool(act[o].item()):
+                    return False
+                if int(pto[o].item()) != o:
+                    return False
+                if int(sm[o].item()) != o:
+                    return False
+            if len(plan.expanded_to_origin) == p and any(
+                int(plan.expanded_to_origin[j]) != int(sm[j].item()) for j in range(p)
+            ):
                 return False
         return True
     # Legacy dense expansion (e.g. eagle tree): expanded_to_origin is all valid origins
+    if not plan.expanded_to_origin:
+        return False
     for o in plan.expanded_to_origin:
         if int(o) < 0 or int(o) >= num_reqs:
             return False
@@ -428,6 +560,23 @@ def _split_probs_by_lengths(
     return rows
 
 
+def _pivot_row_first_token_id_from_family_tensors(
+    plan: PivotExpansionPlan, j: int
+) -> int | None:
+    """First speculative token id for packed row ``j`` from tensor family tables."""
+    if plan.families:
+        return None
+    fer = plan.family_expanded_rows_t
+    ftok = plan.family_first_token_ids_t
+    if fer is None or ftok is None:
+        return None
+    mask = fer == int(j)
+    if not bool(mask.any().item()):
+        return None
+    fr = torch.nonzero(mask, as_tuple=False)[0]
+    return int(ftok[int(fr[0].item()), int(fr[1].item())].item())
+
+
 def expand_hybrid_bundle_for_pivot_expansion(
     bundle: HybridProposalBundle,
 ) -> HybridProposalBundle:
@@ -449,10 +598,60 @@ def expand_hybrid_bundle_for_pivot_expansion(
         # Fixed-capacity path: ``expand_hybrid_bundle`` clones rows and patches
         # first-token mass from ``PivotExpansionFamily.first_token_probs`` (PR3).
         bundle = replace(bundle, draft_probs=None)
-    if len(plan.expanded_to_origin) != plan.expanded_batch_size:
-        return bundle
+    p_sz = int(plan.expanded_batch_size)
+    if len(plan.expanded_to_origin) != p_sz:
+        if plan.packed_sm_origin_t is None or int(plan.packed_sm_origin_t.shape[0]) != p_sz:
+            return bundle
 
     # Already packed: enforce inactive rows have zero draft tokens.
+    if (
+        plan.packed_sm_origin_t is not None
+        and plan.packed_row_is_active_t is not None
+        and len(bundle.num_draft_tokens) == plan.packed_batch_size
+        and int(plan.packed_sm_origin_t.shape[0]) == plan.packed_batch_size
+    ):
+        p = plan.packed_batch_size
+        act = plan.packed_row_is_active_t
+        lengths = list(bundle.num_draft_tokens)
+        needs_rebuild = any(
+            (not bool(act[j].item())) and lengths[j] != 0 for j in range(p)
+        )
+        if not needs_rebuild:
+            return bundle
+        tok_rows = _split_flat_tokens_by_lengths(
+            bundle.draft_token_ids, bundle.num_draft_tokens
+        )
+        new_lengths: list[int] = []
+        new_tok: list[torch.Tensor] = []
+        for j in range(p):
+            if bool(act[j].item()):
+                new_lengths.append(lengths[j])
+                new_tok.append(tok_rows[j])
+            else:
+                new_lengths.append(0)
+                new_tok.append(
+                    tok_rows[j].new_empty((0,), dtype=tok_rows[j].dtype)
+                )
+        draft_token_ids = (
+            torch.cat(new_tok, dim=0).to(torch.int32)
+            if any(l > 0 for l in new_lengths)
+            else bundle.draft_token_ids.new_empty((0,), dtype=torch.int32)
+        )
+        device = draft_token_ids.device
+        cu = torch.cumsum(
+            torch.tensor(new_lengths, dtype=torch.int32, device=device), dim=0
+        ).to(torch.int32)
+        max_spec_len = max(new_lengths) if any(new_lengths) else bundle.max_spec_len
+        return replace(
+            bundle,
+            draft_token_ids=draft_token_ids,
+            draft_probs=None,
+            num_draft_tokens=new_lengths,
+            cu_num_draft_tokens=cu,
+            max_spec_len=max_spec_len,
+            source_stage=None,
+        )
+
     if (
         plan.packed_sm_origin is not None
         and plan.packed_row_is_active is not None
@@ -507,8 +706,15 @@ def expand_hybrid_bundle_for_pivot_expansion(
         return bundle
 
     sm = plan.packed_sm_origin
-    if sm is None or len(sm) != plan.expanded_batch_size:
-        sm = plan.expanded_to_origin
+    if sm is not None and len(sm) == plan.expanded_batch_size:
+        sm_list = sm
+    elif (
+        plan.packed_sm_origin_t is not None
+        and int(plan.packed_sm_origin_t.shape[0]) == plan.expanded_batch_size
+    ):
+        sm_list = plan.packed_sm_origin_t.detach().cpu().tolist()
+    else:
+        sm_list = plan.expanded_to_origin
 
     tok_rows = _split_flat_tokens_by_lengths(
         bundle.draft_token_ids, bundle.num_draft_tokens
@@ -531,29 +737,51 @@ def expand_hybrid_bundle_for_pivot_expansion(
     new_prob: list[torch.Tensor] = []
     new_src: list[torch.Tensor] = []
 
-    for j, o in enumerate(sm):
+    for j, o in enumerate(sm_list):
         if o < 0 or o >= origin_b:
             return bundle
         row_t = tok_rows[o].clone()
-        for fam in plan.families:
-            if j in fam.expanded_rows:
-                li = fam.expanded_rows.index(j)
-                row_t[0] = int(fam.first_token_ids[li])
-                break
+        patch_id = _pivot_row_first_token_id_from_family_tensors(plan, j)
+        if patch_id is not None:
+            row_t[0] = patch_id
+        else:
+            for fam in plan.families:
+                if j in fam.expanded_rows:
+                    li = fam.expanded_rows.index(j)
+                    row_t[0] = int(fam.first_token_ids[li])
+                    break
         new_lengths.append(int(row_t.shape[0]))
         new_tok.append(row_t)
         if prob_rows is not None:
             pr = prob_rows[o].clone()
-            for fam in plan.families:
-                if j in fam.expanded_rows:
-                    li = fam.expanded_rows.index(j)
-                    tid = int(fam.first_token_ids[li])
-                    fp = float(fam.first_token_probs[li])
-                    if pr.shape[0] > 0:
-                        pr[0].zero_()
-                        if 0 <= tid < pr.shape[-1]:
-                            pr[0, tid] = fp
-                    break
+            prob_patched = False
+            if patch_id is not None and plan.family_first_token_probs_t is not None:
+                fer = plan.family_expanded_rows_t
+                fpr = plan.family_first_token_probs_t
+                if fer is not None:
+                    mask = fer == int(j)
+                    if bool(mask.any().item()):
+                        fr = torch.nonzero(mask, as_tuple=False)[0]
+                        fp = float(
+                            fpr[int(fr[0].item()), int(fr[1].item())].item()
+                        )
+                        tid = int(patch_id)
+                        if pr.shape[0] > 0:
+                            pr[0].zero_()
+                            if 0 <= tid < pr.shape[-1]:
+                                pr[0, tid] = fp
+                        prob_patched = True
+            if not prob_patched:
+                for fam in plan.families:
+                    if j in fam.expanded_rows:
+                        li = fam.expanded_rows.index(j)
+                        tid = int(fam.first_token_ids[li])
+                        fp = float(fam.first_token_probs[li])
+                        if pr.shape[0] > 0:
+                            pr[0].zero_()
+                            if 0 <= tid < pr.shape[-1]:
+                                pr[0, tid] = fp
+                        break
             new_prob.append(pr)
         if src_rows is not None:
             new_src.append(src_rows[o].clone())
@@ -570,7 +798,7 @@ def expand_hybrid_bundle_for_pivot_expansion(
     new_br: tuple[str, ...] | None = None
     br = bundle.bundle_row_req_ids
     if br is not None and len(br) == origin_b:
-        new_br = tuple(str(br[int(sm[j])]) for j in range(len(sm)))
+        new_br = tuple(str(br[int(sm_list[j])]) for j in range(len(sm_list)))
 
     return replace(
         bundle,

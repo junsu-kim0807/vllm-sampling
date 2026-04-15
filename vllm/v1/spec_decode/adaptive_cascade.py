@@ -196,8 +196,10 @@ def _build_prefix_conditioned_inputs(
     target_positions: torch.Tensor,
     target_hidden_states: torch.Tensor,
     next_token_ids: torch.Tensor,
-    prefix_rows: list[list[int]],
+    prefix_rows: list[list[int]] | None = None,
     roll_rows: list[list[int]] | None = None,
+    prefix_tokens: torch.Tensor | None = None,
+    prefix_lengths: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -208,9 +210,21 @@ def _build_prefix_conditioned_inputs(
     list[int],
     list[int],
 ]:
-    """Build proposer inputs conditioned on logical prefix rows per request."""
+    """Build proposer inputs conditioned on logical prefix rows per request.
+
+    Pass either ``prefix_rows`` (list form) or ``prefix_tokens`` + ``prefix_lengths``
+    (dense ``[B, max_len]`` and ``[B]`` valid lengths); the latter avoids CPU list
+    materialization at HV / pivot boundaries.
+    """
     batch_size = cad.batch_size()
-    assert len(prefix_rows) == batch_size
+    dense_mode = prefix_tokens is not None and prefix_lengths is not None
+    if dense_mode:
+        assert prefix_rows is None
+        assert int(prefix_tokens.shape[0]) == batch_size  # type: ignore[union-attr]
+        assert int(prefix_lengths.shape[0]) == batch_size  # type: ignore[union-attr]
+    else:
+        assert prefix_rows is not None
+        assert len(prefix_rows) == batch_size
     if roll_rows is not None:
         assert len(roll_rows) == batch_size
     qsl = cad.query_start_loc
@@ -237,30 +251,53 @@ def _build_prefix_conditioned_inputs(
         e = int(qsl[b + 1].item())
         base_query_lens.append(e - s)
         base_next = int(next_token_ids[b].item())
-        logical = prefix_rows[b]
-        prefix_lens.append(len(logical))
+        if dense_mode:
+            lpref = int(prefix_lengths[b].item())  # type: ignore[union-attr]
+            prefix_lens.append(lpref)
+            if lpref > 0:
+                logical_t = prefix_tokens[b, :lpref].to(  # type: ignore[union-attr]
+                    device=device, dtype=torch.int32
+                )
+            else:
+                logical_t = torch.empty(0, dtype=torch.int32, device=device)
+        else:
+            logical = prefix_rows[b]  # type: ignore[union-attr]
+            lpref = len(logical)
+            prefix_lens.append(lpref)
+            logical_t = (
+                torch.tensor(logical, dtype=torch.int32, device=device)
+                if lpref
+                else torch.empty(0, dtype=torch.int32, device=device)
+            )
         forced = roll_rows[b] if roll_rows is not None else []
         roll_lens.append(len(forced))
-        chain = [base_next, *logical, *forced]
-        ext = chain[:-1]
-        next_tok = chain[-1]
+        forced_t = (
+            torch.tensor(forced, dtype=torch.int32, device=device)
+            if forced
+            else torch.empty(0, dtype=torch.int32, device=device)
+        )
+        base_next_t = next_token_ids[b : b + 1].to(dtype=torch.int32, device=device)
+        chain_t = torch.cat((base_next_t, logical_t, forced_t), dim=0)
+        ext_len = int(chain_t.shape[0]) - 1
+        ext = chain_t[:-1]
+        next_tok = int(chain_t[-1].item())
         if _spechive_debug_enabled() and b < 2:
             logger.info(
-                "SPECHIVE_DEBUG packing req=%d base_next=%s logical=%s forced=%s ext=%s next_tok=%s",
+                "SPECHIVE_DEBUG packing req=%d base_next=%s logical_len=%d forced=%s "
+                "ext_len=%s next_tok=%s",
                 b,
                 base_next,
-                logical,
+                lpref,
                 forced,
-                ext,
+                ext_len,
                 next_tok,
             )
 
         tok_piece = target_token_ids[s:e]
         hid_piece = target_hidden_states[s:e]
         slot_piece = cad.slot_mapping[s:e]
-        ext_len = len(ext)
         if ext_len > 0:
-            ext_tensor = torch.tensor(ext, dtype=torch.int32, device=device)
+            ext_tensor = ext.to(dtype=torch.int32)
             tok_piece = torch.cat((tok_piece, ext_tensor), dim=0)
             hid_piece = torch.cat(
                 (
@@ -484,8 +521,10 @@ def _forward_prefix_conditioned_logits(
     target_hidden_states: torch.Tensor,
     next_token_ids: torch.Tensor,
     num_rejected_tokens_gpu: torch.Tensor | None,
-    prefix_rows: list[list[int]],
+    prefix_rows: list[list[int]] | None = None,
     roll_rows: list[list[int]] | None = None,
+    prefix_tokens: torch.Tensor | None = None,
+    prefix_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, CommonAttentionMetadata, list[int], list[int], list[int]]:
     """Run one prefix-conditioned forward and return query-row logits."""
     (
@@ -520,6 +559,8 @@ def _forward_prefix_conditioned_logits(
         next_token_ids=next_token_ids,
         prefix_rows=prefix_rows,
         roll_rows=roll_rows,
+        prefix_tokens=prefix_tokens,
+        prefix_lengths=prefix_lengths,
     )
     num_tokens, token_indices_to_sample, pref_cad = proposer.set_inputs_first_pass(
         target_token_ids=pref_toks,
@@ -613,14 +654,16 @@ def _propose_chunk_from_prefix(
     target_hidden_states: torch.Tensor,
     next_token_ids: torch.Tensor,
     num_rejected_tokens_gpu: torch.Tensor | None,
-    prefix_rows: list[list[int]],
     chunk_len: int,
     sampling_metadata: SamplingMetadata,
     use_draft_probs: bool,
+    prefix_rows: list[list[int]] | None = None,
     prefix_prefab: tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, CommonAttentionMetadata
     ]
     | None = None,
+    prefix_tokens: torch.Tensor | None = None,
+    prefix_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sample one chunk from one proposer call conditioned on prefix rows."""
     if prefix_prefab is not None:
@@ -659,6 +702,8 @@ def _propose_chunk_from_prefix(
             next_token_ids=next_token_ids,
             prefix_rows=prefix_rows,
             roll_rows=None,
+            prefix_tokens=prefix_tokens,
+            prefix_lengths=prefix_lengths,
         )
     rows = proposer.propose(
         target_token_ids=pref_toks,
@@ -693,8 +738,10 @@ def _verify_chunk_with_prefix(
     target_hidden_states: torch.Tensor,
     next_token_ids: torch.Tensor,
     num_rejected_tokens_gpu: torch.Tensor | None,
-    prefix_rows: list[list[int]],
     draft_tokens: torch.Tensor,
+    prefix_rows: list[list[int]] | None = None,
+    prefix_tokens: torch.Tensor | None = None,
+    prefix_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Collect verifier logits for full chunk from one prefix-conditioned forward."""
     roll_rows = [
@@ -712,6 +759,8 @@ def _verify_chunk_with_prefix(
             num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             prefix_rows=prefix_rows,
             roll_rows=roll_rows,
+            prefix_tokens=prefix_tokens,
+            prefix_lengths=prefix_lengths,
         )
     )
     bsz = draft_tokens.shape[0]
@@ -763,6 +812,8 @@ def _verify_chunk_with_prefix(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 prefix_rows=prefix_rows,
                 roll_rows=partial_roll,
+                prefix_tokens=prefix_tokens,
+                prefix_lengths=prefix_lengths,
             )
             ref_qsl = ref_cad.query_start_loc
             for b in range(bsz):
@@ -1008,10 +1059,12 @@ class AdaptiveSpechiveProposer:
         base_next_token_ids: torch.Tensor,
         base_common_attn_metadata: CommonAttentionMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
-        prefix_rows: list[list[int]],
         chunk_len: int,
         sampling_metadata: SamplingMetadata,
         use_draft_probs: bool,
+        prefix_rows: list[list[int]] | None = None,
+        prefix_tokens: torch.Tensor | None = None,
+        prefix_lengths: torch.Tensor | None = None,
     ) -> DitRoundProposal:
         """Chunk proposal conditioned on base sampled token + logical prefix."""
         tokens, probs = _propose_chunk_from_prefix(
@@ -1022,10 +1075,12 @@ class AdaptiveSpechiveProposer:
             target_hidden_states=base_target_hidden_states,
             next_token_ids=base_next_token_ids,
             num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-            prefix_rows=prefix_rows,
             chunk_len=chunk_len,
             sampling_metadata=sampling_metadata,
             use_draft_probs=use_draft_probs,
+            prefix_rows=prefix_rows,
+            prefix_tokens=prefix_tokens,
+            prefix_lengths=prefix_lengths,
         )
         return DitRoundProposal(tokens=tokens, probs=probs)
 
@@ -1038,8 +1093,10 @@ class AdaptiveSpechiveProposer:
         base_next_token_ids: torch.Tensor,
         base_common_attn_metadata: CommonAttentionMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
-        prefix_rows: list[list[int]],
         candidate_tokens: torch.Tensor,
+        prefix_rows: list[list[int]] | None = None,
+        prefix_tokens: torch.Tensor | None = None,
+        prefix_lengths: torch.Tensor | None = None,
     ) -> DitRoundVerification:
         """Intermediate verification logits conditioned on logical prefix."""
         assert self._inter_dit is not None
@@ -1051,8 +1108,10 @@ class AdaptiveSpechiveProposer:
             target_hidden_states=base_target_hidden_states,
             next_token_ids=base_next_token_ids,
             num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-            prefix_rows=prefix_rows,
             draft_tokens=candidate_tokens.to(torch.int32),
+            prefix_rows=prefix_rows,
+            prefix_tokens=prefix_tokens,
+            prefix_lengths=prefix_lengths,
         )
         return DitRoundVerification(
             logits_flat=logits_flat,

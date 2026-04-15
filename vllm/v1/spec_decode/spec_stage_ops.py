@@ -26,11 +26,15 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     PivotTreeFamily,
     _split_flat_tokens_by_lengths,
     _split_probs_by_lengths,
+    pivot_plan_sm_origin_cpu_long,
 )
 
 
 def _pivot_packed_row_is_active(plan: PivotExpansionPlan, row_idx: int) -> bool:
     """Whether ``row_idx`` participates in family competition / cleanup (linear packed)."""
+    act_t = plan.packed_row_is_active_t
+    if act_t is not None and 0 <= row_idx < int(act_t.shape[0]):
+        return bool(act_t[row_idx].item())
     active = plan.packed_row_is_active
     if active is None:
         return True
@@ -336,7 +340,7 @@ def select_pivot_expanded_rows_to_origin(
     """
     if sampled_token_ids.shape[0] < expansion_plan.expanded_batch_size:
         return list(range(int(sampled_token_ids.shape[0])))
-    if not expansion_plan.expanded_to_origin:
+    if not expansion_plan.expanded_to_origin and expansion_plan.packed_sm_origin_t is None:
         return list(range(int(sampled_token_ids.shape[0])))
     if (
         num_draft_tokens is not None
@@ -352,21 +356,34 @@ def select_pivot_expanded_rows_to_origin(
             sampled_token_ids,
             placeholder_token_id=PLACEHOLDER_TOKEN_ID,
         )
+    eto_cpu = pivot_plan_sm_origin_cpu_long(expansion_plan)
     b_origin = (
         int(expansion_plan.origin_batch_size)
         if expansion_plan.origin_batch_size > 0
-        else max(expansion_plan.expanded_to_origin) + 1
+        else int(eto_cpu.max().item()) + 1
     )
 
     # Fixed-capacity fast path: build [B, W] candidate table and perform tie-break
     # with tensor ops. Keep general Python loop fallback below.
-    if (
+    use_tensor_meta = (
+        expansion_plan.uses_fixed_capacity_packing
+        and expansion_plan.origin_to_family_rows_t is not None
+        and expansion_plan.origin_to_family_rows_count_t is not None
+        and expansion_plan.origin_to_base_row_t is not None
+        and expansion_plan.family_expanded_rows_t is not None
+        and expansion_plan.family_first_token_ids_t is not None
+        and expansion_plan.family_first_token_probs_t is not None
+        and expansion_plan.family_candidate_ranks_t is not None
+        and int(expansion_plan.origin_to_base_row_t.shape[0]) >= b_origin
+    )
+    use_list_meta = (
         expansion_plan.uses_fixed_capacity_packing
         and expansion_plan.origin_to_family_rows is not None
         and expansion_plan.origin_to_base_row is not None
         and len(expansion_plan.origin_to_family_rows) >= b_origin
         and len(expansion_plan.origin_to_base_row) >= b_origin
-    ):
+    )
+    if use_tensor_meta or use_list_meta:
         device = sampled_token_ids.device
         accepted_lens_t = torch.tensor(accepted_lens, dtype=torch.int32, device=device)
 
@@ -382,46 +399,89 @@ def select_pivot_expanded_rows_to_origin(
             device=device,
             dtype=torch.int32,
         )
-        for fam in expansion_plan.families:
-            for local_idx, row_idx in enumerate(fam.expanded_rows):
-                j = int(row_idx)
-                if 0 <= j < expansion_plan.expanded_batch_size:
-                    row_to_prob[j] = float(fam.first_token_probs[local_idx])
-                    row_to_rank[j] = int(fam.candidate_ranks[local_idx])
+        if use_tensor_meta:
+            fer = expansion_plan.family_expanded_rows_t.to(device=device, dtype=torch.long)
+            fpr = expansion_plan.family_first_token_probs_t.to(device=device, dtype=torch.float32)
+            frk = expansion_plan.family_candidate_ranks_t.to(device=device, dtype=torch.int32)
+            mask = fer >= 0
+            flat_j = fer[mask]
+            row_to_prob[flat_j] = fpr[mask]
+            row_to_rank[flat_j] = frk[mask]
+        else:
+            for fam in expansion_plan.families:
+                for local_idx, row_idx in enumerate(fam.expanded_rows):
+                    j = int(row_idx)
+                    if 0 <= j < expansion_plan.expanded_batch_size:
+                        row_to_prob[j] = float(fam.first_token_probs[local_idx])
+                        row_to_rank[j] = int(fam.candidate_ranks[local_idx])
 
-        family_rows = expansion_plan.origin_to_family_rows
-        base_rows = expansion_plan.origin_to_base_row
-        # origin_to_family_rows contains only extra rows; include base row explicitly.
-        max_w = 1 + max((len(rows) for rows in family_rows[:b_origin]), default=0)
-        idx_cpu = torch.zeros((b_origin, max_w), dtype=torch.long)
-        valid_cpu = torch.zeros((b_origin, max_w), dtype=torch.bool)
-        for o in range(b_origin):
-            base = int(base_rows[o]) if o < len(base_rows) else -1
-            col = 0
-            if 0 <= base < expansion_plan.expanded_batch_size:
-                idx_cpu[o, col] = base
-                valid_cpu[o, col] = _pivot_packed_row_is_active(expansion_plan, base)
-                col += 1
+        if use_tensor_meta:
+            otf = expansion_plan.origin_to_family_rows_t.to(device=device, dtype=torch.long)
+            otc = expansion_plan.origin_to_family_rows_count_t.to(device=device, dtype=torch.int32)
+            base_rows_t = expansion_plan.origin_to_base_row_t.to(device=device, dtype=torch.long)
+            max_w = 1 + int(otc[:b_origin].max().item()) if b_origin > 0 else 1
+            idx = torch.zeros((b_origin, max_w), dtype=torch.long, device=device)
+            valid = torch.zeros((b_origin, max_w), dtype=torch.bool, device=device)
+            for o in range(b_origin):
+                base = int(base_rows_t[o].item())
+                col = 0
+                if 0 <= base < expansion_plan.expanded_batch_size:
+                    idx[o, col] = base
+                    valid[o, col] = _pivot_packed_row_is_active(expansion_plan, base)
+                    col += 1
+                n_ex = int(otc[o].item())
+                for k in range(min(n_ex, otf.shape[1])):
+                    if col >= max_w:
+                        break
+                    j = int(otf[o, k].item())
+                    if j < 0:
+                        continue
+                    if 0 <= j < expansion_plan.expanded_batch_size:
+                        idx[o, col] = j
+                        valid[o, col] = _pivot_packed_row_is_active(expansion_plan, j)
+                    col += 1
+        else:
+            family_rows = expansion_plan.origin_to_family_rows
+            base_rows = expansion_plan.origin_to_base_row
+            # origin_to_family_rows contains only extra rows; include base row explicitly.
+            max_w = 1 + max((len(rows) for rows in family_rows[:b_origin]), default=0)
+            idx_cpu = torch.zeros((b_origin, max_w), dtype=torch.long)
+            valid_cpu = torch.zeros((b_origin, max_w), dtype=torch.bool)
+            for o in range(b_origin):
+                base = int(base_rows[o]) if o < len(base_rows) else -1
+                col = 0
+                if 0 <= base < expansion_plan.expanded_batch_size:
+                    idx_cpu[o, col] = base
+                    valid_cpu[o, col] = _pivot_packed_row_is_active(expansion_plan, base)
+                    col += 1
 
-            rows = family_rows[o]
-            for row_idx in rows:
-                if col >= max_w:
-                    break
-                j = int(row_idx)
-                if 0 <= j < expansion_plan.expanded_batch_size:
-                    idx_cpu[o, col] = j
-                    valid_cpu[o, col] = _pivot_packed_row_is_active(expansion_plan, j)
-                else:
-                    idx_cpu[o, col] = 0
-                    valid_cpu[o, col] = False
-                col += 1
+                rows = family_rows[o]
+                for row_idx in rows:
+                    if col >= max_w:
+                        break
+                    j = int(row_idx)
+                    if 0 <= j < expansion_plan.expanded_batch_size:
+                        idx_cpu[o, col] = j
+                        valid_cpu[o, col] = _pivot_packed_row_is_active(expansion_plan, j)
+                    else:
+                        idx_cpu[o, col] = 0
+                        valid_cpu[o, col] = False
+                    col += 1
 
-        idx = idx_cpu.to(device=device)
-        valid = valid_cpu.to(device=device)
+            idx = idx_cpu.to(device=device)
+            valid = valid_cpu.to(device=device)
 
         acc = accepted_lens_t.index_select(0, idx.view(-1)).view(b_origin, max_w)
         prob = row_to_prob.index_select(0, idx.view(-1)).view(b_origin, max_w)
         rank = row_to_rank.index_select(0, idx.view(-1)).view(b_origin, max_w)
+
+        # Active rows missing from ``family_*`` tables (e.g. no expansion blocks)
+        # must not stay at ``-inf`` / huge rank or tie-break becomes undefined.
+        if use_tensor_meta and expansion_plan.packed_row_is_active_t is not None:
+            act_all = expansion_plan.packed_row_is_active_t.to(device=device)
+            bad = act_all & ~torch.isfinite(row_to_prob)
+            row_to_prob = torch.where(bad, torch.zeros_like(row_to_prob), row_to_prob)
+            row_to_rank = torch.where(bad, torch.zeros_like(row_to_rank), row_to_rank)
 
         neg_inf_i = torch.full_like(acc, -1)
         neg_inf_f = torch.full_like(prob, float("-inf"))
@@ -446,6 +506,11 @@ def select_pivot_expanded_rows_to_origin(
         fam = origin_to_family.get(o)
         if fam is None:
             if (
+                expansion_plan.origin_to_base_row_t is not None
+                and o < int(expansion_plan.origin_to_base_row_t.shape[0])
+            ):
+                j = int(expansion_plan.origin_to_base_row_t[o].item())
+            elif (
                 expansion_plan.origin_to_base_row is not None
                 and o < len(expansion_plan.origin_to_base_row)
                 and int(expansion_plan.origin_to_base_row[o]) >= 0
@@ -475,6 +540,11 @@ def select_pivot_expanded_rows_to_origin(
                     best_row = row_idx
             if best_row is None:
                 if (
+                    expansion_plan.origin_to_base_row_t is not None
+                    and o < int(expansion_plan.origin_to_base_row_t.shape[0])
+                ):
+                    j = int(expansion_plan.origin_to_base_row_t[o].item())
+                elif (
                     expansion_plan.origin_to_base_row is not None
                     and o < len(expansion_plan.origin_to_base_row)
                     and int(expansion_plan.origin_to_base_row[o]) >= 0
@@ -511,7 +581,7 @@ def collapse_pivot_expanded_sampled_to_origin(
     """
     if sampled_token_ids.shape[0] < expansion_plan.expanded_batch_size:
         return sampled_token_ids
-    if not expansion_plan.expanded_to_origin:
+    if not expansion_plan.expanded_to_origin and expansion_plan.packed_sm_origin_t is None:
         return sampled_token_ids
     if selected_rows is None:
         selected_rows = select_pivot_expanded_rows_to_origin(
@@ -561,7 +631,14 @@ def expand_intermediate_state_for_pivot_plan(
     if len(state.frontier_metadata) == plan.expanded_batch_size:
         return state
     sm = plan.packed_sm_origin
-    if sm is None:
+    if sm is not None and len(sm) == plan.expanded_batch_size:
+        pass
+    elif (
+        plan.packed_sm_origin_t is not None
+        and int(plan.packed_sm_origin_t.shape[0]) == plan.expanded_batch_size
+    ):
+        sm = plan.packed_sm_origin_t.detach().cpu().tolist()
+    else:
         sm = plan.expanded_to_origin
     # Copy dict rows only when an origin row is duplicated by expansion.
     # Unique origin rows can be safely reused because each resulting row owns
@@ -590,6 +667,15 @@ def get_unselected_cleanup_rows(
     """
     selected = set(int(r) for r in selected_rows)
     cleanup: list[int] = []
+    fer = expansion_plan.family_expanded_rows_t
+    if fer is not None and not expansion_plan.families:
+        for row_idx in fer[fer >= 0].reshape(-1).tolist():
+            ri = int(row_idx)
+            if not _pivot_packed_row_is_active(expansion_plan, ri):
+                continue
+            if ri not in selected:
+                cleanup.append(ri)
+        return cleanup
     for fam in expansion_plan.families:
         for row_idx in fam.expanded_rows:
             if not _pivot_packed_row_is_active(expansion_plan, row_idx):
@@ -821,26 +907,78 @@ def _permute_pivot_expansion_plan(
     if plan.origin_to_base_row is not None:
         new_otb = [inv[plan.origin_to_base_row[o]] for o in range(len(plan.origin_to_base_row))]
 
-    if len(plan.expanded_to_origin) != p:
+    def _remap_packed_indices_tensor(t: torch.Tensor | None) -> torch.Tensor | None:
+        if t is None or int(t.shape[0]) != p:
+            return t
+        flat = t.reshape(-1)
+        out = flat.clone()
+        pos = flat >= 0
+        if pos.any():
+            old_ix = flat[pos].tolist()
+            out[pos] = torch.tensor(
+                [inv[int(x)] for x in old_ix],
+                dtype=flat.dtype,
+                device=flat.device,
+            )
+        return out.view(t.shape)
+
+    new_fer = _remap_packed_indices_tensor(plan.family_expanded_rows_t)
+    new_otf_t = _remap_packed_indices_tensor(plan.origin_to_family_rows_t)
+    new_otb_t = None
+    if plan.origin_to_base_row_t is not None and int(plan.origin_to_base_row_t.shape[0]) == int(
+        plan.origin_batch_size
+    ):
+        new_otb_t = torch.tensor(
+            [inv[int(x)] for x in plan.origin_to_base_row_t.tolist()],
+            dtype=plan.origin_to_base_row_t.dtype,
+            device=plan.origin_to_base_row_t.device,
+        )
+
+    sm_len_ok = (
+        plan.packed_sm_origin_t is not None and int(plan.packed_sm_origin_t.shape[0]) == p
+    )
+    eto_len_ok = len(plan.expanded_to_origin) == p
+    if not (sm_len_ok or eto_len_ok):
         return plan
-    new_eto: list[int] = [plan.expanded_to_origin[perm_old[j]] for j in range(p)]
+    tensor_only_clear = (
+        not plan.families
+        and len(plan.expanded_to_origin) == 0
+        and sm_len_ok
+    )
+    if eto_len_ok and not tensor_only_clear:
+        new_eto: list[int] = [plan.expanded_to_origin[perm_old[j]] for j in range(p)]
+    elif tensor_only_clear:
+        new_eto = []
+    else:
+        old_eto = pivot_plan_sm_origin_cpu_long(plan).tolist()
+        new_eto = [old_eto[perm_old[j]] for j in range(p)]
+    new_sm_t = pick_tensor_row_major(plan.packed_sm_origin_t)
     new_rg = pick_tensor_row_major(plan.row_gather_idx_cpu)
+    if tensor_only_clear and new_sm_t is not None:
+        new_rg = new_sm_t.detach().cpu().to(torch.long).contiguous()
+    elif new_rg is None and new_sm_t is not None:
+        new_rg = new_sm_t.detach().cpu().to(torch.long).contiguous()
+    new_is_base_t = pick_tensor_row_major(plan.packed_row_is_base_t)
     return replace(
         plan,
         expanded_to_origin=new_eto,
-        packed_sm_origin=pick_row_major(plan.packed_sm_origin),
-        packed_to_origin=pick_row_major(plan.packed_to_origin),
-        packed_row_is_active=pick_row_major(plan.packed_row_is_active),
-        packed_row_is_base=pick_row_major(plan.packed_row_is_base),
-        packed_row_family_rank=pick_row_major(plan.packed_row_family_rank),
+        packed_sm_origin=None if tensor_only_clear else pick_row_major(plan.packed_sm_origin),
+        packed_to_origin=None if tensor_only_clear else pick_row_major(plan.packed_to_origin),
+        packed_row_is_active=None if tensor_only_clear else pick_row_major(plan.packed_row_is_active),
+        packed_row_is_base=None if tensor_only_clear else pick_row_major(plan.packed_row_is_base),
+        packed_row_family_rank=None if tensor_only_clear else pick_row_major(plan.packed_row_family_rank),
         families=new_families,
-        origin_to_family_rows=new_otf,
-        origin_to_base_row=new_otb,
+        origin_to_family_rows=None if tensor_only_clear else new_otf,
+        origin_to_base_row=None if tensor_only_clear else new_otb,
         packed_to_origin_t=pick_tensor_row_major(plan.packed_to_origin_t),
-        packed_sm_origin_t=pick_tensor_row_major(plan.packed_sm_origin_t),
+        packed_sm_origin_t=new_sm_t,
         packed_row_is_active_t=pick_tensor_row_major(plan.packed_row_is_active_t),
+        packed_row_is_base_t=new_is_base_t,
         packed_row_family_rank_t=pick_tensor_row_major(plan.packed_row_family_rank_t),
         row_gather_idx_cpu=new_rg,
+        family_expanded_rows_t=new_fer,
+        origin_to_family_rows_t=new_otf_t,
+        origin_to_base_row_t=new_otb_t if new_otb_t is not None else plan.origin_to_base_row_t,
     )
 
 
@@ -907,7 +1045,12 @@ def _reorder_hybrid_bundle_rows(
     new_plan = None
     if bundle.expansion_plan is not None:
         ep = bundle.expansion_plan
-        if len(ep.expanded_to_origin) == p:
+        if len(ep.expanded_to_origin) == p or (
+            not ep.expanded_to_origin
+            and ep.packed_sm_origin_t is not None
+            and int(ep.packed_sm_origin_t.shape[0]) == p
+            and int(ep.expanded_batch_size) == p
+        ):
             new_plan = _permute_pivot_expansion_plan(ep, perm_old)
     max_spec_len = max(new_lens) if new_lens else bundle.max_spec_len
     return replace(
@@ -981,7 +1124,13 @@ def remap_hybrid_bundle_rows_for_metadata(
 
     if bundle.expansion_plan is not None:
         ep = bundle.expansion_plan
-        if len(ep.expanded_to_origin) != m:
+        eto_ok = len(ep.expanded_to_origin) == m or (
+            not ep.expanded_to_origin
+            and ep.packed_sm_origin_t is not None
+            and int(ep.packed_sm_origin_t.shape[0]) == m
+            and int(ep.expanded_batch_size) == m
+        )
+        if not eto_ok:
             return None, (
                 "expansion_plan expanded_to_origin length does not match bundle rows "
                 f"({len(ep.expanded_to_origin)} vs {m})"
@@ -1013,7 +1162,15 @@ def remap_hybrid_bundle_rows_for_metadata(
         meta = spec_decode_metadata
         if meta is not None and len(meta.num_draft_tokens) == n:
             mep = meta.expansion_plan
-            if mep is not None and len(mep.expanded_to_origin) == n:
+            if mep is not None and (
+                len(mep.expanded_to_origin) == n
+                or (
+                    not mep.expanded_to_origin
+                    and mep.packed_sm_origin_t is not None
+                    and int(mep.packed_sm_origin_t.shape[0]) == n
+                    and int(mep.expanded_batch_size) == n
+                )
+            ):
                 out = replace(out, expansion_plan=mep)
             else:
                 out = replace(out, expansion_plan=None)
@@ -1064,20 +1221,34 @@ def sanitize_hybrid_bundle_for_metadata(
             sanitized = replace(sanitized, source_stage=None)
     if sanitized.expansion_plan is not None:
         plan = sanitized.expansion_plan
-        if plan.expanded_batch_size < 0 or len(plan.expanded_to_origin) != plan.expanded_batch_size:
+        p_sz = int(plan.expanded_batch_size)
+        eto_ok = len(plan.expanded_to_origin) == p_sz or (
+            not plan.expanded_to_origin
+            and plan.packed_sm_origin_t is not None
+            and int(plan.packed_sm_origin_t.shape[0]) == p_sz
+        )
+        if plan.expanded_batch_size < 0 or not eto_ok:
             sanitized = replace(sanitized, expansion_plan=None)
-        elif plan.packed_sm_origin is not None and len(plan.packed_sm_origin) != plan.expanded_batch_size:
+        elif plan.packed_sm_origin is not None and len(plan.packed_sm_origin) != p_sz:
             sanitized = replace(sanitized, expansion_plan=None)
         elif (
             plan.packed_row_is_active is not None
-            and len(plan.packed_row_is_active) != plan.expanded_batch_size
+            and len(plan.packed_row_is_active) != p_sz
         ):
             sanitized = replace(sanitized, expansion_plan=None)
-        elif plan.uses_fixed_capacity_packing and (
-            plan.packed_sm_origin is None
-            or len(plan.packed_sm_origin) != plan.expanded_batch_size
+        elif (
+            plan.packed_row_is_active_t is not None
+            and int(plan.packed_row_is_active_t.shape[0]) != p_sz
         ):
             sanitized = replace(sanitized, expansion_plan=None)
+        elif plan.uses_fixed_capacity_packing:
+            list_ok = plan.packed_sm_origin is not None and len(plan.packed_sm_origin) == p_sz
+            tens_ok = (
+                plan.packed_sm_origin_t is not None
+                and int(plan.packed_sm_origin_t.shape[0]) == p_sz
+            )
+            if not list_ok and not tens_ok:
+                sanitized = replace(sanitized, expansion_plan=None)
         elif not plan.uses_fixed_capacity_packing and len(plan.families) == 0:
             sanitized = replace(sanitized, expansion_plan=None)
     if sanitized.max_spec_len != runner_num_spec_tokens:

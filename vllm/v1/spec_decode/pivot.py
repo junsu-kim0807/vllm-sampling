@@ -56,6 +56,8 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     PivotExpansionPlan,
     PivotTreeFamily,
     RootTopKInfo,
+    pivot_plan_origin_to_base_row_cpu_long,
+    pivot_plan_sm_origin_cpu_long,
 )
 from vllm.v1.spec_decode.staged_delegate_factory import (
     PivotStagedDelegates,
@@ -68,6 +70,74 @@ from vllm.v1.spec_decode.spec_stage_utils import (
 from vllm.v1.spec_decode.utils import create_vllm_config_for_draft_model
 
 logger = init_logger(__name__)
+
+
+def _linear_pivot_tensor_family_meta(
+    *,
+    B: int,
+    num_expand: int,
+    p_extra: int,
+    device: torch.device,
+    dtype_long: torch.dtype,
+    active_b: torch.Tensor,
+    owners_a: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_vals: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Dense tensor metadata for linear fixed-capacity pivot (replaces ``families`` lists)."""
+    Fa = int(active_b.numel())
+    pe = max(int(p_extra), 0)
+    R = 1 + pe
+    max_m = max(int(num_expand) * pe, 1) if pe > 0 else 1
+    o_base = torch.arange(B, dtype=dtype_long, device=device)
+    if Fa == 0:
+        z = torch.empty(0, device=device, dtype=dtype_long)
+        fer_e = z.new_empty((0, R))
+        frk_e = torch.empty((0, R), dtype=torch.int32, device=device)
+        ftid_e = torch.empty((0, R), dtype=torch.int32, device=device)
+        fpr_e = torch.empty((0, R), dtype=torch.float32, device=device)
+        otf = torch.full((B, max_m), -1, dtype=dtype_long, device=device)
+        otc = torch.zeros(B, dtype=torch.int32, device=device)
+        return z, fer_e, frk_e, ftid_e, fpr_e, otf, otc, o_base
+
+    fer = torch.full((Fa, R), -1, dtype=dtype_long, device=device)
+    fer[:, 0] = owners_a.long()
+    rr_exp = torch.arange(pe, dtype=dtype_long, device=device).unsqueeze(0).expand(Fa, pe)
+    fer[:, 1:] = B + active_b.long().unsqueeze(1) * pe + rr_exp
+
+    frk = torch.arange(R, dtype=torch.int32, device=device).unsqueeze(0).expand(Fa, R).clone()
+    own_l = owners_a.long()
+    K = int(topk_ids.shape[1])
+    take = min(R, K)
+    ftid = torch.zeros((Fa, R), dtype=torch.int32, device=device)
+    fpr = torch.zeros((Fa, R), dtype=torch.float32, device=device)
+    ftid[:, :take] = topk_ids[own_l, :take].to(torch.int32)
+    fpr[:, :take] = topk_vals[own_l, :take].to(torch.float32)
+    if take < R:
+        ftid[:, take:] = -1
+        fpr[:, take:] = 0.0
+        frk[:, take:] = -1
+
+    otf = torch.full((B, max_m), -1, dtype=dtype_long, device=device)
+    otc = torch.zeros(B, dtype=torch.int32, device=device)
+    extras = fer[:, 1:].long()
+    for ji in range(Fa):
+        o = int(owners_a[ji].item())
+        ccur = int(otc[o].item())
+        for r in range(pe):
+            if ccur + r < max_m:
+                otf[o, ccur + r] = int(extras[ji, r].item())
+        otc[o] = ccur + pe
+    return owners_a.long(), fer, frk, ftid, fpr, otf, otc, o_base
 
 
 def _chain_spec_token_tree(num_tokens: int) -> str:
@@ -163,32 +233,20 @@ def _collapse_draft_rows_for_scheduler(
     if origin_batch_size <= 0:
         return out_exp[:0]
 
+    base_rows = pivot_plan_origin_to_base_row_cpu_long(plan)
+    if int(base_rows.numel()) < origin_batch_size:
+        raise RuntimeError(
+            "pivot expansion plan base-row map shorter than origin_batch_size "
+            f"({int(base_rows.numel())} < {origin_batch_size})"
+        )
+    ar = torch.arange(origin_batch_size, dtype=torch.long)
     if (
         plan.uses_fixed_capacity_packing
-        and plan.origin_to_base_row is not None
-        and len(plan.origin_to_base_row) >= origin_batch_size
-        and all(int(plan.origin_to_base_row[o]) == o for o in range(origin_batch_size))
+        and torch.equal(base_rows[:origin_batch_size], ar)
     ):
         return out_exp[:origin_batch_size]
 
-    row_ids: list[int] = []
-    if (
-        plan.origin_to_base_row is not None
-        and len(plan.origin_to_base_row) >= origin_batch_size
-    ):
-        row_ids = [int(plan.origin_to_base_row[o]) for o in range(origin_batch_size)]
-    else:
-        expanded_to_origin = plan.expanded_to_origin
-        for origin in range(origin_batch_size):
-            row_ids.append(
-                next(
-                    idx
-                    for idx, orig in enumerate(expanded_to_origin)
-                    if int(orig) == origin
-                )
-            )
-
-    idx = torch.tensor(row_ids, dtype=torch.long, device=out_exp.device)
+    idx = base_rows[:origin_batch_size].to(device=out_exp.device, dtype=torch.long)
     return out_exp.index_select(0, idx)
 
 
@@ -212,22 +270,12 @@ def _pivot_hybrid_bundle_row_req_ids(
         if num_bundle_rows != origin_batch_size:
             return None
         return tuple(req[b] for b in range(num_bundle_rows))
-    rg = getattr(expansion_plan, "row_gather_idx_cpu", None)
-    if rg is not None and int(rg.shape[0]) >= num_bundle_rows:
-        idxs = rg[:num_bundle_rows].tolist()
-        out: list[str] = []
-        for o in idxs:
-            oi = int(o)
-            if oi < 0 or oi >= len(req):
-                return None
-            out.append(req[oi])
-        return tuple(out)
-    sm = expansion_plan.packed_sm_origin or expansion_plan.expanded_to_origin
-    if len(sm) < num_bundle_rows:
+    sm_cpu = pivot_plan_sm_origin_cpu_long(expansion_plan)
+    if int(sm_cpu.shape[0]) < num_bundle_rows:
         return None
     out2: list[str] = []
     for j in range(num_bundle_rows):
-        o = int(sm[j])
+        o = int(sm_cpu[j].item())
         if o < 0 or o >= len(req):
             return None
         out2.append(req[o])
@@ -724,12 +772,33 @@ class PivotProposer:
                     int(fam.candidate_ranks[local_idx]),
                     int(fam.first_token_ids[local_idx]),
                 )
+        fer = expansion_plan.family_expanded_rows_t
+        frk = expansion_plan.family_candidate_ranks_t
+        ftok = expansion_plan.family_first_token_ids_t
+        if (
+            fer is not None
+            and frk is not None
+            and ftok is not None
+            and not expansion_plan.families
+        ):
+            mask = fer >= 0
+            if bool(mask.any().item()):
+                flat_j = fer[mask]
+                flat_r = frk[mask].to(dtype=torch.int64)
+                flat_t = ftok[mask].to(dtype=torch.int64)
+                for idx in range(int(flat_j.numel())):
+                    j = int(flat_j[idx].item())
+                    row_meta[j] = (int(flat_r[idx].item()), int(flat_t[idx].item()))
         p = int(expansion_plan.expanded_batch_size)
         eto = expansion_plan.expanded_to_origin
-        if len(eto) != p:
+        if len(eto) == p:
+            sm_list = eto
+        else:
+            sm_list = pivot_plan_sm_origin_cpu_long(expansion_plan).tolist()
+        if len(sm_list) != p:
             return families
         for j in range(p):
-            origin_row = int(eto[j])
+            origin_row = int(sm_list[j])
             root_rank, root_token_id = row_meta.get(j, (0, 0))
             families.append(
                 PivotTreeFamily(
@@ -755,11 +824,10 @@ class PivotProposer:
         families = self._build_expanded_root_families(expansion_plan=expansion_plan)
         if not families:
             return None
-        b_origin = (
-            int(expansion_plan.origin_batch_size)
-            if expansion_plan.origin_batch_size > 0
-            else max(expansion_plan.expanded_to_origin) + 1
-        )
+        b_origin = int(expansion_plan.origin_batch_size)
+        if b_origin <= 0:
+            sm_cpu = pivot_plan_sm_origin_cpu_long(expansion_plan)
+            b_origin = int(sm_cpu.max().item()) + 1 if sm_cpu.numel() > 0 else 0
         flat_plan = build_family_flatten_order(
             families=families,
             template=template,
@@ -984,8 +1052,18 @@ class PivotProposer:
         epiv = torch.zeros(P, dtype=torch.int32, device=device)
         epiv[:B] = base_piv
 
-        families: list[PivotExpansionFamily] = []
-        origin_to_family_rows: list[list[int]] = [[] for _ in range(B)]
+        topk_vals, topk_ids = torch.topk(
+            pivot_probs[:, 0, :], k=K, dim=-1, largest=True
+        )
+        empty_idx = pivot_probs.new_empty((0,), dtype=torch.long)
+        fog_t: torch.Tensor
+        fer_t: torch.Tensor
+        frk_t: torch.Tensor
+        ftid_t: torch.Tensor
+        fpr_t: torch.Tensor
+        otf_t: torch.Tensor
+        otc_t: torch.Tensor
+        otb_t: torch.Tensor
 
         if num_expand > 0 and p_extra > 0:
             owners_src = selected_sorted_t.to(device=device, dtype=dtype_long)
@@ -1013,9 +1091,6 @@ class PivotProposer:
             is_base_t[js_mat] = False
             fam_rank_t[js_mat] = torch.where(active_cell, rr + 1, torch.full((), -1, device=device, dtype=dtype_long))
 
-            topk_vals, topk_ids = torch.topk(
-                pivot_probs[:, 0, :], k=K, dim=-1, largest=True
-            )
             extra_toks = topk_ids[owner_per_block.unsqueeze(1), rr + 1]
             epiv[js_mat] = torch.where(
                 active_cell,
@@ -1023,48 +1098,82 @@ class PivotProposer:
                 base_piv[own_exp],
             )
 
-            for b in range(num_expand):
-                if not bool(mask_active_block[b].item()):
-                    continue
-                o = int(owner_per_block[b].item())
-                cand_ids = topk_ids[o].detach().cpu().tolist()
-                cand_probs = topk_vals[o].detach().cpu().tolist()
-                expanded_rows = [o] + [int(B + b * p_extra + r) for r in range(p_extra)]
-                families.append(
-                    PivotExpansionFamily(
-                        origin_row=o,
-                        expanded_rows=expanded_rows,
-                        candidate_ranks=list(range(len(cand_ids))),
-                        first_token_ids=[int(x) for x in cand_ids],
-                        first_token_probs=[float(x) for x in cand_probs],
+            active_b = torch.nonzero(mask_active_block, as_tuple=False).view(-1)
+            if int(active_b.numel()) > 0:
+                owners_a = owner_per_block[active_b]
+                fog_t, fer_t, frk_t, ftid_t, fpr_t, otf_t, otc_t, otb_t = (
+                    _linear_pivot_tensor_family_meta(
+                        B=B,
+                        num_expand=num_expand,
+                        p_extra=p_extra,
+                        device=device,
+                        dtype_long=dtype_long,
+                        active_b=active_b,
+                        owners_a=owners_a,
+                        topk_ids=topk_ids,
+                        topk_vals=topk_vals,
                     )
                 )
-                for r in range(p_extra):
-                    origin_to_family_rows[o].append(B + b * p_extra + r)
+            else:
+                fog_t, fer_t, frk_t, ftid_t, fpr_t, otf_t, otc_t, otb_t = (
+                    _linear_pivot_tensor_family_meta(
+                        B=B,
+                        num_expand=num_expand,
+                        p_extra=p_extra,
+                        device=device,
+                        dtype_long=dtype_long,
+                        active_b=empty_idx,
+                        owners_a=empty_idx,
+                        topk_ids=topk_ids,
+                        topk_vals=topk_vals,
+                    )
+                )
+        else:
+            fog_t, fer_t, frk_t, ftid_t, fpr_t, otf_t, otc_t, otb_t = (
+                _linear_pivot_tensor_family_meta(
+                    B=B,
+                    num_expand=num_expand,
+                    p_extra=p_extra,
+                    device=device,
+                    dtype_long=dtype_long,
+                    active_b=empty_idx,
+                    owners_a=empty_idx,
+                    topk_ids=topk_ids,
+                    topk_vals=topk_vals,
+                )
+            )
 
         expanded_pivots = epiv.unsqueeze(-1)
         expanded_probs = pivot_probs[packed_sm_origin_t.long(), :1, :].clone()
-        expanded_to_origin = packed_sm_origin_t.detach().cpu().tolist()
         row_gather_cpu = packed_sm_origin_t.detach().cpu().to(torch.long).contiguous()
         plan = PivotExpansionPlan(
-            expanded_to_origin=expanded_to_origin,
-            families=families,
+            expanded_to_origin=[],
+            families=[],
             expanded_batch_size=P,
             origin_batch_size=B,
             packed_batch_size=P,
-            packed_to_origin=packed_to_origin_t.detach().cpu().tolist(),
-            packed_sm_origin=expanded_to_origin,
-            packed_row_is_active=is_active_t.detach().cpu().tolist(),
-            packed_row_is_base=is_base_t.detach().cpu().tolist(),
-            packed_row_family_rank=fam_rank_t.detach().cpu().tolist(),
-            origin_to_base_row=list(range(B)),
-            origin_to_family_rows=origin_to_family_rows,
+            packed_to_origin=None,
+            packed_sm_origin=None,
+            packed_row_is_active=None,
+            packed_row_is_base=None,
+            packed_row_family_rank=None,
+            origin_to_base_row=None,
+            origin_to_family_rows=None,
             uses_fixed_capacity_packing=True,
             packed_to_origin_t=packed_to_origin_t,
             packed_sm_origin_t=packed_sm_origin_t,
             packed_row_is_active_t=is_active_t,
+            packed_row_is_base_t=is_base_t,
             packed_row_family_rank_t=fam_rank_t,
             row_gather_idx_cpu=row_gather_cpu,
+            family_origin_rows_t=fog_t,
+            family_expanded_rows_t=fer_t,
+            family_candidate_ranks_t=frk_t,
+            family_first_token_ids_t=ftid_t,
+            family_first_token_probs_t=fpr_t,
+            origin_to_family_rows_t=otf_t,
+            origin_to_family_rows_count_t=otc_t,
+            origin_to_base_row_t=otb_t,
         )
         return expanded_pivots, expanded_probs, plan
 
@@ -1119,8 +1228,15 @@ class PivotProposer:
         epiv = torch.zeros(P, dtype=torch.int32, device=device)
         epiv[:B] = base_piv
 
-        families: list[PivotExpansionFamily] = []
-        origin_to_family_rows: list[list[int]] = [[] for _ in range(B)]
+        empty_idx = initial_pivots.new_empty((0,), dtype=torch.long)
+        fog_t: torch.Tensor
+        fer_t: torch.Tensor
+        frk_t: torch.Tensor
+        ftid_t: torch.Tensor
+        fpr_t: torch.Tensor
+        otf_t: torch.Tensor
+        otc_t: torch.Tensor
+        otb_t: torch.Tensor
 
         if num_expand > 0 and p_extra > 0:
             owners_src = selected_sorted_t.to(device=device, dtype=dtype_long)
@@ -1151,47 +1267,81 @@ class PivotProposer:
             extra_toks = tok_mat[owner_per_block.unsqueeze(1), rr + 1]
             epiv[js_mat] = torch.where(active_cell, extra_toks, base_piv[own_exp])
 
-            for b in range(num_expand):
-                if not bool(mask_active_block[b].item()):
-                    continue
-                o = int(owner_per_block[b].item())
-                cand_ids = tok_mat[o].detach().cpu().tolist()
-                cand_probs = pr_mat[o].detach().cpu().tolist()
-                expanded_rows = [o] + [int(B + b * p_extra + r) for r in range(p_extra)]
-                families.append(
-                    PivotExpansionFamily(
-                        origin_row=o,
-                        expanded_rows=expanded_rows,
-                        candidate_ranks=list(range(len(cand_ids))),
-                        first_token_ids=[int(x) for x in cand_ids],
-                        first_token_probs=[float(x) for x in cand_probs],
+            active_b = torch.nonzero(mask_active_block, as_tuple=False).view(-1)
+            if int(active_b.numel()) > 0:
+                owners_a = owner_per_block[active_b]
+                fog_t, fer_t, frk_t, ftid_t, fpr_t, otf_t, otc_t, otb_t = (
+                    _linear_pivot_tensor_family_meta(
+                        B=B,
+                        num_expand=num_expand,
+                        p_extra=p_extra,
+                        device=device,
+                        dtype_long=dtype_long,
+                        active_b=active_b,
+                        owners_a=owners_a,
+                        topk_ids=tok_mat,
+                        topk_vals=pr_mat,
                     )
                 )
-                for r in range(p_extra):
-                    origin_to_family_rows[o].append(B + b * p_extra + r)
+            else:
+                fog_t, fer_t, frk_t, ftid_t, fpr_t, otf_t, otc_t, otb_t = (
+                    _linear_pivot_tensor_family_meta(
+                        B=B,
+                        num_expand=num_expand,
+                        p_extra=p_extra,
+                        device=device,
+                        dtype_long=dtype_long,
+                        active_b=empty_idx,
+                        owners_a=empty_idx,
+                        topk_ids=tok_mat,
+                        topk_vals=pr_mat,
+                    )
+                )
+        else:
+            fog_t, fer_t, frk_t, ftid_t, fpr_t, otf_t, otc_t, otb_t = (
+                _linear_pivot_tensor_family_meta(
+                    B=B,
+                    num_expand=num_expand,
+                    p_extra=p_extra,
+                    device=device,
+                    dtype_long=dtype_long,
+                    active_b=empty_idx,
+                    owners_a=empty_idx,
+                    topk_ids=tok_mat,
+                    topk_vals=pr_mat,
+                )
+            )
 
         expanded_pivots = epiv.unsqueeze(-1)
-        expanded_to_origin = packed_sm_origin_t.detach().cpu().tolist()
         row_gather_cpu = packed_sm_origin_t.detach().cpu().to(torch.long).contiguous()
         plan = PivotExpansionPlan(
-            expanded_to_origin=expanded_to_origin,
-            families=families,
+            expanded_to_origin=[],
+            families=[],
             expanded_batch_size=P,
             origin_batch_size=B,
             packed_batch_size=P,
-            packed_to_origin=packed_to_origin_t.detach().cpu().tolist(),
-            packed_sm_origin=expanded_to_origin,
-            packed_row_is_active=is_active_t.detach().cpu().tolist(),
-            packed_row_is_base=is_base_t.detach().cpu().tolist(),
-            packed_row_family_rank=fam_rank_t.detach().cpu().tolist(),
-            origin_to_base_row=list(range(B)),
-            origin_to_family_rows=origin_to_family_rows,
+            packed_to_origin=None,
+            packed_sm_origin=None,
+            packed_row_is_active=None,
+            packed_row_is_base=None,
+            packed_row_family_rank=None,
+            origin_to_base_row=None,
+            origin_to_family_rows=None,
             uses_fixed_capacity_packing=True,
             packed_to_origin_t=packed_to_origin_t,
             packed_sm_origin_t=packed_sm_origin_t,
             packed_row_is_active_t=is_active_t,
+            packed_row_is_base_t=is_base_t,
             packed_row_family_rank_t=fam_rank_t,
             row_gather_idx_cpu=row_gather_cpu,
+            family_origin_rows_t=fog_t,
+            family_expanded_rows_t=fer_t,
+            family_candidate_ranks_t=frk_t,
+            family_first_token_ids_t=ftid_t,
+            family_first_token_probs_t=fpr_t,
+            origin_to_family_rows_t=otf_t,
+            origin_to_family_rows_count_t=otc_t,
+            origin_to_base_row_t=otb_t,
         )
         return expanded_pivots, None, plan
 
@@ -1240,9 +1390,9 @@ class PivotProposer:
         base_prefix_rows: list[list[int]],
         plan: PivotExpansionPlan,
     ) -> list[list[int]]:
-        sm = plan.packed_sm_origin
-        if sm is None:
-            sm = plan.expanded_to_origin
+        # Tensor-only linear pivot plans omit list ``packed_sm_origin`` / ``expanded_to_origin``;
+        # use canonical CPU gather indices (same contract as ``row_gather_idx_cpu``).
+        sm = pivot_plan_sm_origin_cpu_long(plan).tolist()
         return [list(base_prefix_rows[o]) for o in sm]
 
     def _expand_sampling_metadata_for_plan(
@@ -1251,9 +1401,7 @@ class PivotProposer:
         plan: PivotExpansionPlan,
         expanded_prefix_rows: list[list[int]],
     ) -> SamplingMetadata:
-        sm = plan.packed_sm_origin
-        if sm is None:
-            sm = plan.expanded_to_origin
+        sm = pivot_plan_sm_origin_cpu_long(plan).tolist()
         return slice_sampling_metadata_for_subbatch(
             sampling_metadata,
             sm,
@@ -1270,7 +1418,9 @@ class PivotProposer:
         base_next_token_ids: torch.Tensor,
         base_common_attn_metadata: CommonAttentionMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
-        prefix_rows: list[list[int]],
+        prefix_rows: list[list[int]] | None = None,
+        prefix_tokens: torch.Tensor | None = None,
+        prefix_lengths: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         tuple[
@@ -1295,6 +1445,8 @@ class PivotProposer:
             base_common_attn_metadata=base_common_attn_metadata,
             base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
             prefix_rows=prefix_rows,
+            prefix_tokens=prefix_tokens,
+            prefix_lengths=prefix_lengths,
         )
         assert round_state.bootstrap_complete and round_state.hidden_bundle is not None, (
             "Intermediate bootstrap must produce hidden state bundle before staged proposal."
@@ -1565,12 +1717,14 @@ class PivotProposer:
         base_common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
-        base_prefix_rows: list[list[int]],
+        base_prefix_rows: list[list[int]] | None,
         pivots: torch.Tensor,
         chunk_len: int,
         use_draft_probs: bool,
         pivot_probs: torch.Tensor | None,
         expansion_plan: PivotExpansionPlan | None = None,
+        base_prefix_tokens: torch.Tensor | None = None,
+        base_prefix_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch_size = int(pivots.shape[0])
         out = torch.full(
@@ -1586,22 +1740,40 @@ class PivotProposer:
         if tail_len > 0:
             dev = pivots.device
             pv = pivots.to(torch.int32).reshape(-1)
-            lens_base = torch.tensor(
-                [len(r) for r in base_prefix_rows],
-                device=dev,
-                dtype=torch.long,
-            )
-            max_base = int(lens_base.max().item()) if batch_size else 0
-            pref_t = torch.full(
-                (batch_size, max_base + 1),
-                PLACEHOLDER_TOKEN_ID,
-                dtype=torch.int32,
-                device=dev,
-            )
-            for b, row in enumerate(base_prefix_rows):
-                lb = len(row)
-                if lb:
-                    pref_t[b, :lb] = torch.as_tensor(row, device=dev, dtype=torch.int32)
+            if base_prefix_tokens is not None:
+                assert base_prefix_lengths is not None
+                lens_base = base_prefix_lengths.to(device=dev, dtype=torch.long)
+                max_base = int(lens_base.max().item()) if batch_size else 0
+                pref_t = torch.full(
+                    (batch_size, max_base + 1),
+                    PLACEHOLDER_TOKEN_ID,
+                    dtype=torch.int32,
+                    device=dev,
+                )
+                for b in range(batch_size):
+                    lb = int(lens_base[b].item())
+                    if lb > 0:
+                        pref_t[b, :lb] = base_prefix_tokens[b, :lb].to(
+                            device=dev, dtype=torch.int32
+                        )
+            else:
+                assert base_prefix_rows is not None
+                lens_base = torch.tensor(
+                    [len(r) for r in base_prefix_rows],
+                    device=dev,
+                    dtype=torch.long,
+                )
+                max_base = int(lens_base.max().item()) if batch_size else 0
+                pref_t = torch.full(
+                    (batch_size, max_base + 1),
+                    PLACEHOLDER_TOKEN_ID,
+                    dtype=torch.int32,
+                    device=dev,
+                )
+                for b, row in enumerate(base_prefix_rows):
+                    lb = len(row)
+                    if lb:
+                        pref_t[b, :lb] = torch.as_tensor(row, device=dev, dtype=torch.int32)
             br = torch.arange(batch_size, device=dev, dtype=torch.long)
             pref_t[br, lens_base] = pv
             len_t = lens_base + 1
@@ -1611,11 +1783,6 @@ class PivotProposer:
                 provisional_prefix_tokens=pref_t,
                 provisional_prefix_lengths=len_t,
                 sampled_ids_only=True,
-            )
-            # Proposer / hidden bootstrap still consume list[list[int]]; single
-            # materialization at the API boundary (no per-row pivot tolist path).
-            proposer_prefix_rows = materialize_prefix_rows_from_dense(
-                pref_t, len_t, batch_size
             )
             tail_cad = base_common_attn_metadata
             tail_tok = base_target_token_ids
@@ -1639,11 +1806,11 @@ class PivotProposer:
                     base_common_attn_metadata=base_common_attn_metadata,
                     base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
                 )
-                assert int(tail_cad.batch_size()) == batch_size == len(proposer_prefix_rows)
+                assert int(tail_cad.batch_size()) == batch_size == int(pref_t.shape[0])
                 if _spechive_debug_enabled():
                     logger.info(
-                        "PIVOT_DEBUG tail_contract: prefix_rows=%d cad_rows=%d next_rows=%d",
-                        len(proposer_prefix_rows),
+                        "PIVOT_DEBUG tail_contract: prefix_dense_rows=%d cad_rows=%d next_rows=%d",
+                        int(pref_t.shape[0]),
                         int(tail_cad.batch_size()),
                         int(tail_next.shape[0]),
                     )
@@ -1655,7 +1822,9 @@ class PivotProposer:
                         base_next_token_ids=tail_next,
                         base_common_attn_metadata=tail_cad,
                         base_num_rejected_tokens_gpu=tail_rej,
-                        prefix_rows=proposer_prefix_rows,
+                        prefix_rows=None,
+                        prefix_tokens=pref_t,
+                        prefix_lengths=len_t,
                     )
                 )
             else:
@@ -1667,7 +1836,9 @@ class PivotProposer:
                         base_next_token_ids=base_next_token_ids,
                         base_common_attn_metadata=base_common_attn_metadata,
                         base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-                        prefix_rows=proposer_prefix_rows,
+                        prefix_rows=None,
+                        prefix_tokens=pref_t,
+                        prefix_lengths=len_t,
                     )
                 )
             tail_rows, tail_probs = _propose_chunk_from_prefix(
@@ -1678,11 +1849,13 @@ class PivotProposer:
                 target_hidden_states=proposal_hidden_states,
                 next_token_ids=tail_next,
                 num_rejected_tokens_gpu=tail_rej,
-                prefix_rows=proposer_prefix_rows,
                 chunk_len=tail_len,
                 sampling_metadata=tail_sm,
                 use_draft_probs=use_draft_probs,
                 prefix_prefab=tail_prefix_prefab,
+                prefix_rows=None,
+                prefix_tokens=pref_t,
+                prefix_lengths=len_t,
             )
             out[:, 1 : 1 + tail_len] = tail_rows
 
@@ -1708,10 +1881,12 @@ class PivotProposer:
         base_common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
-        base_prefix_rows: list[list[int]],
         chunk_len: int,
         use_draft_probs: bool,
         enable_topk_expansion: bool,
+        base_prefix_rows: list[list[int]] | None = None,
+        base_prefix_tokens: torch.Tensor | None = None,
+        base_prefix_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, PivotExpansionPlan | None]:
         proposal_hidden_states, pivot_prefix_prefab = (
             self._resolve_hidden_states_for_proposal(
@@ -1722,6 +1897,8 @@ class PivotProposer:
                 base_common_attn_metadata=base_common_attn_metadata,
                 base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
                 prefix_rows=base_prefix_rows,
+                prefix_tokens=base_prefix_tokens,
+                prefix_lengths=base_prefix_lengths,
             )
         )
         pivots, pivot_probs = _propose_chunk_from_prefix(
@@ -1732,11 +1909,13 @@ class PivotProposer:
             target_hidden_states=proposal_hidden_states,
             next_token_ids=base_next_token_ids,
             num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-            prefix_rows=base_prefix_rows,
             chunk_len=1,
             sampling_metadata=sampling_metadata,
             use_draft_probs=use_draft_probs,
             prefix_prefab=pivot_prefix_prefab,
+            prefix_rows=base_prefix_rows,
+            prefix_tokens=base_prefix_tokens,
+            prefix_lengths=base_prefix_lengths,
         )
         pivots = pivots.to(torch.int32)[:, :1]
         batch_size = int(pivots.shape[0])
@@ -1795,25 +1974,57 @@ class PivotProposer:
                     if int(batch_size) > 0
                     else 0.0
                 )
-                for _fi, _fam in enumerate(expansion_plan.families):
-                    _origin_b = int(getattr(_fam, "origin_row", -1))
-                    _origin_rid = (
-                        self.runner.input_batch.req_ids[_origin_b]
-                        if 0 <= _origin_b < len(self.runner.input_batch.req_ids)
-                        else ""
-                    )
-                    _ec_prof.emit_family_metadata(
-                        SpecDecodeFamilyMetadataRecord(
-                            step_id=getattr(_pctx, "step_id", 0),
-                            family_id=f"{_origin_rid}:f{_fi}",
-                            origin_req_id=_origin_rid,
-                            family_stage="expand",
-                            family_width_before=1,
-                            family_width_after=len(getattr(_fam, "expanded_rows", [])),
-                            topk_k=len(getattr(_fam, "candidate_ranks", [])),
-                            expansion_pct=_exp_pct,
+                if expansion_plan.families:
+                    for _fi, _fam in enumerate(expansion_plan.families):
+                        _origin_b = int(getattr(_fam, "origin_row", -1))
+                        _origin_rid = (
+                            self.runner.input_batch.req_ids[_origin_b]
+                            if 0 <= _origin_b < len(self.runner.input_batch.req_ids)
+                            else ""
                         )
-                    )
+                        _ec_prof.emit_family_metadata(
+                            SpecDecodeFamilyMetadataRecord(
+                                step_id=getattr(_pctx, "step_id", 0),
+                                family_id=f"{_origin_rid}:f{_fi}",
+                                origin_req_id=_origin_rid,
+                                family_stage="expand",
+                                family_width_before=1,
+                                family_width_after=len(
+                                    getattr(_fam, "expanded_rows", [])
+                                ),
+                                topk_k=len(getattr(_fam, "candidate_ranks", [])),
+                                expansion_pct=_exp_pct,
+                            )
+                        )
+                elif expansion_plan.family_origin_rows_t is not None:
+                    _fog = expansion_plan.family_origin_rows_t
+                    _fer = expansion_plan.family_expanded_rows_t
+                    for _fi in range(int(_fog.shape[0])):
+                        _origin_b = int(_fog[_fi].item())
+                        _origin_rid = (
+                            self.runner.input_batch.req_ids[_origin_b]
+                            if 0 <= _origin_b < len(self.runner.input_batch.req_ids)
+                            else ""
+                        )
+                        _w = (
+                            int((_fer[_fi] >= 0).sum().item())
+                            if _fer is not None
+                            else 1
+                        )
+                        _ec_prof.emit_family_metadata(
+                            SpecDecodeFamilyMetadataRecord(
+                                step_id=getattr(_pctx, "step_id", 0),
+                                family_id=f"{_origin_rid}:f{_fi}",
+                                origin_req_id=_origin_rid,
+                                family_stage="expand",
+                                family_width_before=1,
+                                family_width_after=_w,
+                                topk_k=int(expansion_plan.family_candidate_ranks_t.shape[1])
+                                if expansion_plan.family_candidate_ranks_t is not None
+                                else 0,
+                                expansion_pct=_exp_pct,
+                            )
+                        )
         if expansion_plan is not None:
             self._active_pivot_expansion_plan = expansion_plan
             if self._pivot_spechive:
@@ -1829,9 +2040,15 @@ class PivotProposer:
         if expansion_plan is not None:
             if _ec_prof is not None:
                 _ec_prof.start_stage("expand_collapse", invocation_idx=0)
-            exp_prefix = self._expand_prefix_rows_for_plan(
-                base_prefix_rows, expansion_plan
-            )
+            br_list = base_prefix_rows
+            if br_list is None:
+                assert base_prefix_tokens is not None and base_prefix_lengths is not None
+                br_list = materialize_prefix_rows_from_dense(
+                    base_prefix_tokens,
+                    base_prefix_lengths,
+                    int(base_prefix_tokens.shape[0]),
+                )
+            exp_prefix = self._expand_prefix_rows_for_plan(br_list, expansion_plan)
             exp_sm = self._expand_sampling_metadata_for_plan(
                 sampling_metadata, expansion_plan, exp_prefix
             )
@@ -1853,6 +2070,12 @@ class PivotProposer:
             use_draft_probs=use_draft_probs,
             pivot_probs=pivot_probs_rows,
             expansion_plan=expansion_plan,
+            base_prefix_tokens=(
+                base_prefix_tokens if expansion_plan is None else None
+            ),
+            base_prefix_lengths=(
+                base_prefix_lengths if expansion_plan is None else None
+            ),
         )
         if expansion_plan is not None:
             p_out = int(out.shape[0])
@@ -2007,16 +2230,24 @@ class PivotProposer:
         base_next_token_ids: torch.Tensor,
         base_common_attn_metadata: CommonAttentionMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
-        prefix_rows: list[list[int]],
         chunk_len: int,
         sampling_metadata: SamplingMetadata,
         use_draft_probs: bool,
+        prefix_rows: list[list[int]] | None = None,
+        prefix_tokens: torch.Tensor | None = None,
+        prefix_lengths: torch.Tensor | None = None,
     ) -> DitRoundProposal:
         origin_bs = int(base_common_attn_metadata.batch_size())
+        if prefix_tokens is not None:
+            assert prefix_lengths is not None
+            prefix_empty = int(prefix_lengths.sum().item()) == 0
+        else:
+            assert prefix_rows is not None
+            prefix_empty = all(len(r) == 0 for r in prefix_rows)
         enable_topk = (
             self._topk_selection > 1
             and origin_bs >= self._min_batch_for_expansion
-            and all(len(r) == 0 for r in prefix_rows)
+            and prefix_empty
             and not self._is_waiting_for_target_collapse
             and not (
                 self._pivot_spechive and self._active_pivot_expansion_plan is not None
@@ -2030,10 +2261,12 @@ class PivotProposer:
             base_common_attn_metadata=base_common_attn_metadata,
             sampling_metadata=sampling_metadata,
             base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-            base_prefix_rows=prefix_rows,
             chunk_len=chunk_len,
             use_draft_probs=use_draft_probs,
             enable_topk_expansion=enable_topk,
+            base_prefix_rows=prefix_rows,
+            base_prefix_tokens=prefix_tokens,
+            base_prefix_lengths=prefix_lengths,
         )
         if (
             expansion_plan is None
@@ -2074,17 +2307,24 @@ class PivotProposer:
         base_next_token_ids: torch.Tensor,
         base_common_attn_metadata: CommonAttentionMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
-        prefix_rows: list[list[int]],
         candidate_tokens: torch.Tensor,
+        prefix_rows: list[list[int]] | None = None,
+        prefix_tokens: torch.Tensor | None = None,
+        prefix_lengths: torch.Tensor | None = None,
     ) -> DitRoundVerification:
-        # When topk expansion is active, prefix_rows is expanded (length P)
-        # while the base tensors / CAD still reflect the origin batch (B).
-        # Expand frontier inputs so the intermediate verifier sees matching
-        # batch dimensions.
+        assert (prefix_rows is not None) or (
+            prefix_tokens is not None and prefix_lengths is not None
+        )
+        # When topk expansion is active, prefix batch rows (P) may exceed origin
+        # CAD batch (B). Expand frontier inputs so the intermediate verifier
+        # sees matching batch dimensions.
         plan = self._active_pivot_expansion_plan
-        if plan is not None and len(prefix_rows) != int(
-            base_common_attn_metadata.batch_size()
-        ):
+        n_prefix = (
+            int(prefix_tokens.shape[0])
+            if prefix_tokens is not None
+            else len(prefix_rows)  # type: ignore[arg-type]
+        )
+        if plan is not None and n_prefix != int(base_common_attn_metadata.batch_size()):
             (
                 base_target_token_ids,
                 base_target_positions,
@@ -2117,6 +2357,8 @@ class PivotProposer:
                 base_common_attn_metadata=base_common_attn_metadata,
                 base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
                 prefix_rows=prefix_rows,
+                prefix_tokens=prefix_tokens,
+                prefix_lengths=prefix_lengths,
             )
             assert round_state.hidden_bundle is not None
             verifier_round_state = round_state
@@ -2162,8 +2404,10 @@ class PivotProposer:
                 target_hidden_states=verifier_hidden_states,
                 next_token_ids=base_next_token_ids,
                 num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-                prefix_rows=prefix_rows,
                 draft_tokens=candidate_tokens.to(torch.int32),
+                prefix_rows=prefix_rows,
+                prefix_tokens=prefix_tokens,
+                prefix_lengths=prefix_lengths,
             )
         return DitRoundVerification(logits_flat=logits_flat, bonus_logits=bonus_logits)
 

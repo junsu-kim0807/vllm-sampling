@@ -56,7 +56,9 @@ class HiddenStateProvider(Protocol):
         base_next_token_ids: torch.Tensor,
         base_common_attn_metadata: CommonAttentionMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
-        prefix_rows: list[list[int]],
+        prefix_rows: list[list[int]] | None = None,
+        prefix_tokens: torch.Tensor | None = None,
+        prefix_lengths: torch.Tensor | None = None,
     ) -> IntermediateRoundState: ...
 
 
@@ -143,7 +145,9 @@ class IntermediateModelStateProvider:
         base_next_token_ids: torch.Tensor,
         base_common_attn_metadata: CommonAttentionMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
-        prefix_rows: list[list[int]],
+        prefix_rows: list[list[int]] | None = None,
+        prefix_tokens: torch.Tensor | None = None,
+        prefix_lengths: torch.Tensor | None = None,
     ) -> StagedHiddenStateBundle:
         (
             pref_toks,
@@ -163,6 +167,8 @@ class IntermediateModelStateProvider:
             next_token_ids=base_next_token_ids,
             prefix_rows=prefix_rows,
             roll_rows=None,
+            prefix_tokens=prefix_tokens,
+            prefix_lengths=prefix_lengths,
         )
         # When the proposer has needs_extra_input_slots (e.g. draft_model with
         # pass_hidden_states_to_model=False), set_inputs_first_pass will call
@@ -292,7 +298,9 @@ class IntermediateModelStateProvider:
         base_next_token_ids: torch.Tensor,
         base_common_attn_metadata: CommonAttentionMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
-        prefix_rows: list[list[int]],
+        prefix_rows: list[list[int]] | None = None,
+        prefix_tokens: torch.Tensor | None = None,
+        prefix_lengths: torch.Tensor | None = None,
     ) -> IntermediateRoundState:
         bundle = self._forward_hidden_states(
             base_target_token_ids=base_target_token_ids,
@@ -302,6 +310,8 @@ class IntermediateModelStateProvider:
             base_common_attn_metadata=base_common_attn_metadata,
             base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
             prefix_rows=prefix_rows,
+            prefix_tokens=prefix_tokens,
+            prefix_lengths=prefix_lengths,
         )
         return IntermediateRoundState(
             hidden_bundle=bundle,

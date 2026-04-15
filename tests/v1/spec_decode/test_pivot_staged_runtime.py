@@ -417,9 +417,11 @@ def test_build_pivot_expansion_plan_from_root_topk_when_probs_missing() -> None:
     assert ep.shape[0] == 5
     assert plan.row_gather_idx_cpu is not None
     assert plan.packed_sm_origin_t is not None
+    assert plan.expanded_to_origin == []
+    assert plan.family_expanded_rows_t is not None
     assert torch.equal(
         plan.row_gather_idx_cpu,
-        torch.tensor(plan.packed_sm_origin or [], dtype=torch.long),
+        plan.packed_sm_origin_t.detach().cpu().to(torch.long).contiguous(),
     )
 
 

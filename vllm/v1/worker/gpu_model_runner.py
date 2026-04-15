@@ -12,6 +12,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
+from types import SimpleNamespace
 from dataclasses import dataclass, replace as dataclass_replace
 from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
@@ -193,11 +194,9 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     _split_probs_by_lengths,
     expand_hybrid_bundle_for_pivot_expansion,
     pivot_expansion_indices_fit_prepare_batch,
+    pivot_plan_origin_to_base_row_cpu_long,
 )
-from vllm.v1.spec_decode.spec_stage_utils import (
-    materialize_prefix_rows_from_dense,
-    slice_sampling_metadata_for_subbatch,
-)
+from vllm.v1.spec_decode.spec_stage_utils import slice_sampling_metadata_for_subbatch
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.tetris import apply_tetris
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
@@ -244,24 +243,15 @@ def _pivot_origin_row_num_draft_tokens(
 ) -> list[int]:
     """Per-origin draft widths for post-collapse rows (one row per origin request)."""
     meta_nd = spec_decode_metadata.num_draft_tokens
-    b_origin = (
-        int(expansion_plan.origin_batch_size)
-        if expansion_plan.origin_batch_size > 0
-        else max(expansion_plan.expanded_to_origin) + 1
-    )
+    base_rows = pivot_plan_origin_to_base_row_cpu_long(expansion_plan)
+    b_origin = int(base_rows.numel())
     out: list[int] = []
     for o in range(b_origin):
-        if (
-            expansion_plan.origin_to_base_row is not None
-            and o < len(expansion_plan.origin_to_base_row)
-            and int(expansion_plan.origin_to_base_row[o]) >= 0
-        ):
-            j = int(expansion_plan.origin_to_base_row[o])
-        else:
-            j = next(
-                idx
-                for idx, org in enumerate(expansion_plan.expanded_to_origin)
-                if org == o
+        j = int(base_rows[o].item())
+        if j < 0 or j >= len(meta_nd):
+            raise RuntimeError(
+                "missing pivot base row mapping for origin "
+                f"{o} (j={j}, meta_rows={len(meta_nd)}, plan_b={b_origin})"
             )
         out.append(int(meta_nd[j]))
     return out
@@ -320,7 +310,25 @@ def _pivot_plan_sm_indices(plan: PivotExpansionPlan) -> list[int]:
     """Sampling-metadata / list-index origins: always in ``[0, B)`` (never ``packed_to_origin``)."""
     if plan.packed_sm_origin is not None:
         return plan.packed_sm_origin
+    p = int(plan.expanded_batch_size)
+    rg = getattr(plan, "row_gather_idx_cpu", None)
+    if rg is not None and int(rg.shape[0]) == p:
+        return rg.detach().cpu().tolist()
+    if plan.packed_sm_origin_t is not None:
+        return plan.packed_sm_origin_t.detach().cpu().tolist()
     return plan.expanded_to_origin
+
+
+def _pivot_plan_expanded_origin_map_len_ok(plan: PivotExpansionPlan) -> bool:
+    """True when per-row origin mapping is available for ``expanded_batch_size`` rows."""
+    p = int(plan.expanded_batch_size)
+    if len(plan.expanded_to_origin) == p:
+        return True
+    return (
+        not plan.expanded_to_origin
+        and plan.packed_sm_origin_t is not None
+        and int(plan.packed_sm_origin_t.shape[0]) == p
+    )
 
 
 def _hybrid_bundle_row_req_ids_for_batch(
@@ -511,29 +519,21 @@ def _collapse_draft_tensor_rows_for_scheduler(
     if batch_size <= 0:
         return out_exp[:0]
 
-    # Fixed-capacity pivot invariant: base rows are [0, B) in origin order.
+    base_rows = pivot_plan_origin_to_base_row_cpu_long(plan)
+    if int(base_rows.numel()) < batch_size:
+        raise RuntimeError(
+            "pivot expansion plan base-row map shorter than batch_size "
+            f"({int(base_rows.numel())} < {batch_size})"
+        )
+    ar = torch.arange(batch_size, dtype=torch.long)
+    # Fixed-capacity pivot invariant: base rows are ``[0, B)`` in origin order.
     if (
         plan.uses_fixed_capacity_packing
-        and plan.origin_to_base_row is not None
-        and len(plan.origin_to_base_row) >= batch_size
-        and all(int(plan.origin_to_base_row[o]) == o for o in range(batch_size))
+        and torch.equal(base_rows[:batch_size], ar)
     ):
         return out_exp[:batch_size]
 
-    row_ids: list[int] = []
-    if (
-        plan.origin_to_base_row is not None
-        and len(plan.origin_to_base_row) >= batch_size
-    ):
-        row_ids = [int(plan.origin_to_base_row[o]) for o in range(batch_size)]
-    else:
-        expanded_to_origin = plan.expanded_to_origin
-        for o in range(batch_size):
-            row_ids.append(
-                next(idx for idx, orig in enumerate(expanded_to_origin) if int(orig) == o)
-            )
-
-    idx = torch.tensor(row_ids, dtype=torch.long, device=out_exp.device)
+    idx = base_rows[:batch_size].to(device=out_exp.device, dtype=torch.long)
     return out_exp.index_select(0, idx)
 
 
@@ -2211,7 +2211,7 @@ class GPUModelRunner(
                 pivot_plan is not None
                 and pb is not None
                 and pivot_plan.expanded_batch_size > 0
-                and len(pivot_plan.expanded_to_origin) == pivot_plan.expanded_batch_size
+                and _pivot_plan_expanded_origin_map_len_ok(pivot_plan)
                 and len(pb.num_draft_tokens) == pivot_plan.expanded_batch_size
             ):
                 if pb.expansion_plan is not pivot_plan:
@@ -2235,7 +2235,7 @@ class GPUModelRunner(
                 pivot_plan is not None
                 and pb is not None
                 and pivot_plan.expanded_batch_size > 0
-                and len(pivot_plan.expanded_to_origin) == pivot_plan.expanded_batch_size
+                and _pivot_plan_expanded_origin_map_len_ok(pivot_plan)
                 and len(pb.num_draft_tokens) == pivot_plan.expanded_batch_size
             )
             if use_pivot_expanded:
@@ -2250,20 +2250,15 @@ class GPUModelRunner(
                 assert int(pb.draft_token_ids.shape[0]) == int(
                     pb.cu_num_draft_tokens[-1].item()
                 ), "bundle flat draft rows must match cu_num_draft_tokens tail"
-                if (
-                    pivot_plan.uses_fixed_capacity_packing
-                    and pivot_plan.packed_sm_origin is not None
-                    and pivot_plan.packed_row_is_active is not None
-                ):
+                if pivot_plan.uses_fixed_capacity_packing:
                     P = pivot_plan.packed_batch_size
                     num_draft_meta = np.zeros(P, dtype=np.int32)
                     cu_meta = np.zeros(P, dtype=np.int32)
-                    sm = pivot_plan.packed_sm_origin
-                    active = pivot_plan.packed_row_is_active
+                    sm = _pivot_plan_sm_indices(pivot_plan)
                     for j in range(P):
                         o = int(sm[j])
                         cu_meta[j] = cu_num_tokens[o]
-                        if active[j]:
+                        if self._pivot_profile_row_is_active(pivot_plan, j):
                             num_draft_meta[j] = num_draft_tokens[o]
                 else:
                     num_draft_meta = num_draft_tokens[pivot_plan.expanded_to_origin]
@@ -2340,13 +2335,14 @@ class GPUModelRunner(
                 and spec_decode_metadata is not None
                 and spec_decode_metadata.expansion_plan is not None
                 and spec_decode_metadata.expansion_plan.uses_fixed_capacity_packing
-                and spec_decode_metadata.expansion_plan.packed_sm_origin is not None
+                and _pivot_plan_expanded_origin_map_len_ok(
+                    spec_decode_metadata.expansion_plan
+                )
             )
             if packed_lora:
                 exp_plan = spec_decode_metadata.expansion_plan
-                assert exp_plan.packed_sm_origin is not None
                 req_lora = self.input_batch.request_lora_mapping[:num_reqs]
-                sm = exp_plan.packed_sm_origin
+                sm = _pivot_plan_sm_indices(exp_plan)
                 P = exp_plan.packed_batch_size
                 prompt_lora_mapping = tuple(
                     int(req_lora[int(sm[j])])
@@ -3695,6 +3691,9 @@ class GPUModelRunner(
     ) -> bool:
         if expansion_plan is None:
             return True
+        act_t = expansion_plan.packed_row_is_active_t
+        if act_t is not None and 0 <= row_idx < int(act_t.shape[0]):
+            return bool(act_t[row_idx].item())
         active = expansion_plan.packed_row_is_active
         if active is None:
             return True
@@ -3722,7 +3721,15 @@ class GPUModelRunner(
 
         if expansion_plan is not None:
             sm = expansion_plan.packed_sm_origin
-            if sm is None or len(sm) != len(bundle.num_draft_tokens):
+            if sm is not None and len(sm) == len(bundle.num_draft_tokens):
+                pass
+            elif (
+                expansion_plan.packed_sm_origin_t is not None
+                and int(expansion_plan.packed_sm_origin_t.shape[0])
+                == len(bundle.num_draft_tokens)
+            ):
+                sm = expansion_plan.packed_sm_origin_t.detach().cpu().tolist()
+            else:
                 sm = expansion_plan.expanded_to_origin
             for row_idx, origin_row in enumerate(sm):
                 if not self._pivot_profile_row_is_active(expansion_plan, row_idx):
@@ -3776,7 +3783,7 @@ class GPUModelRunner(
         accepted_lens: list[int] | None,
         req_ids: list[str],
     ) -> None:
-        if expansion_plan is None or not expansion_plan.families:
+        if expansion_plan is None:
             return
         if selected_rows is None or accepted_lens is None:
             return
@@ -3798,7 +3805,33 @@ class GPUModelRunner(
             else 0.0
         )
 
-        for fam_idx, fam in enumerate(expansion_plan.families):
+        if expansion_plan.families:
+            fam_iter = list(enumerate(expansion_plan.families))
+        elif expansion_plan.family_origin_rows_t is not None:
+            fog = expansion_plan.family_origin_rows_t
+            fer = expansion_plan.family_expanded_rows_t
+            frk = expansion_plan.family_candidate_ranks_t
+            if fer is None or frk is None:
+                return
+            fam_iter = []
+            for fi in range(int(fog.shape[0])):
+                o = int(fog[fi].item())
+                rows = [int(x) for x in fer[fi][fer[fi] >= 0].tolist()]
+                ranks = [int(x) for x in frk[fi][fer[fi] >= 0].tolist()]
+                fam_iter.append(
+                    (
+                        fi,
+                        SimpleNamespace(
+                            origin_row=o,
+                            expanded_rows=rows,
+                            candidate_ranks=ranks,
+                        ),
+                    )
+                )
+        else:
+            return
+
+        for fam_idx, fam in fam_iter:
             origin_row = int(fam.origin_row)
             if not (0 <= origin_row < len(selected_rows) and origin_row < len(req_ids)):
                 continue
@@ -3926,9 +3959,6 @@ class GPUModelRunner(
             expected_prefix_len = prefix_len.clone()
             expected_prefix_src = prefix_src.clone()
 
-        def _materialize_prefix_rows(num_rows: int) -> list[list[int]]:
-            """List materialization only at draft/verify API boundaries (see DitPrefixState)."""
-            return materialize_prefix_rows_from_dense(prefix_tok, prefix_len, num_rows)
         inter_verified_rows = torch.zeros(batch_size, dtype=torch.int32)
         inter_accepted_rows = torch.zeros(batch_size, dtype=torch.int32)
         pivot_expansion_plan: PivotExpansionPlan | None = None
@@ -3989,10 +4019,11 @@ class GPUModelRunner(
                 base_next_token_ids=next_token_ids,
                 base_common_attn_metadata=common_attn_metadata,
                 base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                prefix_rows=_materialize_prefix_rows(cur_bs),
                 chunk_len=L,
                 sampling_metadata=round_sm,
                 use_draft_probs=use_draft_probs,
+                prefix_tokens=prefix_tok[:cur_bs],
+                prefix_lengths=prefix_len[:cur_bs],
             )
             _hv_prof.end_stage("draft_forward",
                                invocation_idx=round_idx)
@@ -4164,8 +4195,9 @@ class GPUModelRunner(
                 base_next_token_ids=next_token_ids,
                 base_common_attn_metadata=common_attn_metadata,
                 base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                prefix_rows=_materialize_prefix_rows(eff_bs),
                 candidate_tokens=proposal.tokens,
+                prefix_tokens=prefix_tok[:eff_bs],
+                prefix_lengths=prefix_len[:eff_bs],
             )
             _hv_prof.end_stage("intermediate_verify",
                                invocation_idx=round_idx)
@@ -4300,7 +4332,6 @@ class GPUModelRunner(
                 provisional_prefix_lengths=prefix_len[:nt],
                 sampled_ids_only=True,
             )
-            tail_prefix_rows = _materialize_prefix_rows(n_prefix)
             tail = drafter.propose_chunk_from_prefix(
                 base_target_token_ids=target_token_ids,
                 base_target_positions=target_positions,
@@ -4308,10 +4339,11 @@ class GPUModelRunner(
                 base_next_token_ids=next_token_ids,
                 base_common_attn_metadata=common_attn_metadata,
                 base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                prefix_rows=tail_prefix_rows,
                 chunk_len=tail_len,
                 sampling_metadata=tail_sm,
                 use_draft_probs=use_draft_probs,
+                prefix_tokens=prefix_tok[:n_prefix],
+                prefix_lengths=prefix_len[:n_prefix],
             )
             if tail.expansion_plan is not None and pivot_expansion_plan is None:
                 pivot_expansion_plan = tail.expansion_plan
@@ -4585,8 +4617,8 @@ class GPUModelRunner(
         """Request id per ``meta.num_draft_tokens`` row (matches prepare-time layout)."""
         n = len(meta.num_draft_tokens)
         plan = meta.expansion_plan
-        if plan is not None and plan.packed_sm_origin is not None:
-            sm = plan.packed_sm_origin
+        if plan is not None:
+            sm = _pivot_plan_sm_indices(plan)
             if len(sm) >= n:
                 return [str(self.input_batch.req_ids[int(sm[j])]) for j in range(n)]
         if plan is not None and len(plan.expanded_to_origin) >= n:
@@ -4767,7 +4799,7 @@ class GPUModelRunner(
             if (
                 plan is not None
                 and plan.expanded_batch_size > 0
-                and len(plan.expanded_to_origin) == plan.expanded_batch_size
+                and _pivot_plan_expanded_origin_map_len_ok(plan)
                 and len(spec_decode_metadata.num_draft_tokens)
                 == plan.expanded_batch_size
             ):
