@@ -841,6 +841,11 @@ class GPUModelRunner(
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(self.sampler)
+        else:
+            # No speculative decoding (or not the last PP rank): sampling paths
+            # must not assume ``self.drafter`` / ``self.rejection_sampler`` exist.
+            self.drafter = None
+            self.rejection_sampler = None
         self.pending_hybrid_spec_bundle: HybridProposalBundle | None = None
         self.pending_pivot_expansion_plan: PivotExpansionPlan | None = None
         self._dit_debug_enabled = (
@@ -2444,7 +2449,11 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if (
+                self.speculative_config
+                and self.drafter is not None
+                and spec_decode_common_attn_metadata is None
+            ):
                 drafter_kv_gid = getattr(self.drafter, "kv_cache_gid", None)
                 if drafter_kv_gid is not None:
                     if int(drafter_kv_gid) == kv_cache_gid:
@@ -3452,6 +3461,17 @@ class GPUModelRunner(
             bundle.expansion_plan if bundle is not None else None
         )
 
+    def _discard_drafter_pending_hierarchical_state(self) -> None:
+        """Drop staged spechive/pivot state on the drafter when present."""
+        drafter = self.drafter
+        if drafter is None:
+            return
+        discard = getattr(
+            drafter, "discard_pending_hierarchical_verification_state", None
+        )
+        if callable(discard):
+            discard()
+
     def _take_drafter_staged_hybrid_and_publish(
         self,
         spec_decode_metadata: SpecDecodeMetadata | None,
@@ -3463,6 +3483,9 @@ class GPUModelRunner(
         ``CommonAttentionMetadata.num_reqs``, when mixed prefill/decode or split
         decode applies.
         """
+        if self.drafter is None:
+            self.set_pending_hybrid_spec_bundle(None)
+            return
         take_bundle = getattr(self.drafter, "take_pending_spechive_bundle", None)
         if not callable(take_bundle):
             self.set_pending_hybrid_spec_bundle(None)
@@ -3491,12 +3514,9 @@ class GPUModelRunner(
         if (
             self.speculative_config is not None
             and self.speculative_config.method == "pivot"
+            and self.drafter is not None
         ):
-            discard_pending_state = getattr(
-                self.drafter, "discard_pending_hierarchical_verification_state", None
-            )
-            if callable(discard_pending_state):
-                discard_pending_state()
+            self._discard_drafter_pending_hierarchical_state()
         if self._is_dit_debug_enabled():
             suffix = f" ({detail})" if detail else ""
             logger.warning(
@@ -4384,11 +4404,7 @@ class GPUModelRunner(
         if spec_decode_metadata is None:
             self.pending_hybrid_spec_bundle = None
             self.pending_pivot_expansion_plan = None
-            discard_pending_state = getattr(
-                self.drafter, "discard_pending_hierarchical_verification_state", None
-            )
-            if callable(discard_pending_state):
-                discard_pending_state()
+            self._discard_drafter_pending_hierarchical_state()
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
@@ -4404,6 +4420,7 @@ class GPUModelRunner(
         if (
             self.speculative_config is not None
             and self.speculative_config.use_draft_probs_in_rejection
+            and self.drafter is not None
         ):
             draft_probs = getattr(self.drafter, "last_draft_probs_flat", None)
         bundle = self.take_pending_hybrid_spec_bundle()
@@ -4434,11 +4451,7 @@ class GPUModelRunner(
                         remap_info,
                     )
                 self.pending_pivot_expansion_plan = None
-                discard_pending_state = getattr(
-                    self.drafter, "discard_pending_hierarchical_verification_state", None
-                )
-                if callable(discard_pending_state):
-                    discard_pending_state()
+                self._discard_drafter_pending_hierarchical_state()
                 bundle = None
             else:
                 bundle = remapped
@@ -4467,11 +4480,7 @@ class GPUModelRunner(
                     "spechive_bundle_cleanup_on_validation_failure",
                     {"reason": "bundle_validation_failed"},
                 )
-                discard_pending_state = getattr(
-                    self.drafter, "discard_pending_hierarchical_verification_state", None
-                )
-                if callable(discard_pending_state):
-                    discard_pending_state()
+                self._discard_drafter_pending_hierarchical_state()
             bundle = validated_bundle
         if bundle is not None and bundle.draft_probs is not None:
             draft_probs = bundle.draft_probs
@@ -4690,11 +4699,12 @@ class GPUModelRunner(
         if (
             self.speculative_config is not None
             and self.speculative_config.use_draft_probs_in_rejection
+            and self.drafter is not None
         ):
             clear_fn = getattr(self.drafter, "clear_draft_probs", None)
             if clear_fn is not None:
                 clear_fn()
-        if bundle is not None:
+        if bundle is not None and self.drafter is not None:
             on_target_verification = getattr(
                 self.drafter, "on_target_verification", None
             )
@@ -6121,7 +6131,49 @@ class GPUModelRunner(
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
         self.draft_token_ids_event.synchronize()
-        return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
+        rows = self.draft_token_ids_cpu[: len(req_ids)].tolist()
+        # Match prior list export from ``propose_draft_token_ids``: omit placeholder
+        # draft ids for the scheduler while keeping the full padded tensor on GPU
+        # for async input-id scatter.
+        return (
+            [
+                [int(tok) for tok in row if int(tok) != PLACEHOLDER_TOKEN_ID]
+                for row in rows
+            ],
+            req_ids,
+        )
+
+    def _pad_ragged_draft_token_lists_to_tensor(
+        self, rows: list[list[int]]
+    ) -> torch.Tensor:
+        """Pack per-request draft token lists into a dense GPU tensor.
+
+        ``apply_tetris`` returns ragged Python lists; async
+        :meth:`_prepare_input_ids` requires ``_draft_token_ids`` to be a
+        tensor shaped ``(batch, num_spec_tokens)`` with
+        ``PLACEHOLDER_TOKEN_ID`` padding so scatter indices stay valid.
+        """
+        if not rows:
+            return torch.empty(
+                (0, self.num_spec_tokens),
+                device=self.device,
+                dtype=torch.int64,
+            )
+        out = torch.full(
+            (len(rows), self.num_spec_tokens),
+            PLACEHOLDER_TOKEN_ID,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        for i, row in enumerate(rows):
+            if not row:
+                continue
+            li = min(len(row), self.num_spec_tokens)
+            if li:
+                out[i, :li] = torch.tensor(
+                    row[:li], device=self.device, dtype=torch.int64
+                )
+        return out
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
@@ -6380,7 +6432,7 @@ class GPUModelRunner(
             and hasattr(self.drafter, "last_draft_logprobs")
             and self.drafter.last_draft_logprobs is not None
         ):
-            draft_token_ids = apply_tetris(
+            tetris_rows = apply_tetris(
                 draft_token_ids=draft_token_ids,
                 draft_token_logprobs=self.drafter.last_draft_logprobs,
                 base_k=getattr(spec_config, "tetris_base_k", None)
@@ -6392,28 +6444,36 @@ class GPUModelRunner(
                     spec_config, "tetris_turn_on_batch_size", None
                 ),
             )
-        elif isinstance(draft_token_ids, torch.Tensor):
+            draft_token_ids = self._pad_ragged_draft_token_lists_to_tensor(
+                tetris_rows
+            )
+        elif (
+            isinstance(draft_token_ids, torch.Tensor)
+            and spec_config is not None
+            and getattr(spec_config, "tetris", False)
+            and not (
+                hasattr(self.drafter, "last_draft_logprobs")
+                and self.drafter.last_draft_logprobs is not None
+            )
+        ):
+            # TETRIS on but logprobs missing: narrow columns to base_k; keep tensor
+            # so async ``_prepare_input_ids`` can scatter padded draft rows.
+            logger.warning_once(
+                "TETRIS is enabled but draft logprobs are missing "
+                "(drafter.last_draft_logprobs is None); falling back "
+                "to base_k tokens without TETRIS. Typical causes: "
+                "parallel_drafting, use_local_argmax_reduction, or a "
+                "proposer path that does not record per-step logprobs.",
+                scope="local",
+            )
             num_spec = draft_token_ids.shape[1]
-            if spec_config is not None and getattr(spec_config, "tetris", False):
-                logger.warning_once(
-                    "TETRIS is enabled but draft logprobs are missing "
-                    "(drafter.last_draft_logprobs is None); falling back "
-                    "to base_k tokens without TETRIS. Typical causes: "
-                    "parallel_drafting, use_local_argmax_reduction, or a "
-                    "proposer path that does not record per-step logprobs.",
-                    scope="local",
-                )
-                base_k = getattr(spec_config, "tetris_base_k", None)
-                if base_k is not None:
-                    num_spec = base_k
-                else:
-                    extra = getattr(spec_config, "tetris_extra_proposals", 0)
-                    num_spec = max(1, num_spec - extra)
-            draft_token_ids = [
-                [tok for tok in draft_token_ids[i, :num_spec].tolist()
-                 if tok != PLACEHOLDER_TOKEN_ID]
-                for i in range(draft_token_ids.shape[0])
-            ]
+            base_k = getattr(spec_config, "tetris_base_k", None)
+            if base_k is not None:
+                num_spec = base_k
+            else:
+                extra = getattr(spec_config, "tetris_extra_proposals", 0)
+                num_spec = max(1, num_spec - extra)
+            draft_token_ids = draft_token_ids[:, :num_spec].contiguous()
         # ---- end TETRIS ----------------------------------------------------
 
         return draft_token_ids
@@ -6458,7 +6518,7 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if hasattr(self, "drafter"):
+                if self.drafter is not None:
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)
                     if (
