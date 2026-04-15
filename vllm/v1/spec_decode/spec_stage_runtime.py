@@ -72,6 +72,18 @@ class PivotExpansionPlan:
     origin_to_family_rows: list[list[int]] | None = None
     uses_fixed_capacity_packing: bool = False
     """True for linear pivot fixed P layout; false for legacy variable eagle expansion."""
+    # Optional packed layout tensors (device = plan construction device); list fields
+    # above remain the compatibility surface for consumers/tests.
+    packed_to_origin_t: torch.Tensor | None = None
+    """Shape ``[P]``; inactive slots ``-1`` (same semantics as ``packed_to_origin``)."""
+    packed_sm_origin_t: torch.Tensor | None = None
+    """Shape ``[P]``; indices in ``[0, B)`` for sampling-metadata / gather."""
+    packed_row_is_active_t: torch.Tensor | None = None
+    """Shape ``[P]``, bool."""
+    packed_row_family_rank_t: torch.Tensor | None = None
+    """Shape ``[P]``; inactive rows ``-1``."""
+    row_gather_idx_cpu: torch.Tensor | None = None
+    """Long tensor ``[P]`` on CPU; equals ``packed_sm_origin`` row-major gather indices."""
 
 
 @dataclass(frozen=True)

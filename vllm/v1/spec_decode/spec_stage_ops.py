@@ -526,16 +526,24 @@ def collapse_pivot_expanded_sampled_to_origin(
 
 def validate_root_only_pivot_expansion(
     *,
-    prefix_rows: list[list[int]],
+    prefix_rows: list[list[int]] | None = None,
+    prefix_lengths_tensor: torch.Tensor | None = None,
+    prefix_num_rows: int | None = None,
     expansion_plan: PivotExpansionPlan | None,
 ) -> DitDebugCheckResult:
-    has_only_root_prefix = all(len(row) == 0 for row in prefix_rows)
     if expansion_plan is None:
         return DitDebugCheckResult(
             code="check_root_only_pivot_expansion",
             ok=True,
             detail="no expansion plan",
         )
+    if prefix_lengths_tensor is not None and prefix_num_rows is not None:
+        has_only_root_prefix = bool(
+            (prefix_lengths_tensor[:prefix_num_rows] == 0).all().item()
+        )
+    else:
+        assert prefix_rows is not None
+        has_only_root_prefix = all(len(row) == 0 for row in prefix_rows)
     return DitDebugCheckResult(
         code="check_root_only_pivot_expansion",
         ok=has_only_root_prefix,
@@ -792,6 +800,12 @@ def _permute_pivot_expansion_plan(
             return field
         return [field[perm_old[j]] for j in range(p)]
 
+    def pick_tensor_row_major(field: torch.Tensor | None) -> torch.Tensor | None:
+        if field is None or int(field.shape[0]) != p:
+            return None
+        idx = torch.tensor(perm_old, dtype=torch.long, device=field.device)
+        return field.index_select(0, idx).contiguous()
+
     new_families: list[PivotExpansionFamily] = []
     for fam in plan.families:
         new_families.append(
@@ -810,6 +824,7 @@ def _permute_pivot_expansion_plan(
     if len(plan.expanded_to_origin) != p:
         return plan
     new_eto: list[int] = [plan.expanded_to_origin[perm_old[j]] for j in range(p)]
+    new_rg = pick_tensor_row_major(plan.row_gather_idx_cpu)
     return replace(
         plan,
         expanded_to_origin=new_eto,
@@ -821,6 +836,11 @@ def _permute_pivot_expansion_plan(
         families=new_families,
         origin_to_family_rows=new_otf,
         origin_to_base_row=new_otb,
+        packed_to_origin_t=pick_tensor_row_major(plan.packed_to_origin_t),
+        packed_sm_origin_t=pick_tensor_row_major(plan.packed_sm_origin_t),
+        packed_row_is_active_t=pick_tensor_row_major(plan.packed_row_is_active_t),
+        packed_row_family_rank_t=pick_tensor_row_major(plan.packed_row_family_rank_t),
+        row_gather_idx_cpu=new_rg,
     )
 
 

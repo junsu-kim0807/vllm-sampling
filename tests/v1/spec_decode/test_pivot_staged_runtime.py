@@ -327,6 +327,36 @@ def test_validate_root_only_pivot_expansion_rejects_non_root_prefix() -> None:
     assert not result.ok
 
 
+def test_validate_root_only_pivot_expansion_dense_prefix() -> None:
+    plan = PivotExpansionPlan(
+        expanded_to_origin=[0, 0],
+        families=[
+            PivotExpansionFamily(
+                origin_row=0,
+                expanded_rows=[0, 1],
+                candidate_ranks=[0, 1],
+                first_token_ids=[1, 2],
+                first_token_probs=[0.6, 0.4],
+            )
+        ],
+        expanded_batch_size=2,
+    )
+    lens = torch.tensor([0, 0], dtype=torch.int32)
+    ok = validate_root_only_pivot_expansion(
+        prefix_lengths_tensor=lens,
+        prefix_num_rows=2,
+        expansion_plan=plan,
+    )
+    assert ok.ok
+    lens2 = torch.tensor([0, 1], dtype=torch.int32)
+    bad = validate_root_only_pivot_expansion(
+        prefix_lengths_tensor=lens2,
+        prefix_num_rows=2,
+        expansion_plan=plan,
+    )
+    assert not bad.ok
+
+
 def test_get_unselected_cleanup_rows_returns_unselected_family_rows() -> None:
     plan = PivotExpansionPlan(
         expanded_to_origin=[0, 0, 1],
@@ -385,6 +415,12 @@ def test_build_pivot_expansion_plan_from_root_topk_when_probs_missing() -> None:
     assert plan.uses_fixed_capacity_packing
     assert eprob is None
     assert ep.shape[0] == 5
+    assert plan.row_gather_idx_cpu is not None
+    assert plan.packed_sm_origin_t is not None
+    assert torch.equal(
+        plan.row_gather_idx_cpu,
+        torch.tensor(plan.packed_sm_origin or [], dtype=torch.long),
+    )
 
 
 def test_pivot_probs_sparse_from_root_topk_scatters_per_packed_row() -> None:

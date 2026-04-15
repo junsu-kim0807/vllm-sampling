@@ -12,6 +12,24 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 
 
+def materialize_prefix_rows_from_dense(
+    tokens: torch.Tensor,
+    lengths: torch.Tensor,
+    num_rows: int,
+) -> list[list[int]]:
+    """Build ``list[list[int]]`` from ``tokens[:num_rows, :]`` and per-row ``lengths``."""
+    rows: list[list[int]] = []
+    le = lengths[:num_rows].detach().cpu().reshape(-1).tolist()
+    tc = tokens[:num_rows].detach().cpu()
+    for b in range(num_rows):
+        L = int(le[b])
+        if L <= 0:
+            rows.append([])
+        else:
+            rows.append([int(x) for x in tc[b, :L].tolist()])
+    return rows
+
+
 def group_indices_by_prefix_len(rows: list[list[int]]) -> list[tuple[int, list[int]]]:
     groups: dict[int, list[int]] = {}
     for b, row in enumerate(rows):
@@ -46,6 +64,8 @@ def slice_sampling_metadata_for_subbatch(
     idxs: list[int],
     *,
     provisional_prefix_rows: list[list[int]] | None = None,
+    provisional_prefix_tokens: torch.Tensor | None = None,
+    provisional_prefix_lengths: torch.Tensor | None = None,
     sampled_ids_only: bool = False,
 ) -> SamplingMetadata:
     """Slice request-major SamplingMetadata for sub-batch stage execution."""
@@ -56,6 +76,58 @@ def slice_sampling_metadata_for_subbatch(
             return None
         return x.index_select(0, idx)
 
+    def _provisional_spec_rows() -> list[list[int]] | None:
+        if provisional_prefix_rows is not None:
+            return provisional_prefix_rows
+        if provisional_prefix_tokens is not None:
+            if provisional_prefix_lengths is None:
+                raise ValueError(
+                    "provisional_prefix_lengths is required when "
+                    "provisional_prefix_tokens is set"
+                )
+            nn = len(idxs)
+            return materialize_prefix_rows_from_dense(
+                provisional_prefix_tokens[:nn],
+                provisional_prefix_lengths[:nn],
+                nn,
+            )
+        return None
+
+    # Hot path: no per-row output history, no bad-words / RNG remapping work.
+    if (
+        sampled_ids_only
+        and not sm.output_token_ids
+        and not sm.bad_words_token_ids
+        and not sm.generators
+    ):
+        output_token_ids = [[] for _ in idxs]
+        prov = _provisional_spec_rows()
+        if prov is not None:
+            spec_token_ids = prov
+        elif sm.spec_token_ids is not None:
+            if sm.spec_token_ids:
+                spec_token_ids = [sm.spec_token_ids[i] for i in idxs]
+            else:
+                spec_token_ids = [[] for _ in idxs]
+        else:
+            spec_token_ids = None
+        return replace(
+            sm,
+            temperature=_slice_opt_tensor(sm.temperature),
+            top_p=_slice_opt_tensor(sm.top_p),
+            top_k=_slice_opt_tensor(sm.top_k),
+            frequency_penalties=sm.frequency_penalties.index_select(0, idx),
+            presence_penalties=sm.presence_penalties.index_select(0, idx),
+            repetition_penalties=sm.repetition_penalties.index_select(0, idx),
+            prompt_token_ids=_slice_opt_tensor(sm.prompt_token_ids),
+            allowed_token_ids_mask=_slice_opt_tensor(sm.allowed_token_ids_mask),
+            output_token_ids=output_token_ids,
+            bad_words_token_ids=sm.bad_words_token_ids,
+            generators=sm.generators,
+            spec_token_ids=spec_token_ids,
+            max_num_logprobs=None,
+        )
+
     # Greedy + no-penalty batches omit output_token_ids in InputBatch; staged
     # pivot/spec paths still slice per logical row — synthesize empty histories.
     if sm.output_token_ids:
@@ -63,8 +135,9 @@ def slice_sampling_metadata_for_subbatch(
     else:
         output_token_ids = [[] for _ in idxs]
 
-    if provisional_prefix_rows is not None:
-        spec_token_ids = provisional_prefix_rows
+    prov_slow = _provisional_spec_rows()
+    if prov_slow is not None:
+        spec_token_ids = prov_slow
     elif sm.spec_token_ids is not None:
         if sm.spec_token_ids:
             spec_token_ids = [sm.spec_token_ids[i] for i in idxs]

@@ -5,7 +5,10 @@ import torch
 
 from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.spec_decode.spec_stage_utils import slice_sampling_metadata_for_subbatch
+from vllm.v1.spec_decode.spec_stage_utils import (
+    materialize_prefix_rows_from_dense,
+    slice_sampling_metadata_for_subbatch,
+)
 
 
 def _minimal_sm(
@@ -59,3 +62,43 @@ def test_slice_subbatch_empty_spec_token_ids_synthesizes_rows() -> None:
     out = slice_sampling_metadata_for_subbatch(sm, [0, 0])
     assert out.output_token_ids == [[], []]
     assert out.spec_token_ids == [[], []]
+
+
+def test_materialize_prefix_rows_from_dense_roundtrip() -> None:
+    tok = torch.tensor([[1, 2, 0], [3, 0, 0]], dtype=torch.int32)
+    ln = torch.tensor([2, 1], dtype=torch.long)
+    rows = materialize_prefix_rows_from_dense(tok, ln, 2)
+    assert rows == [[1, 2], [3]]
+
+
+def test_slice_subbatch_dense_provisional_matches_list() -> None:
+    sm = _minimal_sm(batch_size=2, output_token_ids=[])
+    tok = torch.tensor([[5, 0], [6, 7]], dtype=torch.int32)
+    ln = torch.tensor([1, 2], dtype=torch.long)
+    out_dense = slice_sampling_metadata_for_subbatch(
+        sm,
+        [0, 1],
+        provisional_prefix_tokens=tok,
+        provisional_prefix_lengths=ln,
+        sampled_ids_only=True,
+    )
+    out_list = slice_sampling_metadata_for_subbatch(
+        sm,
+        [0, 1],
+        provisional_prefix_rows=[[5], [6, 7]],
+        sampled_ids_only=True,
+    )
+    assert out_dense.spec_token_ids == out_list.spec_token_ids
+
+
+def test_slice_subbatch_sampled_ids_only_fast_path_smoke() -> None:
+    """Greedy-style empty histories + ``sampled_ids_only`` use the fast slice path."""
+    sm = _minimal_sm(batch_size=3, output_token_ids=[])
+    idxs = [2, 0, 1]
+    out = slice_sampling_metadata_for_subbatch(
+        sm, idxs, sampled_ids_only=True
+    )
+    assert out.max_num_logprobs is None
+    assert out.output_token_ids == [[], [], []]
+    idx = torch.tensor(idxs, dtype=torch.long, device=sm.frequency_penalties.device)
+    assert torch.equal(out.frequency_penalties, sm.frequency_penalties.index_select(0, idx))
