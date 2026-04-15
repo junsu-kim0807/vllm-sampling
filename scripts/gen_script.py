@@ -13,6 +13,8 @@ Modes:
   default  : generate regular jobs from PAIRS
   --test   : smoke test jobs
   --batch  : vary batch size
+  --length : fixed batch 256, sweep num_spec_tokens (5,7,9,11) like --batch
+  --ablation: pivot only; sweep topk_selection {2,5} x expansion_pct {0.1,0.2}
   --draft  : vary num_spec_tokens while varying draft model, fixed target
   --verify : vary num_spec_tokens while varying target model along an ordered model chain
 
@@ -22,6 +24,7 @@ LongBench-v1: gov_report, qmsum (THUDM/LongBench). Set HF_TOKEN before submit.
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import re
 import stat
@@ -1090,6 +1093,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--length",
+        action="store_true",
+        help=(
+            "Like --batch but batch size fixed at 256 and num_spec_tokens "
+            "swept over 5, 7, 9, 11 for each method."
+        ),
+    )
+    parser.add_argument(
+        "--ablation",
+        action="store_true",
+        help=(
+            "Pivot-method jobs only: topk_selection in {2, 5} and "
+            "expansion_pct in {0.1, 0.2} (full grid), same batch-size sweep as --batch."
+        ),
+    )
+    parser.add_argument(
         "--draft",
         action="store_true",
         help=(
@@ -1327,20 +1346,48 @@ def main() -> None:
             (args.adaptive_spechive_intermediate_model, args.round, "")
         ]
 
-    selected_modes = [args.batch, args.test, args.draft, args.verify]
+    selected_modes = [
+        args.batch,
+        args.test,
+        args.draft,
+        args.verify,
+        args.length,
+        args.ablation,
+    ]
     if sum(1 for x in selected_modes if x) > 1:
-        raise SystemExit("Use only one of --batch, --test, --draft, or --verify.")
+        raise SystemExit(
+            "Use only one of --batch, --length, --ablation, --test, --draft, or --verify."
+        )
 
     datasets = filter_by_attr(DATASETS, set(args.datasets), "name")
 
-    if args.batch:
+    if args.batch or args.length or args.ablation:
         if not datasets:
             raise SystemExit(
-                "With --batch: please pass at least one --datasets value. "
+                "With --batch/--length/--ablation: pass at least one --datasets value. "
                 f"Known: {[d.name for d in DATASETS]}"
             )
 
-        batch_sizes_list = [1, 4, 16, 64, 256, 512]
+        if args.batch:
+            batch_sizes_list = [1, 4, 16, 64, 256, 512]
+            num_spec_values = [3]
+            pivot_ablation_pairs: list[tuple[int, float]] = [
+                (args.topk_selection, args.expansion_pct)
+            ]
+            pivot_only = False
+            scaling_mode = "batch"
+        elif args.length:
+            batch_sizes_list = [256]
+            num_spec_values = [5, 7, 9, 11]
+            pivot_ablation_pairs = [(args.topk_selection, args.expansion_pct)]
+            pivot_only = False
+            scaling_mode = "length"
+        else:
+            batch_sizes_list = [1, 4, 16, 64, 256, 512]
+            num_spec_values = [3]
+            pivot_ablation_pairs = [(2, 0.1), (2, 0.2), (5, 0.1), (5, 0.2)]
+            pivot_only = True
+            scaling_mode = "ablation"
 
         def time_limit_for_batch(bs: int) -> str:
             if bs == 1:
@@ -1558,7 +1605,6 @@ def main() -> None:
         test_samples = 5
         warmup_iters = args.warmup_iters
         warmup_max_tokens = args.warmup_max_tokens
-        num_spec = 3
         max_model_len = args.max_model_len
 
         written_scripts: list[Path] = []
@@ -1568,6 +1614,7 @@ def main() -> None:
             pair: PairConfig,
             dataset: DatasetConfig,
             bs: int,
+            num_spec_tokens: int,
             method: str,
             eagle_model: str | None,
             eagle_draft_tp: int | None = None,
@@ -1578,16 +1625,32 @@ def main() -> None:
             tetris_extra_proposals: int = 0,
             tetris_turn_on_batch_size: int | None = None,
             time_limit_override: str,
+            pivot_topk_sel: int | None = None,
+            pivot_exp_pct: float | None = None,
+            pivot_path_component: str = "",
         ) -> None:
             batch_sizes_str = str(bs)
-            ktag = spec_token_tag(num_spec)
+            ktag = spec_token_tag(num_spec_tokens)
+            topk_eff = (
+                pivot_topk_sel if pivot_topk_sel is not None else args.topk_selection
+            )
+            exp_pct_eff = (
+                pivot_exp_pct if pivot_exp_pct is not None else args.expansion_pct
+            )
             pivot_mode_tag = ""
             if method == "pivot" and pivot_spechive is not None:
                 pivot_mode_tag = "pivot_spechive" if pivot_spechive else "pivot"
 
             method_dir = Path(method) / pivot_mode_tag if pivot_mode_tag else Path(method)
-            base_batch_dir = method_dir / f"b{bs}" / ktag / pair.pair_id
-            base_result_subdir = Path(ktag) / pivot_mode_tag if pivot_mode_tag else Path(ktag)
+            base_batch_dir = method_dir / f"b{bs}" / ktag
+            if pivot_path_component:
+                base_batch_dir = base_batch_dir / pivot_path_component
+            base_batch_dir = base_batch_dir / pair.pair_id
+            base_result_subdir = Path(ktag)
+            if pivot_path_component:
+                base_result_subdir = base_result_subdir / pivot_path_component
+            if pivot_mode_tag:
+                base_result_subdir = base_result_subdir / pivot_mode_tag
             if method == "adaptive_spechive":
                 variants = spechive_variants
             elif method == "pivot" and pivot_spechive:
@@ -1612,6 +1675,8 @@ def main() -> None:
                 )
                 script_path = JOBS_ROOT / batch_dir / f"{dataset.name}.slurm"
                 suffix_parts = [ktag]
+                if pivot_path_component:
+                    suffix_parts.append(pivot_path_component)
                 if pivot_mode_tag:
                     suffix_parts.append(pivot_mode_tag)
                 if variant_tag:
@@ -1628,7 +1693,7 @@ def main() -> None:
                     seed=args.seed,
                     warmup_iters=warmup_iters,
                     warmup_max_tokens=warmup_max_tokens,
-                    num_spec_tokens=num_spec,
+                    num_spec_tokens=num_spec_tokens,
                     verbose=args.verbose,
                     debug=debug_enabled,
                     test=test,
@@ -1642,8 +1707,8 @@ def main() -> None:
                     adaptive_spechive_intermediate_model=im_model,
                     adaptive_spechive_mode=args.adaptive_spechive_mode,
                     adaptive_spechive_rounds=rounds,
-                    pivot_topk_selection=args.topk_selection,
-                    pivot_expansion_pct=args.expansion_pct,
+                    pivot_topk_selection=topk_eff,
+                    pivot_expansion_pct=exp_pct_eff,
                     pivot_spechive=(
                         args.pivot_spechive
                         if pivot_spechive is None
@@ -1679,79 +1744,99 @@ def main() -> None:
             and not include_pivot_spechive_batch
         ):
             raise SystemExit(
-                "--batch with --spec-method=pivot --pivot-spechive requires "
+                f"--{scaling_mode} with --spec-method=pivot --pivot-spechive requires "
                 "--adaptive-spechive-intermediate-model"
             )
 
-        for bs in batch_sizes_list:
-            tl = time_limit_for_batch(bs)
-            for dataset in datasets:
-                if args.spec_method != "pivot":
-                    for pair in speculative_pairs:
-                        _write_one(
-                            pair=pair,
-                            dataset=dataset,
-                            bs=bs,
-                            method=args.spec_method,
-                            eagle_model=None,
-                            time_limit_override=tl,
-                        )
+        for num_spec in num_spec_values:
+            for bs in batch_sizes_list:
+                tl = time_limit_for_batch(bs)
+                for dataset in datasets:
+                    if not pivot_only and args.spec_method != "pivot":
+                        for pair in speculative_pairs:
+                            _write_one(
+                                pair=pair,
+                                dataset=dataset,
+                                bs=bs,
+                                num_spec_tokens=num_spec,
+                                method=args.spec_method,
+                                eagle_model=None,
+                                time_limit_override=tl,
+                            )
 
+                    if not pivot_only:
+                        # MagicDec
+                        for pair in speculative_pairs:
+                            _write_one(
+                                pair=pair,
+                                dataset=dataset,
+                                bs=bs,
+                                num_spec_tokens=num_spec,
+                                method="magicdec",
+                                eagle_model=None,
+                                magicdec_method=args.magicdec_method,
+                                magicdec_kv_budget=args.magicdec_kv_budget,
+                                time_limit_override=tl,
+                            )
 
-                # MagicDec
-                for pair in speculative_pairs:
-                    _write_one(
-                        pair=pair,
-                        dataset=dataset,
-                        bs=bs,
-                        method="magicdec",
-                        eagle_model=None,
-                        magicdec_method=args.magicdec_method,
-                        magicdec_kv_budget=args.magicdec_kv_budget,
-                        time_limit_override=tl,
-                    )
+                        # TETRIS
+                        for pair in speculative_pairs:
+                            _write_one(
+                                pair=pair,
+                                dataset=dataset,
+                                bs=bs,
+                                num_spec_tokens=num_spec,
+                                method="tetris",
+                                eagle_model=None,
+                                tetris_extra_proposals=args.tetris_extra_proposals,
+                                tetris_turn_on_batch_size=args.tetris_turn_on_batch_size,
+                                time_limit_override=tl,
+                            )
 
-                # TETRIS
-                for pair in speculative_pairs:
-                    _write_one(
-                        pair=pair,
-                        dataset=dataset,
-                        bs=bs,
-                        method="tetris",
-                        eagle_model=None,
-                        tetris_extra_proposals=args.tetris_extra_proposals,
-                        tetris_turn_on_batch_size=args.tetris_turn_on_batch_size,
-                        time_limit_override=tl,
-                    )
+                    for pivot_topk, pivot_exp in pivot_ablation_pairs:
+                        pivot_pc = ""
+                        if args.ablation:
+                            pivot_pc = (
+                                f"tk{pivot_topk}_ep{str(pivot_exp).replace('.', 'p')}"
+                            )
+                        # PIVOT (always)
+                        for pair in speculative_pairs:
+                            _write_one(
+                                pair=pair,
+                                dataset=dataset,
+                                bs=bs,
+                                num_spec_tokens=num_spec,
+                                method="pivot",
+                                eagle_model=None,
+                                pivot_spechive=False,
+                                time_limit_override=tl,
+                                pivot_topk_sel=pivot_topk,
+                                pivot_exp_pct=pivot_exp,
+                                pivot_path_component=pivot_pc,
+                            )
 
-                # PIVOT (always)
-                for pair in speculative_pairs:
-                    _write_one(
-                        pair=pair,
-                        dataset=dataset,
-                        bs=bs,
-                        method="pivot",
-                        eagle_model=None,
-                        pivot_spechive=False,
-                        time_limit_override=tl,
-                    )
-
-                # PIVOT+SpecHive (only when intermediate model is available)
-                if include_pivot_spechive_batch:
-                    for pair in speculative_pairs:
-                        pivot_intermediate = resolve_pivot_intermediate(pair.pair_id)
-                        if pivot_intermediate is None:
-                            continue
-                        _write_one(
-                            pair=pair,
-                            dataset=dataset,
-                            bs=bs,
-                            method="pivot",
-                            eagle_model=None,
-                            pivot_spechive=True,
-                            adaptive_spechive_intermediate_model=pivot_intermediate,
-                            time_limit_override=tl,
-                        )
+                        # PIVOT+SpecHive (only when intermediate model is available)
+                        if include_pivot_spechive_batch:
+                            for pair in speculative_pairs:
+                                pivot_intermediate = resolve_pivot_intermediate(
+                                    pair.pair_id
+                                )
+                                if pivot_intermediate is None:
+                                    continue
+                                _write_one(
+                                    pair=pair,
+                                    dataset=dataset,
+                                    bs=bs,
+                                    num_spec_tokens=num_spec,
+                                    method="pivot",
+                                    eagle_model=None,
+                                    pivot_spechive=True,
+                                    adaptive_spechive_intermediate_model=pivot_intermediate,
+                                    time_limit_override=tl,
+                                    pivot_topk_sel=pivot_topk,
+                                    pivot_exp_pct=pivot_exp,
+                                    pivot_path_component=pivot_pc,
+                                )
 
                 # Enable these if you want AR and EAGLE3 jobs as well.
                 # for pair in ar_pairs:
@@ -1781,11 +1866,16 @@ def main() -> None:
                 #     )
 
         num_written = len(written_scripts)
-        print(f"[batch] Generated {num_written} job scripts.")
+        print(f"[{scaling_mode}] Generated {num_written} job scripts.")
 
-        submit_path = REPO_ROOT / "scripts" / "submit_spec_decode_batch_scaling.sh"
+        submit_scripts = {
+            "batch": REPO_ROOT / "scripts" / "submit_spec_decode_batch_scaling.sh",
+            "length": REPO_ROOT / "scripts" / "submit_spec_decode_length_sweep.sh",
+            "ablation": REPO_ROOT / "scripts" / "submit_spec_decode_pivot_ablation.sh",
+        }
+        submit_path = submit_scripts[scaling_mode]
         add_submit_script(submit_path, written_scripts)
-        print(f"[batch] Submit script: {submit_path}")
+        print(f"[{scaling_mode}] Submit script: {submit_path}")
         return
 
     if args.draft:
