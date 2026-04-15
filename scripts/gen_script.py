@@ -14,7 +14,7 @@ Modes:
   --test   : smoke test jobs
   --batch  : vary batch size
   --length : fixed batch 256, sweep num_spec_tokens (5,7,9,11) like --batch
-  --ablation: pivot only; sweep topk_selection {2,5} x expansion_pct {0.1,0.2}
+  --ablation: pivot only; sweep topk x expansion_pct and num_spec_tokens 3,7,11
   --draft  : vary num_spec_tokens while varying draft model, fixed target
   --verify : vary num_spec_tokens while varying target model along an ordered model chain
 
@@ -546,6 +546,11 @@ def batch_tag(batch_sizes: str) -> str:
 
 def spec_token_tag(num_spec_tokens: int) -> str:
     return f"k{num_spec_tokens}"
+
+
+def pivot_config_path_tag(topk: int, expansion_pct: float) -> str:
+    """Subdir tag for pivot jobs: topk + expansion fraction (e.g. tk5_ep0p2)."""
+    return f"tk{topk}_ep{str(expansion_pct).replace('.', 'p')}"
 
 
 def shquote(value: str) -> str:
@@ -1105,7 +1110,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Pivot-method jobs only: topk_selection in {2, 5} and "
-            "expansion_pct in {0.1, 0.2} (full grid), same batch-size sweep as --batch."
+            "expansion_pct in {0.1, 0.2} (full grid), num_spec_tokens in "
+            "{3, 7, 11}, same batch-size sweep as --batch."
         ),
     )
     parser.add_argument(
@@ -1383,9 +1389,10 @@ def main() -> None:
             pivot_only = False
             scaling_mode = "length"
         else:
-            batch_sizes_list = [256]
-            num_spec_values = [3]
-            pivot_ablation_pairs = [(2, 0.1), (2, 0.2), (5, 0.1)]
+            # Same batch sweep as --batch in this script; pivot grid + k sweep.
+            batch_sizes_list = [1, 4, 16, 64, 256]
+            num_spec_values = [3, 7, 11]
+            pivot_ablation_pairs = [(2, 0.1), (2, 0.2), (5, 0.1), (5, 0.2)]
             pivot_only = True
             scaling_mode = "ablation"
 
@@ -1794,11 +1801,7 @@ def main() -> None:
                             )
 
                     for pivot_topk, pivot_exp in pivot_ablation_pairs:
-                        pivot_pc = ""
-                        if args.ablation:
-                            pivot_pc = (
-                                f"tk{pivot_topk}_ep{str(pivot_exp).replace('.', 'p')}"
-                            )
+                        pivot_pc = pivot_config_path_tag(pivot_topk, pivot_exp)
                         # PIVOT (always)
                         for pair in speculative_pairs:
                             _write_one(
@@ -1849,22 +1852,23 @@ def main() -> None:
                 #         time_limit_override=tl,
                 #     )
 
-                for pair in eagle_pairs:
-                    eagle_model = (
-                        eagle_llama33_speculator
-                        if pair.target_model == llama33_70b
-                        else eagle_qwen30b_a3b_speculator
-                    )
-                    _write_one(
-                        pair=pair,
-                        dataset=dataset,
-                        bs=bs,
-                        method="eagle3",
-                        eagle_model=eagle_model,
-                        eagle_draft_tp=1,
-                        time_limit_override=tl,
-                        num_spec_tokens=num_spec,
-                    )
+                if not pivot_only:
+                    for pair in eagle_pairs:
+                        eagle_model = (
+                            eagle_llama33_speculator
+                            if pair.target_model == llama33_70b
+                            else eagle_qwen30b_a3b_speculator
+                        )
+                        _write_one(
+                            pair=pair,
+                            dataset=dataset,
+                            bs=bs,
+                            num_spec_tokens=num_spec,
+                            method="eagle3",
+                            eagle_model=eagle_model,
+                            eagle_draft_tp=1,
+                            time_limit_override=tl,
+                        )
 
         num_written = len(written_scripts)
         print(f"[{scaling_mode}] Generated {num_written} job scripts.")
