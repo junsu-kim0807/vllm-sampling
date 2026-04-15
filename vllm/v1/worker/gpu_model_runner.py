@@ -6223,6 +6223,38 @@ class GPUModelRunner(
             req_ids,
         )
 
+    def _pad_ragged_draft_token_lists_to_tensor(
+        self, rows: list[list[int]]
+    ) -> torch.Tensor:
+        """Pack per-request draft token lists into a dense GPU tensor.
+
+        ``apply_tetris`` returns ragged Python lists; async
+        :meth:`_prepare_input_ids` requires ``_draft_token_ids`` to be a
+        tensor shaped ``(batch, num_spec_tokens)`` with
+        ``PLACEHOLDER_TOKEN_ID`` padding so scatter indices stay valid.
+        """
+        if not rows:
+            return torch.empty(
+                (0, self.num_spec_tokens),
+                device=self.device,
+                dtype=torch.int64,
+            )
+        out = torch.full(
+            (len(rows), self.num_spec_tokens),
+            PLACEHOLDER_TOKEN_ID,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        for i, row in enumerate(rows):
+            if not row:
+                continue
+            li = min(len(row), self.num_spec_tokens)
+            if li:
+                out[i, :li] = torch.tensor(
+                    row[:li], device=self.device, dtype=torch.int64
+                )
+        return out
+
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
     ) -> None:
@@ -6480,7 +6512,7 @@ class GPUModelRunner(
             and hasattr(self.drafter, "last_draft_logprobs")
             and self.drafter.last_draft_logprobs is not None
         ):
-            draft_token_ids = apply_tetris(
+            tetris_rows = apply_tetris(
                 draft_token_ids=draft_token_ids,
                 draft_token_logprobs=self.drafter.last_draft_logprobs,
                 base_k=getattr(spec_config, "tetris_base_k", None)
@@ -6492,31 +6524,36 @@ class GPUModelRunner(
                     spec_config, "tetris_turn_on_batch_size", None
                 ),
             )
-        elif isinstance(draft_token_ids, torch.Tensor):
+            draft_token_ids = self._pad_ragged_draft_token_lists_to_tensor(
+                tetris_rows
+            )
+        elif (
+            isinstance(draft_token_ids, torch.Tensor)
+            and spec_config is not None
+            and getattr(spec_config, "tetris", False)
+            and not (
+                hasattr(self.drafter, "last_draft_logprobs")
+                and self.drafter.last_draft_logprobs is not None
+            )
+        ):
+            # TETRIS on but logprobs missing: narrow columns to base_k; keep tensor
+            # so async ``_prepare_input_ids`` can scatter padded draft rows.
+            logger.warning_once(
+                "TETRIS is enabled but draft logprobs are missing "
+                "(drafter.last_draft_logprobs is None); falling back "
+                "to base_k tokens without TETRIS. Typical causes: "
+                "parallel_drafting, use_local_argmax_reduction, or a "
+                "proposer path that does not record per-step logprobs.",
+                scope="local",
+            )
             num_spec = draft_token_ids.shape[1]
-            if spec_config is not None and getattr(spec_config, "tetris", False):
-                logger.warning_once(
-                    "TETRIS is enabled but draft logprobs are missing "
-                    "(drafter.last_draft_logprobs is None); falling back "
-                    "to base_k tokens without TETRIS. Typical causes: "
-                    "parallel_drafting, use_local_argmax_reduction, or a "
-                    "proposer path that does not record per-step logprobs.",
-                    scope="local",
-                )
-                base_k = getattr(spec_config, "tetris_base_k", None)
-                if base_k is not None:
-                    num_spec = base_k
-                else:
-                    extra = getattr(spec_config, "tetris_extra_proposals", 0)
-                    num_spec = max(1, num_spec - extra)
-            draft_token_ids = [
-                [
-                    tok
-                    for tok in draft_token_ids[i, :num_spec].tolist()
-                    if tok != PLACEHOLDER_TOKEN_ID
-                ]
-                for i in range(draft_token_ids.shape[0])
-            ]
+            base_k = getattr(spec_config, "tetris_base_k", None)
+            if base_k is not None:
+                num_spec = base_k
+            else:
+                extra = getattr(spec_config, "tetris_extra_proposals", 0)
+                num_spec = max(1, num_spec - extra)
+            draft_token_ids = draft_token_ids[:, :num_spec].contiguous()
         # ---- end TETRIS ----------------------------------------------------
 
         return draft_token_ids
