@@ -164,10 +164,7 @@ from vllm.v1.sample.rejection_sampler import (
     RejectionSampler,
 )
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.spec_decode.adaptive_cascade import (
-    _build_hybrid_bundle_from_rows,
-    _flatten_prob_rows_for_output,
-)
+from vllm.v1.spec_decode.adaptive_cascade import _build_hybrid_bundle_from_rows
 from vllm.v1.spec_decode.adaptive_spechive import AdaptiveSpechiveProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -378,12 +375,6 @@ def _uses_pivot_linear_fixed_capacity_packing(
     )
 
 
-def _expand_list_rows_by_pivot_plan(
-    rows: list[list[Any]], plan: PivotExpansionPlan
-) -> list[list[Any]]:
-    return [list(rows[o]) for o in _pivot_plan_sm_indices(plan)]
-
-
 def _rows_are_all_empty(rows: list[list[Any]]) -> bool:
     return all(len(row) == 0 for row in rows)
 
@@ -392,9 +383,7 @@ def _can_use_empty_prefix_expansion_fast_path(
     *,
     prefix_rows: list[list[int]] | None = None,
     prefix_lengths_tensor: torch.Tensor | None = None,
-    prefix_prob_rows: list[list[torch.Tensor]],
     source_stage_rows: list[list[int]] | None = None,
-    use_draft_probs: bool,
     num_rows: int | None = None,
 ) -> bool:
     if prefix_lengths_tensor is not None and num_rows is not None:
@@ -403,8 +392,6 @@ def _can_use_empty_prefix_expansion_fast_path(
     elif prefix_rows is None or not _rows_are_all_empty(prefix_rows):
         return False
     if source_stage_rows is not None and not _rows_are_all_empty(source_stage_rows):
-        return False
-    if use_draft_probs and not _rows_are_all_empty(prefix_prob_rows):
         return False
     return True
 
@@ -460,6 +447,35 @@ def _hv_expand_dense_prefix_buffers(
         len_buf.index_select(0, idx).contiguous(),
         src_buf.index_select(0, idx).contiguous(),
     )
+
+
+def _hv_expand_dense_prob_buffer(
+    prob_buf: torch.Tensor,
+    plan: PivotExpansionPlan,
+) -> torch.Tensor:
+    """Gather draft-prob rows with the same pivot mapping as prefix_tok."""
+    sm = _pivot_plan_sm_indices(plan)
+    idx = torch.tensor(sm, dtype=torch.long, device=prob_buf.device)
+    return prob_buf.index_select(0, idx).contiguous()
+
+
+def _flatten_prefix_prob_dense_for_output(
+    prob_buf: torch.Tensor,
+    out_rows: torch.Tensor,
+) -> torch.Tensor | None:
+    """Flatten [B, cap, V] prefix draft probs along valid *out_rows* positions."""
+    out_dev = out_rows.device
+    parts: list[torch.Tensor] = []
+    for b in range(int(out_rows.shape[0])):
+        valid = int((out_rows[b] != PLACEHOLDER_TOKEN_ID).sum().item())
+        if valid <= 0:
+            continue
+        parts.append(prob_buf[b, :valid].to(dtype=torch.float32, device=out_dev))
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return torch.cat(parts, dim=0)
 
 
 def _expand_count_tensor_by_pivot_plan(
@@ -3882,8 +3898,8 @@ class GPUModelRunner(
 
         _pref_cpu = torch.device("cpu")
         # Same information as DitPrefixState(tokens, lengths): dense accepted-prefix
-        # tokens + valid lengths. Per-row draft probs stay list-backed; stage ids use
-        # prefix_src (2D) until a flattened DitPrefixState.probs_flat contract exists.
+        # tokens + valid lengths. Optional draft probs are dense [B, cap, vocab] on
+        # CPU, aligned with prefix_tok positions; stage ids use prefix_src (2D).
         prefix_tok = torch.full(
             (batch_size, cap),
             PLACEHOLDER_TOKEN_ID,
@@ -3892,7 +3908,15 @@ class GPUModelRunner(
         )
         prefix_len = torch.zeros(batch_size, dtype=torch.int32, device=_pref_cpu)
         prefix_src = torch.zeros((batch_size, cap), dtype=torch.int32, device=_pref_cpu)
-        prefix_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+        prefix_prob_buf: torch.Tensor | None = (
+            torch.zeros(
+                (batch_size, cap, vocab_size),
+                dtype=torch.float32,
+                device=_pref_cpu,
+            )
+            if use_draft_probs
+            else None
+        )
         dit_debug_enabled = self._is_dit_debug_enabled()
         expected_prefix_tok: torch.Tensor | None = None
         expected_prefix_len: torch.Tensor | None = None
@@ -4006,9 +4030,7 @@ class GPUModelRunner(
                                      invocation_idx=round_idx)
                 if _can_use_empty_prefix_expansion_fast_path(
                     prefix_lengths_tensor=prefix_len,
-                    prefix_prob_rows=prefix_prob_rows,
                     source_stage_rows=None,
-                    use_draft_probs=use_draft_probs,
                     num_rows=cur_bs,
                 ):
                     prefix_tok = torch.full(
@@ -4019,7 +4041,15 @@ class GPUModelRunner(
                     )
                     prefix_len = torch.zeros(eff_bs, dtype=torch.int32, device=_pref_cpu)
                     prefix_src = torch.zeros((eff_bs, cap), dtype=torch.int32, device=_pref_cpu)
-                    prefix_prob_rows = [[] for _ in range(eff_bs)]
+                    prefix_prob_buf = (
+                        torch.zeros(
+                            (eff_bs, cap, vocab_size),
+                            dtype=torch.float32,
+                            device=_pref_cpu,
+                        )
+                        if use_draft_probs
+                        else None
+                    )
                     if expected_prefix_tok is not None:
                         expected_prefix_tok = prefix_tok.clone()
                         expected_prefix_len = prefix_len.clone()
@@ -4028,9 +4058,10 @@ class GPUModelRunner(
                     prefix_tok, prefix_len, prefix_src = _hv_expand_dense_prefix_buffers(
                         prefix_tok, prefix_len, prefix_src, pivot_expansion_plan
                     )
-                    prefix_prob_rows = _expand_list_rows_by_pivot_plan(
-                        prefix_prob_rows, pivot_expansion_plan
-                    )
+                    if prefix_prob_buf is not None:
+                        prefix_prob_buf = _hv_expand_dense_prob_buffer(
+                            prefix_prob_buf, pivot_expansion_plan
+                        )
                     if expected_prefix_tok is not None:
                         (
                             expected_prefix_tok,
@@ -4202,8 +4233,14 @@ class GPUModelRunner(
                         cap,
                         0,
                     )
-                if use_draft_probs:
-                    prefix_prob_rows[b].extend(decision.emitted_prob_rows[b])
+                if use_draft_probs and prefix_prob_buf is not None:
+                    epr = decision.emitted_prob_rows[b]
+                    if epr:
+                        L0 = int(before_lens[b].item())
+                        n_epr = len(epr)
+                        prefix_prob_buf[b, L0 : L0 + n_epr] = torch.stack(
+                            epr, dim=0
+                        ).to(dtype=torch.float32, device=prefix_prob_buf.device)
             after_lens = prefix_len[:eff_bs]
             self._dit_debug_assert(
                 all(
@@ -4222,12 +4259,11 @@ class GPUModelRunner(
             if use_draft_probs:
                 self._dit_debug_assert(
                     all(
-                        len(prefix_prob_rows[b]) == int(prefix_len[b].item())
-                        and len(decision.emitted_prob_rows[b]) == len(decision.emitted_rows[b])
+                        len(decision.emitted_prob_rows[b]) == len(decision.emitted_rows[b])
                         for b in range(eff_bs)
                     ),
                     "check_hv_probs_and_stage_alignment",
-                    detail=f"round={round_idx}, prefix_prob_lens={[len(r) for r in prefix_prob_rows]}",
+                    detail=f"round={round_idx}, prefix_lens={prefix_len[:eff_bs].tolist()}",
                 )
 
         expected_rounds = (
@@ -4284,9 +4320,7 @@ class GPUModelRunner(
                 assert pivot_expansion_plan is not None, "tail batch must match prefix rows"
                 if _can_use_empty_prefix_expansion_fast_path(
                     prefix_lengths_tensor=prefix_len,
-                    prefix_prob_rows=prefix_prob_rows,
                     source_stage_rows=None,
-                    use_draft_probs=use_draft_probs,
                     num_rows=n_prefix,
                 ):
                     prefix_tok = torch.full(
@@ -4297,7 +4331,15 @@ class GPUModelRunner(
                     )
                     prefix_len = torch.zeros(tail_eff, dtype=torch.int32, device=_pref_cpu)
                     prefix_src = torch.zeros((tail_eff, cap), dtype=torch.int32, device=_pref_cpu)
-                    prefix_prob_rows = [[] for _ in range(tail_eff)]
+                    prefix_prob_buf = (
+                        torch.zeros(
+                            (tail_eff, cap, vocab_size),
+                            dtype=torch.float32,
+                            device=_pref_cpu,
+                        )
+                        if use_draft_probs
+                        else None
+                    )
                     if expected_prefix_tok is not None:
                         expected_prefix_tok = prefix_tok.clone()
                         expected_prefix_len = prefix_len.clone()
@@ -4306,9 +4348,10 @@ class GPUModelRunner(
                     prefix_tok, prefix_len, prefix_src = _hv_expand_dense_prefix_buffers(
                         prefix_tok, prefix_len, prefix_src, pivot_expansion_plan
                     )
-                    prefix_prob_rows = _expand_list_rows_by_pivot_plan(
-                        prefix_prob_rows, pivot_expansion_plan
-                    )
+                    if prefix_prob_buf is not None:
+                        prefix_prob_buf = _hv_expand_dense_prob_buffer(
+                            prefix_prob_buf, pivot_expansion_plan
+                        )
                     if expected_prefix_tok is not None:
                         (
                             expected_prefix_tok,
@@ -4330,14 +4373,18 @@ class GPUModelRunner(
             tail_cpu = tail.tokens[:, :tail_len].to(
                 dtype=torch.int32, device=prefix_tok.device
             )
-            if use_draft_probs and tail.probs is not None:
-                tail_prob_rows: list[list[torch.Tensor]] = [
-                    [tail.probs[b, j] for j in range(tail_len)] for b in range(tail_eff)
-                ]
-            else:
-                tail_prob_rows = [[] for _ in range(tail_eff)]
+            tail_probs_slice = (
+                tail.probs[:, :tail_len]
+                if (use_draft_probs and tail.probs is not None)
+                else None
+            )
             for b in range(tail_eff):
                 row_chunk = tail_cpu[b]
+                len_before_tail = (
+                    int(prefix_len[b].item())
+                    if (tail_probs_slice is not None and prefix_prob_buf is not None)
+                    else 0
+                )
                 _hv_dense_append_tail_chunk(
                     prefix_tok, prefix_len, prefix_src, b, row_chunk, cap, 1
                 )
@@ -4351,22 +4398,21 @@ class GPUModelRunner(
                         cap,
                         1,
                     )
-                if use_draft_probs:
-                    prefix_prob_rows[b].extend(tail_prob_rows[b])
+                if tail_probs_slice is not None and prefix_prob_buf is not None:
+                    len_after_tail = int(prefix_len[b].item())
+                    n_tail_prob = len_after_tail - len_before_tail
+                    if n_tail_prob > 0:
+                        prefix_prob_buf[b, len_before_tail:len_after_tail] = (
+                            tail_probs_slice[b, :n_tail_prob].to(
+                                dtype=torch.float32,
+                                device=prefix_prob_buf.device,
+                            )
+                        )
             self._dit_debug_assert(
                 all(int(prefix_len[b].item()) <= cap for b in range(tail_eff)),
                 "check_hv_probs_and_stage_alignment",
                 detail=f"tail, prefix_lens={prefix_len[:tail_eff].tolist()}",
             )
-            if use_draft_probs:
-                self._dit_debug_assert(
-                    all(
-                        len(prefix_prob_rows[b]) == int(prefix_len[b].item())
-                        for b in range(tail_eff)
-                    ),
-                    "check_hv_probs_and_stage_alignment",
-                    detail=f"tail, prefix_prob_lens={[len(r) for r in prefix_prob_rows]}",
-                )
 
         eff_rows = int(prefix_tok.shape[0])
         dev = target_token_ids.device
@@ -4385,8 +4431,8 @@ class GPUModelRunner(
                 out_exp[b, :valid] = prefix_tok[b, :valid].to(dev, dtype=torch.int32)
                 source_stage_2d[b, :valid] = prefix_src[b, :valid].to(dev, dtype=torch.int32)
         draft_probs_flat = (
-            _flatten_prob_rows_for_output(prefix_prob_rows, out_exp)
-            if use_draft_probs
+            _flatten_prefix_prob_dense_for_output(prefix_prob_buf, out_exp)
+            if use_draft_probs and prefix_prob_buf is not None
             else None
         )
         row_req_ids = _hybrid_bundle_row_req_ids_for_batch(
