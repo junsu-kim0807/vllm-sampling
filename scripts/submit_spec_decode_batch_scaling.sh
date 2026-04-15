@@ -1,425 +1,115 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_DIR="/Users/junsu/StarKV/vllm-sampling"
+REPO_DIR="/scratch/junsuk87/vllm-sampling"
 
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b1.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b1.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b4.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b4.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b16.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b16.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b64.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b64.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b256.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b256.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b512.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b512.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/gov_report_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_llama33_70b/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_qwen30b_a3b/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/ar_deepseekcoder_33b/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_1b_to_llama33_70b/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/llama32_3b_to_llama33_70b/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_1p3b_to_33b/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/deepseekcoder_6p7b_to_33b/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_4b_to_qwen3_30b_a3b/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_4b_instruct_2507/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen25_0p5b_to_qwen3_30b_a3b_instruct_2507/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_4b_instruct_2507/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/qwen3_0p6b_to_qwen3_30b_a3b_instruct_2507/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_llama33_70b/qmsum_b1024.slurm
-echo "sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b1024.slurm"
-sbatch /Users/junsu/StarKV/vllm-sampling/scripts/jobs/spec_decode/eagle3_qwen30b_a3b/qmsum_b1024.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b1/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b1/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b1/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b1/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b1/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b1/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b1/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b1/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b1/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b1/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b1/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b1/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b1/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b1/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b1/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b1/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b1/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b1/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b1/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b1/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/eagle3/b1/k3/eagle3_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/eagle3/b1/k3/eagle3_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b4/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b4/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b4/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b4/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b4/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b4/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b4/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b4/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b4/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b4/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b4/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b4/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b4/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b4/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b4/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b4/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b4/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b4/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b4/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b4/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/eagle3/b4/k3/eagle3_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/eagle3/b4/k3/eagle3_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b16/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b16/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b16/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b16/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b16/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b16/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b16/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b16/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b16/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b16/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b16/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b16/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b16/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b16/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b16/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b16/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b16/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b16/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b16/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b16/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/eagle3/b16/k3/eagle3_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/eagle3/b16/k3/eagle3_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b64/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b64/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b64/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b64/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b64/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b64/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b64/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b64/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b64/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b64/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b64/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b64/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b64/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b64/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b64/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b64/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b64/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b64/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b64/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b64/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/eagle3/b64/k3/eagle3_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/eagle3/b64/k3/eagle3_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b256/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b256/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b256/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b256/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b256/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b256/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b256/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b256/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b256/k3/llama32_1b_to_llama33_70b/aime25.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b256/k3/llama32_1b_to_llama33_70b/aime25.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b256/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/speculative/b256/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b256/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/magicdec/b256/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b256/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/tetris/b256/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b256/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot/b256/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b256/k3/llama32_1b_to_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/pivot/pivot_spechive/b256/k3/llama32_1b_to_llama33_70b/alpaca.slurm
+echo "sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/eagle3/b256/k3/eagle3_llama33_70b/alpaca.slurm"
+sbatch /scratch/junsuk87/vllm-sampling/scripts/jobs/spec_decode/eagle3/b256/k3/eagle3_llama33_70b/alpaca.slurm

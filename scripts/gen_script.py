@@ -489,20 +489,20 @@ BATCH_SPEC_PAIR_CONFIGS: list[BatchSpecPairConfig] = [
         note="Llama 3.2 1B draft -> Llama 3.3 70B target",
         pivot_intermediate_key="llama31_8b",
     ),
-    BatchSpecPairConfig(
-        pair_id="vicuna_68m_to_vicuna_13b_v13",
-        draft_key="vicuna_68m",
-        target_key="vicuna_13b_v13",
-        tp_size=1,
-        gpu_count=1,
-        note="Vicuna 68M draft -> Vicuna 13B v1.3 target",
-        pivot_intermediate_key="vicuna_7b_v13",
-    ),
+    # BatchSpecPairConfig(
+    #     pair_id="vicuna_68m_to_vicuna_13b_v13",
+    #     draft_key="vicuna_68m",
+    #     target_key="vicuna_13b_v13",
+    #     tp_size=1,
+    #     gpu_count=1,
+    #     note="Vicuna 68M draft -> Vicuna 13B v1.3 target",
+    #     pivot_intermediate_key="vicuna_7b_v13",
+    # ),
 ]
 
 DATASETS: list[DatasetConfig] = [
-    DatasetConfig(name="aime25", max_new_tokens=256),
-    DatasetConfig(name="codeelo", max_new_tokens=1024),
+    DatasetConfig(name="aime25", max_new_tokens=2048),
+    DatasetConfig(name="codeelo", max_new_tokens=2048),
     DatasetConfig(name="gov_report", max_new_tokens=512),
     DatasetConfig(name="qmsum", max_new_tokens=512),
     DatasetConfig(name="alpaca", max_new_tokens=256),
@@ -760,8 +760,8 @@ def build_python_command(
             parts.append(f"--tetris-turn-on-batch-size {tetris_turn_on_batch_size}")
 
     max_tokens_by_dataset = {
-        "aime25": 256,
-        "codeelo": 1024,
+        "aime25": 2048,
+        "codeelo": 2048,
         "gov_report": 512,
         "qmsum": 512,
         "spec_bench": 256,
@@ -1369,7 +1369,7 @@ def main() -> None:
             )
 
         if args.batch:
-            batch_sizes_list = [1, 4, 16, 64, 256, 512]
+            batch_sizes_list = [1, 4, 16, 64, 256]
             num_spec_values = [3]
             pivot_ablation_pairs: list[tuple[int, float]] = [
                 (args.topk_selection, args.expansion_pct)
@@ -1378,14 +1378,14 @@ def main() -> None:
             scaling_mode = "batch"
         elif args.length:
             batch_sizes_list = [256]
-            num_spec_values = [5, 7, 9, 11]
+            num_spec_values = [7, 11]
             pivot_ablation_pairs = [(args.topk_selection, args.expansion_pct)]
             pivot_only = False
             scaling_mode = "length"
         else:
-            batch_sizes_list = [1, 4, 16, 64, 256, 512]
+            batch_sizes_list = [256]
             num_spec_values = [3]
-            pivot_ablation_pairs = [(2, 0.1), (2, 0.2), (5, 0.1), (5, 0.2)]
+            pivot_ablation_pairs = [(2, 0.1), (2, 0.2), (5, 0.1)]
             pivot_only = True
             scaling_mode = "ablation"
 
@@ -1418,14 +1418,14 @@ def main() -> None:
         )
 
         ar_pairs: list[PairConfig] = [
-            # PairConfig(
-            #     pair_id="ar_llama33_70b",
-            #     draft_model=llama33_70b,
-            #     target_model=llama33_70b,
-            #     tp_size=4,
-            #     gpu_count=4,
-            #     note="AR only (no speculative decoding)",
-            # ),
+            PairConfig(
+                pair_id="ar_llama33_70b",
+                draft_model=llama33_70b,
+                target_model=llama33_70b,
+                tp_size=4,
+                gpu_count=4,
+                note="AR only (no speculative decoding)",
+            ),
             # PairConfig(
             #     pair_id="ar_qwen30b_a3b",
             #     draft_model=qwen30b_a3b,
@@ -1445,14 +1445,14 @@ def main() -> None:
         ]
 
         eagle_pairs: list[PairConfig] = [
-            # PairConfig(
-            #     pair_id="eagle3_llama33_70b",
-            #     draft_model=llama33_70b,
-            #     target_model=llama33_70b,
-            #     tp_size=4,
-            #     gpu_count=4,
-            #     note="EAGLE3 (eagle3 method)",
-            # ),
+            PairConfig(
+                pair_id="eagle3_llama33_70b",
+                draft_model=llama33_70b,
+                target_model=llama33_70b,
+                tp_size=4,
+                gpu_count=4,
+                note="EAGLE3 (eagle3 method)",
+            ),
             # PairConfig(
             #     pair_id="eagle3_qwen30b_a3b",
             #     draft_model=qwen30b_a3b,
@@ -1849,21 +1849,22 @@ def main() -> None:
                 #         time_limit_override=tl,
                 #     )
 
-                # for pair in eagle_pairs:
-                #     eagle_model = (
-                #         eagle_llama33_speculator
-                #         if pair.target_model == llama33_70b
-                #         else eagle_qwen30b_a3b_speculator
-                #     )
-                #     _write_one(
-                #         pair=pair,
-                #         dataset=dataset,
-                #         bs=bs,
-                #         method="eagle3",
-                #         eagle_model=eagle_model,
-                #         eagle_draft_tp=1,
-                #         time_limit_override=tl,
-                #     )
+                for pair in eagle_pairs:
+                    eagle_model = (
+                        eagle_llama33_speculator
+                        if pair.target_model == llama33_70b
+                        else eagle_qwen30b_a3b_speculator
+                    )
+                    _write_one(
+                        pair=pair,
+                        dataset=dataset,
+                        bs=bs,
+                        method="eagle3",
+                        eagle_model=eagle_model,
+                        eagle_draft_tp=1,
+                        time_limit_override=tl,
+                        num_spec_tokens=num_spec,
+                    )
 
         num_written = len(written_scripts)
         print(f"[{scaling_mode}] Generated {num_written} job scripts.")
