@@ -263,6 +263,11 @@ class SpecDecodeRequestMetadataRecord:
     first_draft_topk_k: int = 0
     first_draft_topk_source: str | None = None
 
+    # Target model at first draft verify position (same pipeline as rejection verify)
+    first_draft_target_top1_token_id: int | None = None
+    first_draft_target_top1_confidence: float | None = None
+    first_draft_target_top1_source: str | None = None
+
 
 @dataclass
 class SpecDecodeBatchMetadataRecord:
@@ -354,6 +359,10 @@ class StepProfileContext:
     # Staged verification metadata
     staged_verification_depth: int = 0
     staged_verification_used: bool = False
+
+    # req_id -> (token_id, softmax confidence) for first draft row (verify logits)
+    first_draft_target_top1_by_req_id: dict[str, tuple[int, float]] = field(
+        default_factory=dict)
 
     # Deep profiler kernel records (populated only on sampled steps)
     kernel_records: list[SpecDecodeStageKernelRecord] = field(

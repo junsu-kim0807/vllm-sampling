@@ -162,6 +162,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
+    apply_sampling_constraints,
 )
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.adaptive_cascade import (
@@ -4501,6 +4502,11 @@ class GPUModelRunner(
                     sampled_ids_only=False,
                 )
 
+        self._maybe_capture_first_draft_target_top1_for_profile(
+            spec_decode_metadata,
+            logits,
+            verity_sm,
+        )
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
@@ -4758,6 +4764,66 @@ class GPUModelRunner(
         if not callable(getter):
             return None, None
         return getter()
+
+    def _maybe_capture_first_draft_target_top1_for_profile(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        logits: torch.Tensor,
+        verity_sm: SamplingMetadata,
+    ) -> None:
+        """Record target top-1 at the first draft verify row per req_id for JSONL."""
+        pctx = self._current_profile_ctx
+        if pctx is None or not self._spec_profiler.mode.metadata_enabled:
+            return
+        if self.rejection_sampler is None:
+            return
+        tidx = spec_decode_metadata.target_logits_indices
+        if tidx.numel() == 0:
+            return
+        rs = self.rejection_sampler
+        proc_block = logits[tidx].to(torch.float32)
+        if not rs.is_processed_logprobs_mode:
+            proc_block = proc_block.clone()
+        proc_block = rs.apply_logits_processors(
+            proc_block,
+            verity_sm,
+            spec_decode_metadata,
+        )
+        proc_block = apply_sampling_constraints(
+            proc_block,
+            spec_decode_metadata.cu_num_draft_tokens,
+            verity_sm,
+        )
+        cu_cpu = spec_decode_metadata.cu_num_draft_tokens.detach().cpu()
+        num_draft = spec_decode_metadata.num_draft_tokens
+        row_req_ids = self._spec_decode_metadata_row_req_ids(spec_decode_metadata)
+        first_rows: list[int] = []
+        first_rids: list[str] = []
+        seen_rid: set[str] = set()
+        prev = 0
+        for i, nd in enumerate(num_draft):
+            if nd > 0:
+                rid = row_req_ids[i]
+                if rid not in seen_rid:
+                    seen_rid.add(rid)
+                    first_rows.append(prev)
+                    first_rids.append(rid)
+            prev = int(cu_cpu[i].item())
+        if not first_rows:
+            return
+        row_idx = torch.tensor(first_rows, device=proc_block.device, dtype=torch.long)
+        sub = proc_block[row_idx]
+        probs = torch.softmax(sub, dim=-1, dtype=torch.float32)
+        top1_conf, top1_ids = torch.max(probs, dim=-1)
+        top1_ids_cpu = top1_ids.detach().cpu()
+        top1_conf_cpu = top1_conf.detach().cpu()
+        out = pctx.first_draft_target_top1_by_req_id
+        out.clear()
+        for j, rid in enumerate(first_rids):
+            out[rid] = (
+                int(top1_ids_cpu[j].item()),
+                float(top1_conf_cpu[j].item()),
+            )
 
     def _bookkeeping_sync(
         self,
@@ -5960,6 +6026,17 @@ class GPUModelRunner(
                         _fd_conf = None
                         _fd_k = 0
 
+                    _tgt1_tid: int | None = None
+                    _tgt1_conf: float | None = None
+                    _tgt1_src: str | None = None
+                    if _pctx_rm is not None:
+                        _tgt_map = _pctx_rm.first_draft_target_top1_by_req_id
+                        if _rid in _tgt_map:
+                            _tgt1_tid, _tgt1_conf = _tgt_map[_rid]
+                            _tgt1_src = "target_verify_logits"
+                    if _tgt1_src is None:
+                        _tgt1_src = "unavailable"
+
                     _req_rec = SpecDecodeRequestMetadataRecord(
                         step_id=_step_id,
                         req_id=_rid,
@@ -5981,6 +6058,9 @@ class GPUModelRunner(
                         first_draft_topk_confidences=_fd_conf,
                         first_draft_topk_k=_fd_k,
                         first_draft_topk_source=_fd_src,
+                        first_draft_target_top1_token_id=_tgt1_tid,
+                        first_draft_target_top1_confidence=_tgt1_conf,
+                        first_draft_target_top1_source=_tgt1_src,
                     )
                     # Attach token IDs if configured
                     if _incl_tids and _sd_toks:

@@ -681,7 +681,13 @@ class TestFirstDraftTopkMetadataHelpers:
             first_draft_topk_confidences=[0.9, 0.1],
             first_draft_topk_k=2,
             first_draft_topk_source="profile_first_draft_topk",
+            first_draft_target_top1_token_id=42,
+            first_draft_target_top1_confidence=0.12,
+            first_draft_target_top1_source="target_verify_logits",
         )
         d = asdict(rec)
         assert d["first_draft_topk_k"] == 2
         assert d["first_draft_topk_source"] == "profile_first_draft_topk"
+        assert d["first_draft_target_top1_token_id"] == 42
+        assert d["first_draft_target_top1_confidence"] == pytest.approx(0.12)
+        assert d["first_draft_target_top1_source"] == "target_verify_logits"
