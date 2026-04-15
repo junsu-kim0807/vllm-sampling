@@ -161,8 +161,9 @@ class HybridProposalBundle:
     # batch when prepare-time metadata rows differ from propose-time order.
     bundle_row_req_ids: tuple[str, ...] | None = None
     # Optional per-row staged-verification totals recorded before target verify.
-    inter_verified_counts: list[int] | None = None
-    inter_accepted_counts: list[int] | None = None
+    # May be a 1-D CPU int tensor (e.g. HV loop) or a Python list at boundaries.
+    inter_verified_counts: torch.Tensor | list[int] | None = None
+    inter_accepted_counts: torch.Tensor | list[int] | None = None
     staged_verification_depth: int = 0
 
 

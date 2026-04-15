@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace as dataclass_replace
@@ -369,6 +369,48 @@ def _expand_list_rows_by_pivot_plan(
     rows: list[list[Any]], plan: PivotExpansionPlan
 ) -> list[list[Any]]:
     return [list(rows[o]) for o in _pivot_plan_sm_indices(plan)]
+
+
+def _rows_are_all_empty(rows: list[list[Any]]) -> bool:
+    return all(len(row) == 0 for row in rows)
+
+
+def _can_use_empty_prefix_expansion_fast_path(
+    *,
+    prefix_rows: list[list[int]],
+    prefix_prob_rows: list[list[torch.Tensor]],
+    source_stage_rows: list[list[int]],
+    use_draft_probs: bool,
+) -> bool:
+    if not _rows_are_all_empty(prefix_rows):
+        return False
+    if not _rows_are_all_empty(source_stage_rows):
+        return False
+    if use_draft_probs and not _rows_are_all_empty(prefix_prob_rows):
+        return False
+    return True
+
+
+def _expand_count_tensor_by_pivot_plan(
+    counts: torch.Tensor,
+    plan: PivotExpansionPlan,
+) -> torch.Tensor:
+    gather_idx = plan.row_gather_idx_cpu
+    if gather_idx is None:
+        gather_idx = torch.tensor(_pivot_plan_sm_indices(plan), dtype=torch.long)
+    return counts.index_select(0, gather_idx)
+
+
+def _inter_bundle_counts_len(counts: torch.Tensor | list[int]) -> int:
+    if isinstance(counts, torch.Tensor):
+        return int(counts.shape[0])
+    return len(counts)
+
+
+def _inter_bundle_count_at(counts: torch.Tensor | list[int], row_idx: int) -> int:
+    if isinstance(counts, torch.Tensor):
+        return int(counts[row_idx].item())
+    return int(counts[row_idx])
 
 
 def _collapse_draft_tensor_rows_for_scheduler(
@@ -3527,20 +3569,28 @@ class GPUModelRunner(
         logger.info("DIT_DEBUG %s", json.dumps(event, sort_keys=True, default=str))
 
     def _dit_debug_assert(
-        self, cond: bool, code: str, *, detail: str = "", context: dict[str, Any] | None = None
+        self,
+        cond: bool | Callable[[], bool],
+        code: str,
+        *,
+        detail: str = "",
+        context: dict[str, Any] | None = None,
     ) -> bool:
         if not self._is_dit_debug_enabled():
+            if callable(cond):
+                return True
             return cond
+        cond_val = cond() if callable(cond) else cond
         counts = self._dit_debug_check_counts[code]
-        if cond:
+        if cond_val:
             counts[0] += 1
         else:
             counts[1] += 1
-        payload: dict[str, Any] = {"check_code": code, "ok": cond, "detail": detail}
+        payload: dict[str, Any] = {"check_code": code, "ok": cond_val, "detail": detail}
         if context is not None:
             payload.update(context)
         self._dit_debug_event("check", payload)
-        return cond
+        return cond_val
 
     def _dit_debug_emit_summary(self, *, reason: str) -> None:
         if not (self._is_dit_debug_enabled() and self._dit_debug_summary):
@@ -3592,32 +3642,38 @@ class GPUModelRunner(
                     continue
                 if not (0 <= origin_row < origin_batch_size):
                     continue
-                if row_idx < len(inter_verified_rows):
-                    inter_verified_per_req[origin_row] += int(
-                        inter_verified_rows[row_idx]
+                if row_idx < _inter_bundle_counts_len(inter_verified_rows):
+                    inter_verified_per_req[origin_row] += _inter_bundle_count_at(
+                        inter_verified_rows, row_idx
                     )
-                if row_idx < len(inter_accepted_rows):
-                    inter_accepted_per_req[origin_row] += int(
-                        inter_accepted_rows[row_idx]
+                if row_idx < _inter_bundle_counts_len(inter_accepted_rows):
+                    inter_accepted_per_req[origin_row] += _inter_bundle_count_at(
+                        inter_accepted_rows, row_idx
                     )
             if selected_rows is not None:
                 for origin_row, row_idx in enumerate(selected_rows):
                     if origin_row >= origin_batch_size:
                         break
-                    if 0 <= row_idx < len(inter_accepted_rows):
-                        partial_accepted_per_req[origin_row] = int(
-                            inter_accepted_rows[row_idx]
+                    if 0 <= row_idx < _inter_bundle_counts_len(inter_accepted_rows):
+                        partial_accepted_per_req[origin_row] = _inter_bundle_count_at(
+                            inter_accepted_rows, row_idx
                         )
         else:
             limit = min(
                 origin_batch_size,
-                len(inter_verified_rows),
-                len(inter_accepted_rows),
+                _inter_bundle_counts_len(inter_verified_rows),
+                _inter_bundle_counts_len(inter_accepted_rows),
             )
             for row_idx in range(limit):
-                inter_verified_per_req[row_idx] = int(inter_verified_rows[row_idx])
-                inter_accepted_per_req[row_idx] = int(inter_accepted_rows[row_idx])
-                partial_accepted_per_req[row_idx] = int(inter_accepted_rows[row_idx])
+                inter_verified_per_req[row_idx] = _inter_bundle_count_at(
+                    inter_verified_rows, row_idx
+                )
+                inter_accepted_per_req[row_idx] = _inter_bundle_count_at(
+                    inter_accepted_rows, row_idx
+                )
+                partial_accepted_per_req[row_idx] = _inter_bundle_count_at(
+                    inter_accepted_rows, row_idx
+                )
 
         pctx.inter_verified_per_req = inter_verified_per_req
         pctx.inter_accepted_per_req = inter_accepted_per_req
@@ -3756,17 +3812,21 @@ class GPUModelRunner(
         prefix_rows: list[list[int]] = [[] for _ in range(batch_size)]
         prefix_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
         source_stage_rows: list[list[int]] = [[] for _ in range(batch_size)]
-        expected_prefix_rows: list[list[int]] = [[] for _ in range(batch_size)]
-        inter_verified_rows: list[int] = [0 for _ in range(batch_size)]
-        inter_accepted_rows: list[int] = [0 for _ in range(batch_size)]
+        dit_debug_enabled = self._is_dit_debug_enabled()
+        expected_prefix_rows: list[list[int]] | None = (
+            [[] for _ in range(batch_size)] if dit_debug_enabled else None
+        )
+        inter_verified_rows = torch.zeros(batch_size, dtype=torch.int32)
+        inter_accepted_rows = torch.zeros(batch_size, dtype=torch.int32)
         pivot_expansion_plan: PivotExpansionPlan | None = None
 
         for round_idx in range(n_inner):
-            self._dit_debug_assert(
-                prefix_rows == expected_prefix_rows,
-                "check3_next_draft_starts_from_intermediate_prefix",
-                detail=f"round={round_idx}",
-            )
+            if dit_debug_enabled:
+                self._dit_debug_assert(
+                    lambda: prefix_rows == expected_prefix_rows,
+                    "check3_next_draft_starts_from_intermediate_prefix",
+                    detail=f"round={round_idx}",
+                )
             sm_idxs = (
                 _pivot_plan_sm_indices(pivot_expansion_plan)
                 if pivot_expansion_plan is not None
@@ -3847,25 +3907,36 @@ class GPUModelRunner(
                                      invocation_idx=round_idx)
                 _hv_prof.start_stage("expand_prefix_rows",
                                      invocation_idx=round_idx)
-                prefix_rows = _expand_list_rows_by_pivot_plan(
-                    prefix_rows, pivot_expansion_plan
+                if _can_use_empty_prefix_expansion_fast_path(
+                    prefix_rows=prefix_rows,
+                    prefix_prob_rows=prefix_prob_rows,
+                    source_stage_rows=source_stage_rows,
+                    use_draft_probs=use_draft_probs,
+                ):
+                    prefix_rows = [[] for _ in range(eff_bs)]
+                    prefix_prob_rows = [[] for _ in range(eff_bs)]
+                    source_stage_rows = [[] for _ in range(eff_bs)]
+                    if expected_prefix_rows is not None:
+                        expected_prefix_rows = [[] for _ in range(eff_bs)]
+                else:
+                    prefix_rows = _expand_list_rows_by_pivot_plan(
+                        prefix_rows, pivot_expansion_plan
+                    )
+                    prefix_prob_rows = _expand_list_rows_by_pivot_plan(
+                        prefix_prob_rows, pivot_expansion_plan
+                    )
+                    source_stage_rows = _expand_list_rows_by_pivot_plan(
+                        source_stage_rows, pivot_expansion_plan
+                    )
+                    if expected_prefix_rows is not None:
+                        expected_prefix_rows = _expand_list_rows_by_pivot_plan(
+                            expected_prefix_rows, pivot_expansion_plan
+                        )
+                inter_verified_rows = _expand_count_tensor_by_pivot_plan(
+                    inter_verified_rows, pivot_expansion_plan
                 )
-                prefix_prob_rows = _expand_list_rows_by_pivot_plan(
-                    prefix_prob_rows, pivot_expansion_plan
-                )
-                source_stage_rows = _expand_list_rows_by_pivot_plan(
-                    source_stage_rows, pivot_expansion_plan
-                )
-                inter_verified_rows = [
-                    inter_verified_rows[o]
-                    for o in _pivot_plan_sm_indices(pivot_expansion_plan)
-                ]
-                inter_accepted_rows = [
-                    inter_accepted_rows[o]
-                    for o in _pivot_plan_sm_indices(pivot_expansion_plan)
-                ]
-                expected_prefix_rows = _expand_list_rows_by_pivot_plan(
-                    expected_prefix_rows, pivot_expansion_plan
+                inter_accepted_rows = _expand_count_tensor_by_pivot_plan(
+                    inter_accepted_rows, pivot_expansion_plan
                 )
                 _hv_prof.end_stage("expand_prefix_rows",
                                    invocation_idx=round_idx)
@@ -4009,7 +4080,8 @@ class GPUModelRunner(
             before_lens = [len(r) for r in prefix_rows]
             for b, emitted in enumerate(decision.emitted_rows):
                 prefix_rows[b].extend(emitted)
-                expected_prefix_rows[b].extend(emitted)
+                if expected_prefix_rows is not None:
+                    expected_prefix_rows[b].extend(emitted)
                 source_stage_rows[b].extend([0] * len(emitted))
                 if use_draft_probs:
                     prefix_prob_rows[b].extend(decision.emitted_prob_rows[b])
@@ -4088,23 +4160,31 @@ class GPUModelRunner(
             tail_eff = int(tail.tokens.shape[0])
             if tail_eff != len(prefix_rows):
                 assert pivot_expansion_plan is not None, "tail batch must match prefix rows"
-                prefix_rows = _expand_list_rows_by_pivot_plan(
-                    prefix_rows, pivot_expansion_plan
+                if _can_use_empty_prefix_expansion_fast_path(
+                    prefix_rows=prefix_rows,
+                    prefix_prob_rows=prefix_prob_rows,
+                    source_stage_rows=source_stage_rows,
+                    use_draft_probs=use_draft_probs,
+                ):
+                    prefix_rows = [[] for _ in range(tail_eff)]
+                    prefix_prob_rows = [[] for _ in range(tail_eff)]
+                    source_stage_rows = [[] for _ in range(tail_eff)]
+                else:
+                    prefix_rows = _expand_list_rows_by_pivot_plan(
+                        prefix_rows, pivot_expansion_plan
+                    )
+                    prefix_prob_rows = _expand_list_rows_by_pivot_plan(
+                        prefix_prob_rows, pivot_expansion_plan
+                    )
+                    source_stage_rows = _expand_list_rows_by_pivot_plan(
+                        source_stage_rows, pivot_expansion_plan
+                    )
+                inter_verified_rows = _expand_count_tensor_by_pivot_plan(
+                    inter_verified_rows, pivot_expansion_plan
                 )
-                prefix_prob_rows = _expand_list_rows_by_pivot_plan(
-                    prefix_prob_rows, pivot_expansion_plan
+                inter_accepted_rows = _expand_count_tensor_by_pivot_plan(
+                    inter_accepted_rows, pivot_expansion_plan
                 )
-                source_stage_rows = _expand_list_rows_by_pivot_plan(
-                    source_stage_rows, pivot_expansion_plan
-                )
-                inter_verified_rows = [
-                    inter_verified_rows[o]
-                    for o in _pivot_plan_sm_indices(pivot_expansion_plan)
-                ]
-                inter_accepted_rows = [
-                    inter_accepted_rows[o]
-                    for o in _pivot_plan_sm_indices(pivot_expansion_plan)
-                ]
             tail_eff = int(tail.tokens.shape[0])
             tail_rows = [
                 [int(tok) for tok in tail.tokens[b].tolist()] for b in range(tail_eff)
@@ -4594,11 +4674,24 @@ class GPUModelRunner(
                 expansion_plan,
                 num_draft_tokens=num_draft_for_collapse,
             )
-            sampler_output.sampled_token_ids = collapse_pivot_expanded_sampled_to_origin(
+            collapsed = collapse_pivot_expanded_sampled_to_origin(
                 sampler_output.sampled_token_ids,
                 expansion_plan,
                 num_draft_tokens=num_draft_for_collapse,
+                selected_rows=selected_rows,
             )
+            if self._is_dit_debug_enabled():
+                collapsed_legacy = collapse_pivot_expanded_sampled_to_origin(
+                    sampler_output.sampled_token_ids,
+                    expansion_plan,
+                    num_draft_tokens=num_draft_for_collapse,
+                    selected_rows=None,
+                )
+                self._dit_debug_assert(
+                    bool(torch.equal(collapsed, collapsed_legacy)),
+                    "pivot_collapse_selected_rows_equiv",
+                )
+            sampler_output.sampled_token_ids = collapsed
             self._spec_profiler.end_stage("collapse_after_target_select")
         if log_pivot_accept_len and pre_collapse_accept_mean is not None:
             post_nd = _post_collapse_num_draft_per_origin(

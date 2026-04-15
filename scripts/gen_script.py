@@ -498,8 +498,8 @@ BATCH_SPEC_PAIR_CONFIGS: list[BatchSpecPairConfig] = [
 ]
 
 DATASETS: list[DatasetConfig] = [
-    DatasetConfig(name="aime25", max_new_tokens=256),
-    DatasetConfig(name="codeelo", max_new_tokens=1024),
+    DatasetConfig(name="aime25", max_new_tokens=2048),
+    DatasetConfig(name="codeelo", max_new_tokens=2048),
     DatasetConfig(name="gov_report", max_new_tokens=512),
     DatasetConfig(name="qmsum", max_new_tokens=512),
     DatasetConfig(name="alpaca", max_new_tokens=256),
@@ -757,8 +757,8 @@ def build_python_command(
             parts.append(f"--tetris-turn-on-batch-size {tetris_turn_on_batch_size}")
 
     max_tokens_by_dataset = {
-        "aime25": 256,
-        "codeelo": 1024,
+        "aime25": 2048,
+        "codeelo": 2048,
         "gov_report": 512,
         "qmsum": 512,
         "spec_bench": 256,

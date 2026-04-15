@@ -13,6 +13,7 @@ from vllm.v1.spec_decode.spec_stage_ops import (
     collapse_pivot_expanded_sampled_to_origin,
     get_unselected_cleanup_rows,
     remap_hybrid_bundle_rows_for_metadata,
+    select_pivot_expanded_rows_to_origin,
     validate_root_only_pivot_expansion,
 )
 from vllm.v1.spec_decode.spec_stage_runtime import (
@@ -298,6 +299,11 @@ def test_collapse_pivot_without_family_uses_origin_to_base_row() -> None:
     assert out.shape == (B, 1)
     assert int(out[0, 0].item()) == 10
     assert int(out[1, 0].item()) == 20
+    selected = select_pivot_expanded_rows_to_origin(sampled, plan)
+    out_passthrough = collapse_pivot_expanded_sampled_to_origin(
+        sampled, plan, selected_rows=selected
+    )
+    assert torch.equal(out, out_passthrough)
 
 
 def test_validate_root_only_pivot_expansion_rejects_non_root_prefix() -> None:

@@ -497,22 +497,28 @@ def collapse_pivot_expanded_sampled_to_origin(
     expansion_plan: PivotExpansionPlan,
     *,
     num_draft_tokens: list[int] | None = None,
+    selected_rows: list[int] | None = None,
 ) -> torch.Tensor:
     """Map expanded verification rows (P) back to one row per origin request (B).
 
     Inactive fixed-capacity packed rows are never chosen from ``PivotExpansionFamily``
     (those indices are omitted from ``expanded_rows``); we still skip any inactive
     row defensively when ``packed_row_is_active`` is present.
+
+    If ``selected_rows`` is provided (e.g. caller already ran
+    ``select_pivot_expanded_rows_to_origin``), it is used directly and selection is
+    skipped. Otherwise selection runs inside this function (backward compatible).
     """
     if sampled_token_ids.shape[0] < expansion_plan.expanded_batch_size:
         return sampled_token_ids
     if not expansion_plan.expanded_to_origin:
         return sampled_token_ids
-    selected_rows = select_pivot_expanded_rows_to_origin(
-        sampled_token_ids,
-        expansion_plan,
-        num_draft_tokens=num_draft_tokens,
-    )
+    if selected_rows is None:
+        selected_rows = select_pivot_expanded_rows_to_origin(
+            sampled_token_ids,
+            expansion_plan,
+            num_draft_tokens=num_draft_tokens,
+        )
     device = sampled_token_ids.device
     idx = torch.tensor(selected_rows, device=device, dtype=torch.long)
     return sampled_token_ids.index_select(0, idx)
@@ -549,8 +555,18 @@ def expand_intermediate_state_for_pivot_plan(
     sm = plan.packed_sm_origin
     if sm is None:
         sm = plan.expanded_to_origin
-    expanded_frontier = [state.frontier_metadata[o] for o in sm]
-    state.frontier_metadata = [dict(item) for item in expanded_frontier]
+    # Copy dict rows only when an origin row is duplicated by expansion.
+    # Unique origin rows can be safely reused because each resulting row owns
+    # its distinct metadata entry in the expanded state.
+    origin_freq = Counter(sm)
+    expanded_frontier: list[dict[str, object]] = []
+    for origin_row in sm:
+        item = state.frontier_metadata[origin_row]
+        if origin_freq[origin_row] > 1:
+            expanded_frontier.append(dict(item))
+        else:
+            expanded_frontier.append(item)
+    state.frontier_metadata = expanded_frontier
     return state
 
 
