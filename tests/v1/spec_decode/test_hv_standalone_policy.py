@@ -15,6 +15,17 @@ def _func_body(src: str, name: str) -> str:
     return ""
 
 
+def test_vllm_as_plain_draft_sets_prompt_lookup_for_replace_validation() -> None:
+    """HV (and similar) __post_init__ leaves prompt_lookup_* at 0; replace(draft_model) must override."""
+    root = Path(__file__).resolve().parents[3]
+    text = (root / "vllm" / "v1" / "spec_decode" / "adaptive_cascade.py").read_text(
+        encoding="utf-8"
+    )
+    body = _func_body(text, "_vllm_as_plain_draft")
+    assert "prompt_lookup_min=1" in body
+    assert "prompt_lookup_max=1" in body
+
+
 def test_run_hv_draft_step_does_not_call_adaptive_build_prefix_conditioned_inputs() -> None:
     """Draft HV step must use runner-local ``hv_step_packing``, not adaptive_cascade."""
     root = Path(__file__).resolve().parents[3]

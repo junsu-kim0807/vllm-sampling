@@ -200,7 +200,8 @@ def test_intermediate_kv_storage_assumptions_docstring() -> None:
     text = (root / "vllm" / "v1" / "worker" / "gpu_model_runner.py").read_text(
         encoding="utf-8"
     )
-    assert "Intermediate KV frontier — storage assumptions" in text
+    # Doc heading was renamed from "Intermediate KV frontier" to "Intermediate frontier".
+    assert "Intermediate frontier — storage assumptions" in text
     assert "_hv_scheduler_output" in text
 
 

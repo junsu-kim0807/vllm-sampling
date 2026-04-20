@@ -83,7 +83,13 @@ def _chain_spec_token_tree(num_tokens: int) -> str:
 def _vllm_as_plain_draft(base: VllmConfig) -> VllmConfig:
     spec = base.speculative_config
     assert spec is not None
-    new_spec = replace(spec, method="draft_model")
+    # Non-ngram __post_init__ sets prompt_lookup_* to 0; pydantic rejects 0 on replace().
+    new_spec = replace(
+        spec,
+        method="draft_model",
+        prompt_lookup_min=1,
+        prompt_lookup_max=1,
+    )
     return replace(base, speculative_config=new_spec)
 
 
@@ -99,6 +105,8 @@ def _vllm_intermediate_as_draft(base: VllmConfig) -> VllmConfig:
         draft_model_config=spec.intermediate_model_config,
         draft_parallel_config=spec.intermediate_parallel_config,
         draft_tensor_parallel_size=spec.intermediate_tensor_parallel_size,
+        prompt_lookup_min=1,
+        prompt_lookup_max=1,
     )
     return replace(base, speculative_config=new_spec)
 
@@ -121,6 +129,8 @@ def _vllm_hierarchical_verification_chunk(
             draft_tensor_parallel_size=spec.intermediate_tensor_parallel_size,
             num_speculative_tokens=length,
             speculative_token_tree=tree,
+            prompt_lookup_min=1,
+            prompt_lookup_max=1,
         )
     else:
         new_spec = replace(
@@ -128,6 +138,8 @@ def _vllm_hierarchical_verification_chunk(
             method="draft_model",
             num_speculative_tokens=length,
             speculative_token_tree=tree,
+            prompt_lookup_min=1,
+            prompt_lookup_max=1,
         )
     return replace(base, speculative_config=new_spec)
 
@@ -151,6 +163,8 @@ def _vllm_hierarchical_eagle_chunk(
             draft_tensor_parallel_size=spec.intermediate_tensor_parallel_size,
             num_speculative_tokens=length,
             speculative_token_tree=tree,
+            prompt_lookup_min=1,
+            prompt_lookup_max=1,
         )
     else:
         new_spec = replace(
