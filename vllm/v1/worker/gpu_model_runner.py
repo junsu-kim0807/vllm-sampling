@@ -166,16 +166,21 @@ from vllm.v1.sample.rejection_sampler import (
 )
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.adaptive_spechive import AdaptiveSpechiveProposer
-from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.draft_model import (
+    DraftModelProposer,
+    PinnedDraftNamespaceDraftModelProposer,
+)
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.adaptive_cascade import (
     IntermediateDraftModelProposer,
+    _build_prefix_conditioned_inputs,
     _canonicalize_reused_prefix_frontier,
 )
 from vllm.v1.spec_decode.hierarchical_verification import HierarchicalVerificationProposer
 from vllm.v1.spec_decode.hv_step_packing import (
     build_prefix_conditioned_inputs as hv_build_prefix_conditioned_inputs,
+    gather_hv_verification_logits_from_spec_decode_metadata,
     slice_hv_verification_logits,
 )
 from vllm.v1.spec_decode.hybrid_bundle_utils import (
@@ -202,6 +207,7 @@ from vllm.v1.spec_decode.spec_stage_ops import (
 )
 from vllm.v1.spec_decode.spec_stage_runtime import (
     DitRoundDecision,
+    DitRoundProposal,
     DitRoundVerification,
     HybridProposalBundle,
     IntermediateRoundState,
@@ -726,6 +732,8 @@ class GPUModelRunner(
             return spec.adaptive_spechive_mode == "hierarchical_verification"
         if spec.method == "pivot":
             return bool(spec.pivot_spechive)
+        if spec.method == "hierarchical_verification":
+            return True
         return False
 
     def _intermediate_kv_frontier_enabled(self) -> bool:
@@ -1041,30 +1049,30 @@ class GPUModelRunner(
             self.intermediate_num_accepted_tokens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int64
             )
-            # Scratch tensors for ``_prepare_inputs`` on the intermediate mirror
+            # Scratch tensors for ``_prepare_inputs`` on the intermediate frontier batch
             # (keeps target persistent buffers untouched).
-            self._interm_positions = self._make_buffer(
+            self.intermediate_step_positions = self._make_buffer(
                 self.max_num_tokens, dtype=torch.int64
             )
-            self._interm_input_ids = self._make_buffer(
+            self.intermediate_step_input_ids = self._make_buffer(
                 self.max_num_tokens, dtype=torch.int32
             )
-            self._interm_query_start_loc = self._make_buffer(
+            self.intermediate_step_query_start_loc = self._make_buffer(
                 self.max_num_reqs + 1, dtype=torch.int32
             )
-            self._interm_seq_lens = self._make_buffer(
+            self.intermediate_step_seq_lens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
             )
-            self._interm_discard_request_mask = self._make_buffer(
+            self.intermediate_step_discard_request_mask = self._make_buffer(
                 self.max_num_reqs, dtype=torch.bool
             )
-            self._interm_num_decode_draft_tokens = self._make_buffer(
+            self.intermediate_step_num_decode_draft_tokens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
             )
 
-        # Set for the duration of ``propose_draft_token_ids`` (mirror_frontier only)
-        # so ``run_hierarchical_verification_rounds`` can call
-        # ``_prepare_intermediate_metadata`` with the current scheduler output.
+        # Set for the duration of ``propose_draft_token_ids`` when intermediate
+        # frontier is enabled so HV paths can call ``_prepare_intermediate_metadata``
+        # with the current scheduler output.
         self._hv_scheduler_output: Any = None
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -1453,12 +1461,12 @@ class GPUModelRunner(
           Debug builds may add stricter checks if a backend requires explicit
           invalidation.
 
-        - **HV verify geometry**: Inner verification remains
-          ``_verify_chunk_with_prefix`` → ``_build_prefix_conditioned_inputs`` (logical
-          prefix + roll). ``mirror_kv_common_attn_metadata`` only replaces the **base**
-          ``CommonAttentionMetadata`` for that path; it does **not** switch HV to a
-          pure single-step runner forward using only ``IntermediateFrontierPrepareResult``
-          per-layer metadata (that would be a separate, larger change).
+        - **HV verify geometry**: Adaptive/pivot spechive inner verification may still
+          use ``_verify_chunk_with_prefix`` (prefix + roll) with optional
+          ``mirror_kv_common_attn_metadata`` replacing only the **base**
+          ``CommonAttentionMetadata``. Standalone ``hierarchical_verification`` uses
+          intermediate frontier ``_prepare_intermediate_metadata`` + one direct
+          intermediate forward and ``gather_hv_verification_logits_from_spec_decode_metadata``.
         """
         return CachedRequestState(
             req_id=src.req_id,
@@ -1592,12 +1600,12 @@ class GPUModelRunner(
             return None
 
         out_b = {
-            "positions": self._interm_positions,
-            "input_ids": self._interm_input_ids,
-            "query_start_loc": self._interm_query_start_loc,
-            "seq_lens": self._interm_seq_lens,
-            "discard_request_mask": self._interm_discard_request_mask,
-            "num_decode_draft_tokens": self._interm_num_decode_draft_tokens,
+            "positions": self.intermediate_step_positions,
+            "input_ids": self.intermediate_step_input_ids,
+            "query_start_loc": self.intermediate_step_query_start_loc,
+            "seq_lens": self.intermediate_step_seq_lens,
+            "discard_request_mask": self.intermediate_step_discard_request_mask,
+            "num_decode_draft_tokens": self.intermediate_step_num_decode_draft_tokens,
         }
         logits_indices, spec_decode_metadata = self._prepare_inputs(
             scheduler_output,
@@ -1685,10 +1693,10 @@ class GPUModelRunner(
             cascade_attn_prefix_lens=cascade_attn_prefix_lens,
             slot_mappings=slot_mappings_by_group,
             input_batch=ib,
-            common_attn_query_start_loc=self._interm_query_start_loc,
-            common_attn_seq_lens=self._interm_seq_lens,
+            common_attn_query_start_loc=self.intermediate_step_query_start_loc,
+            common_attn_seq_lens=self.intermediate_step_seq_lens,
             common_attn_num_accepted_tokens=nat_buf,
-            common_attn_num_decode_draft_tokens=self._interm_num_decode_draft_tokens,
+            common_attn_num_decode_draft_tokens=self.intermediate_step_num_decode_draft_tokens,
         )
 
         return IntermediateFrontierPrepareResult(
@@ -4531,6 +4539,223 @@ class GPUModelRunner(
             logits_flat=logits_flat, bonus_logits=bonus_logits
         )
 
+    def _hv_sync_intermediate_batch_spec_tokens(
+        self, proposal_tokens: torch.Tensor
+    ) -> None:
+        """Write per-row draft proposal tokens into intermediate batch spec slots."""
+        ib = self.intermediate_input_batch
+        assert ib is not None
+        assert self._hv_scheduler_output is not None
+        batch_size = int(proposal_tokens.shape[0])
+        for b in range(batch_size):
+            rid = str(self.input_batch.req_ids[b])
+            mir = self.intermediate_requests.get(rid)
+            if mir is None:
+                continue
+            toks = [int(x) for x in proposal_tokens[b].tolist()]
+            ib.update_req_spec_token_ids(mir, {rid: toks})
+        ib.refresh_metadata()
+
+    def _run_hv_draft_step(
+        self,
+        draft: PinnedDraftNamespaceDraftModelProposer,
+        draft_cad: CommonAttentionMetadata,
+        *,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+        chunk_len: int,
+        sampling_metadata: SamplingMetadata,
+        use_draft_probs: bool,
+    ) -> DitRoundProposal:
+        """One draft HV chunk proposal using runner-built speculative CAD."""
+        cad = clone_common_attn_metadata(draft_cad)
+        (
+            cad,
+            target_token_ids,
+            target_positions,
+            target_hidden_states,
+            next_token_ids,
+        ) = _canonicalize_reused_prefix_frontier(
+            draft,
+            cad=cad,
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+        )
+        (
+            pref_toks,
+            pref_pos,
+            pref_hidden,
+            pref_next,
+            pref_cad,
+            _,
+            _,
+            _,
+        ) = _build_prefix_conditioned_inputs(
+            draft,
+            cad=cad,
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            prefix_rows=prefix_rows,
+            roll_rows=None,
+        )
+        rows = draft.propose(
+            target_token_ids=pref_toks,
+            target_positions=pref_pos,
+            target_hidden_states=pref_hidden,
+            next_token_ids=pref_next,
+            token_indices_to_sample=None,
+            common_attn_metadata=pref_cad,
+            sampling_metadata=sampling_metadata,
+            mm_embed_inputs=None,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            slot_mappings=None,
+        ).to(torch.int32)
+        rows = rows[:, :chunk_len]
+        out_probs = None
+        if use_draft_probs:
+            probs_flat = getattr(draft, "last_draft_probs_flat", None)
+            if probs_flat is not None and probs_flat.numel() > 0:
+                bsz = int(rows.shape[0])
+                out_probs = probs_flat.view(bsz, -1, probs_flat.shape[-1])[
+                    :, : int(rows.shape[1])
+                ].to(torch.float32)
+        return DitRoundProposal(tokens=rows, probs=out_probs)
+
+    def _run_hv_intermediate_verify_from_frontier(
+        self,
+        inter: IntermediateDraftModelProposer,
+        *,
+        proposal_tokens: torch.Tensor,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> DitRoundVerification:
+        """Intermediate verify using frontier batch metadata + one direct forward."""
+        if not self._intermediate_kv_frontier_enabled():
+            raise RuntimeError(
+                "_run_hv_intermediate_verify_from_frontier requires "
+                "intermediate frontier mode (intermediate_input_batch + scheduler sync)."
+            )
+        so = self._hv_scheduler_output
+        if so is None:
+            raise RuntimeError(
+                "hierarchical_verification: missing scheduler_output snapshot "
+                "(_hv_scheduler_output); propose_draft_token_ids must wrap propose()."
+            )
+        self._hv_sync_intermediate_batch_spec_tokens(proposal_tokens)
+        nsched = [
+            int(so.num_scheduled_tokens[str(rid)])
+            for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]
+        ]
+        nst = np.array(nsched, dtype=np.int32)
+        prep = self._prepare_intermediate_metadata(so, nst)
+        if prep is None or prep.spec_decode_metadata is None:
+            raise RuntimeError(
+                "hierarchical_verification: intermediate frontier metadata preparation "
+                "returned None (batch mismatch, async prev-sample, mamba align mode, "
+                "or unsupported layout)."
+            )
+        gid = int(getattr(inter, "kv_cache_gid", -1))
+        cad_map = prep.spec_decode_common_attn_metadata_by_gid or {}
+        inter_cad = cad_map.get(gid) or prep.spec_decode_common_attn_metadata
+        if inter_cad is None:
+            raise RuntimeError(
+                "hierarchical_verification: missing speculative CommonAttentionMetadata "
+                f"for intermediate kv_cache_gid={gid}"
+            )
+        total_tok = int(so.total_num_scheduled_tokens)
+        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+            inter._determine_batch_execution_and_padding(total_tok)
+        )
+        inter.input_ids[:total_tok].copy_(
+            self.intermediate_step_input_ids.gpu[:total_tok], non_blocking=True
+        )
+        if num_input_tokens > total_tok:
+            pad_id = int(inter.input_ids[total_tok - 1].item())
+            inter.input_ids[total_tok:num_input_tokens].fill_(pad_id)
+        inter._set_positions(
+            total_tok, self.intermediate_step_positions.gpu[:total_tok]
+        )
+        if num_input_tokens > total_tok:
+            last_pos = inter.positions[total_tok - 1]
+            inc = torch.arange(
+                1,
+                num_input_tokens - total_tok + 1,
+                device=last_pos.device,
+                dtype=last_pos.dtype,
+            )
+            inter.positions[total_tok:num_input_tokens] = last_pos + inc
+
+        per_layer_attn_metadata: dict[str, object] = {}
+        attn_metadata = None
+        for attn_group in inter.draft_attn_groups:
+            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
+                common_attn_metadata=inter_cad,
+                draft_index=0,
+            )
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
+
+        inter._check_per_layer_attn_metadata_contract(per_layer_attn_metadata)
+
+        if inter.allowed_attn_types is not None and not isinstance(
+            attn_metadata,
+            inter.allowed_attn_types,
+        ):
+            raise ValueError(
+                "hierarchical_verification: unsupported attention metadata type "
+                f"{type(attn_metadata)}; allowed: {inter.allowed_attn_types}"
+            )
+
+        if inter.supports_mm_inputs:
+            inter.inputs_embeds[:num_input_tokens] = inter.model.embed_input_ids(
+                inter.input_ids[:num_input_tokens],
+            )
+            input_ids = None
+            inputs_embeds = inter.inputs_embeds[:num_input_tokens]
+        else:
+            input_ids = inter.input_ids[:num_input_tokens]
+            inputs_embeds = None
+
+        model_kwargs = {
+            "input_ids": input_ids,
+            "positions": inter._get_positions(num_input_tokens),
+            "inputs_embeds": inputs_embeds,
+        }
+        if inter.pass_hidden_states_to_model:
+            model_kwargs["hidden_states"] = inter.hidden_states[:num_input_tokens]
+
+        with set_forward_context(
+            per_layer_attn_metadata,
+            inter.vllm_config,
+            num_tokens=num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            slot_mapping=inter._get_slot_mapping(
+                num_input_tokens, inter_cad.slot_mapping
+            ),
+        ):
+            ret_hidden_states = inter.model(**model_kwargs)
+            if inter.model_returns_tuple():
+                last_hidden_states, _ = ret_hidden_states
+            else:
+                last_hidden_states = ret_hidden_states
+        all_logits = inter.model.compute_logits(last_hidden_states).to(torch.float32)
+        logits_flat, bonus_logits = (
+            gather_hv_verification_logits_from_spec_decode_metadata(
+                all_logits, prep.spec_decode_metadata
+            )
+        )
+        return DitRoundVerification(
+            logits_flat=logits_flat, bonus_logits=bonus_logits
+        )
+
     def run_hv_rounds(
         self,
         *,
@@ -4545,13 +4770,13 @@ class GPUModelRunner(
         num_rejected_tokens_gpu: torch.Tensor | None,
         spec_decode_cad_by_gid: dict[int, CommonAttentionMetadata] | None = None,
     ) -> tuple[torch.Tensor, HybridProposalBundle]:
-        """Standalone hierarchical verification: fixed full-batch rounds, no mirror/pivot."""
+        """Standalone hierarchical verification: fixed full-batch rounds."""
         assert self.speculative_config is not None
-        if self._static_intermediate_kv_frontier_enabled(self.vllm_config):
+        if not self._intermediate_kv_frontier_enabled():
             raise ValueError(
-                "standalone hierarchical_verification (metadata-direct path) "
-                "does not support intermediate_kv_mode=mirror_frontier for this "
-                "configuration; disable mirror intermediate KV or use adaptive_spechive."
+                "standalone hierarchical_verification requires intermediate frontier "
+                "mode: configure intermediate_model, intermediate_kv_mode='mirror_frontier', "
+                "and run on the last pipeline-parallel rank."
             )
         self._dit_debug_step_id += 1
         spec = self.speculative_config
@@ -4564,15 +4789,9 @@ class GPUModelRunner(
 
         cad_map = spec_decode_cad_by_gid or {}
         draft_gid = getattr(drafter.draft, "kv_cache_gid", None)
-        inter_gid = getattr(drafter.inter, "kv_cache_gid", None)
         draft_cad = (
             cad_map[int(draft_gid)]
             if draft_gid is not None and int(draft_gid) in cad_map
-            else common_attn_metadata
-        )
-        inter_cad = (
-            cad_map[int(inter_gid)]
-            if inter_gid is not None and int(inter_gid) in cad_map
             else common_attn_metadata
         )
 
@@ -4583,6 +4802,7 @@ class GPUModelRunner(
         inter_accepted_rows: list[int] = [0 for _ in range(batch_size)]
 
         for _ in range(n_inner):
+            before_lens = [len(r) for r in prefix_rows]
             sm_idxs = list(range(batch_size))
             round_sm = slice_sampling_metadata_for_subbatch(
                 sampling_metadata,
@@ -4608,20 +4828,9 @@ class GPUModelRunner(
                     "hierarchical_verification expects draft proposals for every "
                     f"batch row; got effective batch {eff_bs} != {batch_size}"
                 )
-            hv_pre = self._prepare_hv_step(
+            verification = self._run_hv_intermediate_verify_from_frontier(
                 drafter.inter,
-                inter_cad,
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                prefix_rows=prefix_rows,
-                candidate_tokens=proposal.tokens,
-            )
-            verification = self._run_hv_verify_step(
-                drafter.inter,
-                hv_pre,
+                proposal_tokens=proposal.tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
             decision = drafter.run_inter_verification_acceptance(
@@ -4631,6 +4840,13 @@ class GPUModelRunner(
                 rejection_sampler=self.rejection_sampler,
                 vocab_size=vocab_size,
                 use_draft_probs=use_draft_probs,
+            )
+            self._advance_intermediate_frontier_after_round(
+                decision,
+                batch_size=batch_size,
+                eff_bs=batch_size,
+                pivot_expansion_plan=None,
+                before_prefix_lens=before_lens,
             )
             for b in range(batch_size):
                 inter_verified_rows[b] += L

@@ -1247,6 +1247,23 @@ class SpeculativeConfig:
         if self.method == "hierarchical_verification":
             assert self.draft_model_config is not None
             assert self.intermediate_model_config is not None
+            if self.intermediate_kv_mode != "mirror_frontier":
+                raise ValueError(
+                    "hierarchical_verification (standalone) requires "
+                    "intermediate_kv_mode='mirror_frontier' so the intermediate "
+                    "model uses intermediate frontier bookkeeping (same flag as "
+                    "adaptive_spechive / pivot_spechive)."
+                )
+            if self.target_model_config.is_hybrid:
+                raise ValueError(
+                    "hierarchical_verification (standalone v1) does not support "
+                    "hybrid target models with intermediate frontier verify."
+                )
+            if self.cache_config.mamba_cache_mode == "align":
+                raise ValueError(
+                    "hierarchical_verification (standalone v1) does not support "
+                    "mamba_cache_mode='align' for intermediate frontier metadata."
+                )
             # Standalone HV uses DraftModelProposer for draft and intermediate; those
             # paths do not pass target hiddens into the draft forward
             # (pass_hidden_states_to_model=False). Hidden-size equality vs target is
@@ -1271,11 +1288,17 @@ class SpeculativeConfig:
                     "hierarchical_verification (standalone) does not support Eagle3 "
                     "draft yet; use a draft_model method='draft_model' checkpoint."
                 )
-            if self.target_model_config.is_multimodal_model():
-                raise ValueError(
-                    "hierarchical_verification (v1) does not support multimodal "
-                    "target models."
+            if self.target_model_config is not None:
+                is_mm = getattr(
+                    self.target_model_config, "is_multimodal_model", False
                 )
+                if callable(is_mm):
+                    is_mm = is_mm()
+                if bool(is_mm):
+                    raise ValueError(
+                        "hierarchical_verification (v1) does not support multimodal "
+                        "target models."
+                    )
         if self.method == "pivot" and self.parallel_drafting:
             raise ValueError("parallel_drafting is not supported with pivot.")
         if self.method == "pivot":

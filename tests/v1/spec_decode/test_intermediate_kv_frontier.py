@@ -16,6 +16,8 @@ def _static_intermediate_kv_frontier_enabled(vllm_config: SimpleNamespace) -> bo
         return spec.adaptive_spechive_mode == "hierarchical_verification"
     if spec.method == "pivot":
         return bool(spec.pivot_spechive)
+    if spec.method == "hierarchical_verification":
+        return True
     return False
 
 
@@ -67,6 +69,18 @@ def _cfg_pivot_spechive_draft_like() -> SimpleNamespace:
     )
 
 
+def _cfg_standalone_hierarchical_verification() -> SimpleNamespace:
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="hierarchical_verification",
+            intermediate_model="dummy",
+            adaptive_spechive_mode="draft_target",
+            pivot_spechive=False,
+            intermediate_kv_mode="mirror_frontier",
+        )
+    )
+
+
 def _cfg_no_intermediate() -> SimpleNamespace:
     return SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -97,6 +111,14 @@ def test_static_intermediate_kv_frontier_disabled_pivot_spechive_draft_like() ->
 
 def test_static_intermediate_kv_frontier_disabled_without_intermediate_model() -> None:
     assert not _static_intermediate_kv_frontier_enabled(_cfg_no_intermediate())
+
+
+def test_static_intermediate_kv_frontier_enabled_standalone_hierarchical_verification() -> (
+    None
+):
+    assert _static_intermediate_kv_frontier_enabled(
+        _cfg_standalone_hierarchical_verification()
+    )
 
 
 def test_static_intermediate_kv_frontier_defaults_to_mirror_when_attr_missing() -> None:

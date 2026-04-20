@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Pure packing helpers for hierarchical verification metadata-direct verify."""
+"""Packing helpers for hierarchical verification.
+
+Standalone HV verify uses intermediate frontier metadata + direct forward; the
+helpers here remain shared with adaptive/pivot prefix-conditioned paths and
+for unit tests / debugging.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +15,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 logger = init_logger(__name__)
 
@@ -267,3 +273,19 @@ def slice_hv_verification_logits(
     per_req = torch.stack(per_req_steps, dim=0).to(torch.float32)
     bonus_logits = torch.stack(bonus_rows, dim=0).to(torch.float32)
     return per_req.reshape(-1, per_req.shape[-1]), bonus_logits
+
+
+def gather_hv_verification_logits_from_spec_decode_metadata(
+    all_logits: torch.Tensor,
+    spec_decode_metadata: SpecDecodeMetadata,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pick (logits_flat, bonus_logits) for HV verify from one model forward.
+
+    ``all_logits`` is indexed the same way as standard spec-decode verification:
+    rows selected by ``target_logits_indices`` / ``bonus_logits_indices`` must
+    align with ``_calc_spec_decode_metadata`` when the intermediate frontier
+    batch matches the scheduler step geometry.
+    """
+    tid = spec_decode_metadata.target_logits_indices.long()
+    bid = spec_decode_metadata.bonus_logits_indices.long()
+    return all_logits[tid].to(torch.float32), all_logits[bid].to(torch.float32)

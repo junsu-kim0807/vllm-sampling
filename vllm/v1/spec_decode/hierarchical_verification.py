@@ -13,7 +13,6 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.adaptive_cascade import (
     IntermediateDraftModelProposer,
     _collect_emitted_probs_from_sampled,
-    _propose_chunk_from_prefix,
     _vllm_as_plain_draft,
     _vllm_hierarchical_verification_chunk,
 )
@@ -195,9 +194,10 @@ class HierarchicalVerificationProposer:
         sampling_metadata: SamplingMetadata,
         use_draft_probs: bool,
     ) -> DitRoundProposal:
-        tokens, probs = _propose_chunk_from_prefix(
+        assert self.runner is not None
+        return self.runner._run_hv_draft_step(
             self.draft,
-            cad=base_common_attn_metadata,
+            base_common_attn_metadata,
             target_token_ids=base_target_token_ids,
             target_positions=base_target_positions,
             target_hidden_states=base_target_hidden_states,
@@ -208,7 +208,6 @@ class HierarchicalVerificationProposer:
             sampling_metadata=sampling_metadata,
             use_draft_probs=use_draft_probs,
         )
-        return DitRoundProposal(tokens=tokens, probs=probs)
 
     def verify_chunk_with_inter_verifier(
         self,
@@ -225,23 +224,13 @@ class HierarchicalVerificationProposer:
     ) -> DitRoundVerification:
         if mirror_kv_common_attn_metadata is not None:
             raise ValueError(
-                "standalone hierarchical_verification does not use mirror_kv CAD"
+                "standalone hierarchical_verification uses intermediate frontier "
+                "metadata from the runner; mirror_kv_common_attn_metadata must be None."
             )
         assert self.runner is not None
-        hv_pre = self.runner._prepare_hv_step(
+        return self.runner._run_hv_intermediate_verify_from_frontier(
             self.inter,
-            base_common_attn_metadata,
-            target_token_ids=base_target_token_ids,
-            target_positions=base_target_positions,
-            target_hidden_states=base_target_hidden_states,
-            next_token_ids=base_next_token_ids,
-            num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-            prefix_rows=prefix_rows,
-            candidate_tokens=candidate_tokens.to(torch.int32),
-        )
-        return self.runner._run_hv_verify_step(
-            self.inter,
-            hv_pre,
+            proposal_tokens=candidate_tokens.to(torch.int32),
             num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
         )
 
