@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace as dataclass_replace
@@ -1624,6 +1624,8 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         num_scheduled_tokens: np.ndarray,
         req_ids_subset: list[str] | None = None,
+        *,
+        scheduled_spec_decode_tokens_override: Mapping[str, Sequence[int]] | None = None,
     ) -> IntermediateFrontierPrepareResult | None:
         """Build step-shaped attention + spec metadata using the intermediate frontier batch.
 
@@ -1631,6 +1633,11 @@ class GPUModelRunner(
         Returns ``None`` when the intermediate batch diverges from the target row set, when
         Mamba align-mode preprocessing would be required, or for unsupported layouts
         (M-RoPE / XD-RoPE / prompt embeds / async prev-sample path).
+
+        When ``scheduled_spec_decode_tokens_override`` is set (e.g. standalone HV
+        intermediate verify with scheduler ``scheduled_spec_decode_tokens`` empty),
+        spec-decode metadata is built from that map instead of the scheduler snapshot
+        so it matches proposal tokens already written into the mirror batch.
         """
         if not self._intermediate_kv_frontier_enabled():
             return None
@@ -1671,6 +1678,7 @@ class GPUModelRunner(
             requests=self.intermediate_requests,
             out_buffers=out_b,
             skip_lora_swap=True,
+            scheduled_spec_decode_tokens_override=scheduled_spec_decode_tokens_override,
         )
 
         cascade_attn_prefix_lens = None
@@ -1721,7 +1729,12 @@ class GPUModelRunner(
         )
         pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
-        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        spec_tokens_for_attn: Mapping[str, Sequence[int]] = (
+            scheduled_spec_decode_tokens_override
+            if scheduled_spec_decode_tokens_override is not None
+            else scheduler_output.scheduled_spec_decode_tokens
+        )
+        use_spec_decode = len(spec_tokens_for_attn) > 0
         ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
@@ -2684,6 +2697,7 @@ class GPUModelRunner(
         *,
         input_batch: InputBatch | None = None,
         input_ids_buffer: CpuGpuBuffer | None = None,
+        scheduled_spec_decode_tokens_override: Mapping[str, Sequence[int]] | None = None,
     ) -> None:
         """Prepare the input IDs for the current batch.
 
@@ -2714,7 +2728,11 @@ class GPUModelRunner(
         indices_match = True
         max_flattened_index = -1
         total_num_spec_tokens = 0
-        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        scheduled_spec_tokens = (
+            scheduled_spec_decode_tokens_override
+            if scheduled_spec_decode_tokens_override is not None
+            else scheduler_output.scheduled_spec_decode_tokens
+        )
 
         for req_id, cur_index in ib.req_id_to_index.items():
             if (prev_index := prev_req_id_to_index.get(req_id)) is not None:
@@ -2857,6 +2875,7 @@ class GPUModelRunner(
         requests: dict[str, CachedRequestState] | None = None,
         out_buffers: dict[str, CpuGpuBuffer] | None = None,
         skip_lora_swap: bool = False,
+        scheduled_spec_decode_tokens_override: Mapping[str, Sequence[int]] | None = None,
     ) -> tuple[
         torch.Tensor,
         SpecDecodeMetadata | None,
@@ -3028,6 +3047,7 @@ class GPUModelRunner(
             cu_num_tokens,
             input_batch=ib,
             input_ids_buffer=in_buf,
+            scheduled_spec_decode_tokens_override=scheduled_spec_decode_tokens_override,
         )
 
         if self.uses_mrope:
@@ -3046,7 +3066,12 @@ class GPUModelRunner(
             # Common case (1D positions)
             pos_buf.copy_to_gpu(total_num_scheduled_tokens)
 
-        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        spec_tokens_source: Mapping[str, Sequence[int]] = (
+            scheduled_spec_decode_tokens_override
+            if scheduled_spec_decode_tokens_override is not None
+            else scheduler_output.scheduled_spec_decode_tokens
+        )
+        use_spec_decode = len(spec_tokens_source) > 0
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -3067,7 +3092,7 @@ class GPUModelRunner(
             for (
                 req_id,
                 draft_token_ids,
-            ) in scheduler_output.scheduled_spec_decode_tokens.items():
+            ) in spec_tokens_source.items():
                 req_idx = ib.req_id_to_index[req_id]
                 num_draft_tokens[req_idx] = len(draft_token_ids)
                 if (
@@ -5230,8 +5255,25 @@ class GPUModelRunner(
         nst = np.array(nsched, dtype=np.int32)
         ib_inter = self.intermediate_input_batch
         assert ib_inter is not None
+        num_reqs_hv = int(self.input_batch.num_reqs)
+        prop_rows = int(proposal_tokens.shape[0])
+        if prop_rows < num_reqs_hv:
+            raise RuntimeError(
+                "hierarchical_verification: proposal_tokens row count "
+                f"({prop_rows}) < batch num_reqs ({num_reqs_hv})"
+            )
+        scheduled_spec_override: dict[str, list[int]] = {
+            str(self.input_batch.req_ids[b]): [
+                int(x) for x in proposal_tokens[b].tolist()
+            ]
+            for b in range(num_reqs_hv)
+        }
         with self._hv_suspend_cached_prev_sampled_tokens():
-            prep = self._prepare_intermediate_metadata(so, nst)
+            prep = self._prepare_intermediate_metadata(
+                so,
+                nst,
+                scheduled_spec_decode_tokens_override=scheduled_spec_override,
+            )
         if prep is None or prep.spec_decode_metadata is None:
             detail = self._describe_frontier_prepare_blockers(
                 frontier="intermediate",

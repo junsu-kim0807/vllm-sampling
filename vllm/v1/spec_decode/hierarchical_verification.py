@@ -301,7 +301,29 @@ class HierarchicalVerificationProposer:
                 "hierarchical_verification does not support multimodal draft inputs yet."
             )
         assert self.runner is not None
-        out, bundle = self.runner.run_hv_rounds(
+        run = self.runner
+        # Prefill (or any step) with no scheduled speculative slots: there is no
+        # ``SpecDecodeMetadata`` for this step, so ``_prepare_intermediate_metadata``
+        # cannot populate ``spec_decode_metadata`` and ``run_hv_rounds`` / frontier
+        # verify cannot run. Use the plain draft proposer like ``DraftModelProposer``.
+        so = getattr(run, "_hv_scheduler_output", None)
+        if so is not None and not so.scheduled_spec_decode_tokens:
+            self.discard_pending_hv_state()
+            out = self.draft.propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=token_indices_to_sample,
+                common_attn_metadata=common_attn_metadata,
+                sampling_metadata=sampling_metadata,
+                mm_embed_inputs=mm_embed_inputs,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                slot_mappings=slot_mappings,
+            )
+            self.clear_draft_probs()
+            return out
+        out, bundle = run.run_hv_rounds(
             drafter=self,
             target_token_ids=target_token_ids,
             target_positions=target_positions,

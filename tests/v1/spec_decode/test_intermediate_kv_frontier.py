@@ -197,6 +197,25 @@ def _kwonly_args(src: str, func_name: str) -> set[str]:
     return out
 
 
+def test_prepare_inputs_and_intermediate_metadata_accept_spec_override_kwarg() -> (
+    None
+):
+    """HV intermediate verify can pass proposal-shaped spec map when scheduler dict is empty."""
+    root = Path(__file__).resolve().parents[3]
+    text = (root / "vllm" / "v1" / "worker" / "gpu_model_runner.py").read_text(
+        encoding="utf-8"
+    )
+    assert "scheduled_spec_decode_tokens_override" in _kwonly_args(
+        text, "_prepare_inputs"
+    )
+    assert "scheduled_spec_decode_tokens_override" in _kwonly_args(
+        text, "_prepare_intermediate_metadata"
+    )
+    assert "scheduled_spec_decode_tokens_override" in _kwonly_args(
+        text, "_prepare_input_ids"
+    )
+
+
 def test_verify_chunk_with_inter_verifier_accepts_mirror_cad_kwarg() -> None:
     """Regression: runner can pass mirror KV CAD into verify for frontier mode."""
     root = Path(__file__).resolve().parents[3]
