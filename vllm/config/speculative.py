@@ -84,6 +84,36 @@ def _chain_spec_token_tree(num_tokens: int) -> str:
     return str([(i + 1) * (0,) for i in range(num_tokens)])
 
 
+def _verify_hv_family_hidden_sizes_match_target(
+    *,
+    draft_model_config: ModelConfig,
+    intermediate_model_config: ModelConfig,
+    target_model_config: ModelConfig | None,
+    context: str,
+) -> None:
+    """When target hiddens are injected into drafter buffers, widths must match target.
+
+    Used for adaptive_spechive Eagle3-head paths where
+    ``pass_hidden_states_to_model=True`` copies target last-hiddens into
+    ``SpecDecodeBaseProposer.hidden_states`` (same trailing dim as the target
+    forward). Standalone ``hierarchical_verification`` uses ``DraftModelProposer``
+    for both D and I (``pass_hidden_states_to_model=False``); it does not rely on
+    this contract and must not be gated by this helper.
+    """
+    if target_model_config is None:
+        raise ValueError(f"{context}: target_model_config is required.")
+    t_h = target_model_config.get_hidden_size()
+    d_h = draft_model_config.get_hidden_size()
+    i_h = intermediate_model_config.get_hidden_size()
+    if d_h != t_h or i_h != t_h:
+        raise ValueError(
+            f"{context}: draft and intermediate models must each use the same "
+            f"hidden size as the target model because verification copies target "
+            f"hidden states into their drafting buffers (got draft={d_h}, "
+            f"intermediate={i_h}, target={t_h})."
+        )
+
+
 @config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
@@ -1191,13 +1221,14 @@ class SpeculativeConfig:
             ):
                 assert self.draft_model_config is not None
                 assert self.intermediate_model_config is not None
-                d_h = self.draft_model_config.get_hidden_size()
-                i_h = self.intermediate_model_config.get_hidden_size()
-                if d_h != i_h:
-                    raise ValueError(
-                        "adaptive_spechive inter/hierarchical verification requires draft and intermediate models "
-                        f"to share the same hidden size (got draft={d_h}, "
-                        f"intermediate={i_h})."
+                # Draft-as-Eagle3 injects target hidden states; plain draft_model D+I
+                # does not (see DraftModelProposer / set_inputs_first_pass).
+                if self.adaptive_spechive_draft_uses_eagle3_head():
+                    _verify_hv_family_hidden_sizes_match_target(
+                        draft_model_config=self.draft_model_config,
+                        intermediate_model_config=self.intermediate_model_config,
+                        target_model_config=self.target_model_config,
+                        context="adaptive_spechive inter/hierarchical verification",
                     )
             chunk_len = self.num_speculative_tokens
             rounds = self.adaptive_spechive_num_rounds
@@ -1216,14 +1247,10 @@ class SpeculativeConfig:
         if self.method == "hierarchical_verification":
             assert self.draft_model_config is not None
             assert self.intermediate_model_config is not None
-            d_h = self.draft_model_config.get_hidden_size()
-            i_h = self.intermediate_model_config.get_hidden_size()
-            if d_h != i_h:
-                raise ValueError(
-                    "hierarchical_verification requires draft and intermediate models "
-                    f"to share the same hidden size (got draft={d_h}, "
-                    f"intermediate={i_h})."
-                )
+            # Standalone HV uses DraftModelProposer for draft and intermediate; those
+            # paths do not pass target hiddens into the draft forward
+            # (pass_hidden_states_to_model=False). Hidden-size equality vs target is
+            # not a config contract here.
             outer_upper = self.hv_max_spec_len()
             if outer_upper > _ADAPTIVE_CASCADE_MAX_SPEC_LEN:
                 raise ValueError(

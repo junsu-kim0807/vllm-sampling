@@ -1148,7 +1148,10 @@ class SpecDecodeBaseProposer:
                 target_positions = target_positions[0]
             self._set_positions(num_tokens, target_positions)
 
-            self.hidden_states[:num_tokens] = target_hidden_states
+            # Only stash target hiddens when the draft forward consumes them, or when
+            # MTP reads them back from this buffer (see propose() MTP branch).
+            if self.pass_hidden_states_to_model or self.method == "mtp":
+                self.hidden_states[:num_tokens] = target_hidden_states
 
             return num_tokens, token_indices_to_sample, cad
         else:
