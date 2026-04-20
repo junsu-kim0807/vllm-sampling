@@ -27,7 +27,7 @@ def test_vllm_as_plain_draft_sets_prompt_lookup_for_replace_validation() -> None
 
 
 def test_run_hv_draft_step_does_not_call_adaptive_build_prefix_conditioned_inputs() -> None:
-    """Draft HV step must use runner-local ``hv_step_packing``, not adaptive_cascade."""
+    """Legacy draft HV path must use runner-local ``hv_step_packing``, not adaptive_cascade."""
     root = Path(__file__).resolve().parents[3]
     text = (root / "vllm" / "v1" / "worker" / "gpu_model_runner.py").read_text(
         encoding="utf-8"
@@ -37,6 +37,17 @@ def test_run_hv_draft_step_does_not_call_adaptive_build_prefix_conditioned_input
     # Do not substring-match "_build_prefix_conditioned_inputs(" — that would match
     # hv_build_prefix_conditioned_inputs(.
     assert "adaptive_cascade._build_prefix_conditioned_inputs(" not in body
+
+
+def test_run_hv_draft_step_from_frontier_has_no_prefix_packing() -> None:
+    """Standalone HV draft frontier path must not call ``hv_build_prefix_conditioned_inputs``."""
+    root = Path(__file__).resolve().parents[3]
+    text = (root / "vllm" / "v1" / "worker" / "gpu_model_runner.py").read_text(
+        encoding="utf-8"
+    )
+    body = _func_body(text, "_run_hv_draft_step_from_frontier")
+    assert "hv_build_prefix_conditioned_inputs(" not in body
+    assert "_prepare_draft_metadata" in body
 
 
 def test_speculative_verify_args_hierarchical_has_no_self_cache_config() -> None:

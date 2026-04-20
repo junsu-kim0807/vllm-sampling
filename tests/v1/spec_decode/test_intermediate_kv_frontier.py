@@ -170,6 +170,24 @@ def test_mirror_helpers_short_circuit_on_frontier_disabled() -> None:
         assert "if not self._intermediate_kv_frontier_enabled():" in body, fn
 
 
+def test_draft_mirror_helpers_short_circuit_on_frontier_disabled() -> None:
+    """Draft frontier helpers must no-op when ``_draft_kv_frontier_enabled`` is false."""
+    root = Path(__file__).resolve().parents[3]
+    text = (root / "vllm" / "v1" / "worker" / "gpu_model_runner.py").read_text(
+        encoding="utf-8"
+    )
+    for fn in (
+        "_sync_draft_states_with_scheduler",
+        "_prepare_draft_metadata",
+        "_advance_draft_frontier_after_round",
+        "_sync_draft_num_accepted_from_target",
+        "_reconcile_draft_frontier_after_target",
+    ):
+        body = _func_body_after_def(text, fn)
+        assert "_draft_kv_frontier_enabled" in body, fn
+        assert "if not self._draft_kv_frontier_enabled():" in body, fn
+
+
 def _kwonly_args(src: str, func_name: str) -> set[str]:
     tree = ast.parse(src)
     out: set[str] = set()

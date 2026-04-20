@@ -742,6 +742,15 @@ class GPUModelRunner(
             return False
         return self.intermediate_input_batch is not None
 
+    def _draft_kv_frontier_enabled(self) -> bool:
+        """Standalone HV: draft mirror batch + metadata-direct draft proposals."""
+        if not self._intermediate_kv_frontier_enabled():
+            return False
+        spec = self.speculative_config
+        if spec is None or spec.method != "hierarchical_verification":
+            return False
+        return self.draft_input_batch is not None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1066,6 +1075,54 @@ class GPUModelRunner(
                 self.max_num_reqs, dtype=torch.bool
             )
             self.intermediate_step_num_decode_draft_tokens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+
+        # Draft-model frontier (standalone hierarchical_verification only).
+        self.draft_input_batch: InputBatch | None = None
+        self.draft_requests: dict[str, CachedRequestState] = {}
+        self.draft_committed_tokens: dict[str, int] = {}
+        self.draft_num_accepted_tokens: CpuGpuBuffer | None = None
+        _spec_cfg = self.speculative_config
+        if (
+            self._static_intermediate_kv_frontier_enabled(self.vllm_config)
+            and _spec_cfg is not None
+            and _spec_cfg.method == "hierarchical_verification"
+        ):
+            self.draft_input_batch = InputBatch(
+                max_num_reqs=self.max_num_reqs,
+                max_model_len=max(self.max_model_len, self.max_encoder_len),
+                max_num_batched_tokens=self.max_num_tokens,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                vocab_size=self.model_config.get_vocab_size(),
+                block_sizes=[self.cache_config.block_size],
+                kernel_block_sizes=[self.cache_config.block_size],
+                is_spec_decode=bool(self.vllm_config.speculative_config),
+                logitsprocs=self.input_batch.logitsprocs,
+                logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
+                is_pooling_model=self.is_pooling_model,
+                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            )
+            self.draft_num_accepted_tokens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int64
+            )
+            self.draft_step_positions = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int64
+            )
+            self.draft_step_input_ids = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int32
+            )
+            self.draft_step_query_start_loc = self._make_buffer(
+                self.max_num_reqs + 1, dtype=torch.int32
+            )
+            self.draft_step_seq_lens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self.draft_step_discard_request_mask = self._make_buffer(
+                self.max_num_reqs, dtype=torch.bool
+            )
+            self.draft_step_num_decode_draft_tokens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
             )
 
@@ -1859,6 +1916,337 @@ class GPUModelRunner(
                 self._dit_debug_assert(
                     list(mir.output_token_ids) == list(tgt.output_token_ids),
                     "intermediate_reconcile_output_tokens_match_target",
+                    detail=f"req_id={rid}",
+                )
+
+    def _draft_shallow_req_clone(self, src: CachedRequestState) -> CachedRequestState:
+        """Clone request state for the draft HV frontier; same policy as intermediate."""
+        return self._intermediate_shallow_req_clone(src)
+
+    def _sync_draft_states_with_scheduler(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Sync scheduler-driven lifecycle onto the draft frontier batch."""
+        if not self._draft_kv_frontier_enabled():
+            return
+        ib = self.draft_input_batch
+        assert ib is not None
+        for req_id in scheduler_output.finished_req_ids:
+            self.draft_requests.pop(req_id, None)
+            self.draft_committed_tokens.pop(req_id, None)
+            if req_id in ib.req_id_to_index:
+                ib.remove_request(req_id)
+        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+        cached_req_ids = set(ib.req_id_to_index.keys())
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        unscheduled_req_ids = cached_req_ids - (
+            set(scheduled_req_ids) - set(resumed_req_ids)
+        )
+        for req_id in unscheduled_req_ids:
+            ib.remove_request(req_id)
+
+        active = set(self.input_batch.req_id_to_index.keys())
+        for req_id in list(ib.req_id_to_index.keys()):
+            if req_id not in active:
+                ib.remove_request(req_id)
+
+        scheduled_spec = scheduler_output.scheduled_spec_decode_tokens
+        for req_index in range(self.input_batch.num_reqs):
+            req_id = self.input_batch.req_ids[req_index]
+            tgt = self.requests[req_id]
+            committed = self.draft_committed_tokens.get(
+                req_id, tgt.num_computed_tokens
+            )
+            if req_id in ib.req_id_to_index:
+                mir = self.draft_requests[req_id]
+                mir.num_computed_tokens = committed
+                mir_idx = ib.req_id_to_index[req_id]
+                ib.num_computed_tokens_cpu[mir_idx] = committed
+                ib.update_req_spec_token_ids(mir, scheduled_spec)
+            else:
+                mir = self.draft_requests.get(req_id)
+                if mir is None:
+                    mir = self._draft_shallow_req_clone(tgt)
+                    self.draft_requests[req_id] = mir
+                mir.num_computed_tokens = committed
+                ib.add_request(mir)
+                mir_idx = ib.req_id_to_index[req_id]
+                ib.num_computed_tokens_cpu[mir_idx] = committed
+                ib.update_req_spec_token_ids(mir, scheduled_spec)
+        ib.condense()
+        ib.refresh_metadata()
+
+    def _prepare_draft_metadata(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+        req_ids_subset: list[str] | None = None,
+    ) -> IntermediateFrontierPrepareResult | None:
+        """Build step-shaped attention + spec metadata using the draft frontier batch."""
+        if not self._draft_kv_frontier_enabled():
+            return None
+        if req_ids_subset is not None:
+            return None
+        ib = self.draft_input_batch
+        assert ib is not None
+        if self.input_batch.prev_sampled_token_ids is not None:
+            return None
+        if self.cache_config.mamba_cache_mode == "align":
+            return None
+        if len(self.kv_cache_config.kv_cache_groups) == 0:
+            return None
+        num_reqs_ib = ib.num_reqs
+        if (
+            num_reqs_ib != self.input_batch.num_reqs
+            or num_reqs_ib <= 0
+            or tuple(ib.req_ids[:num_reqs_ib])
+            != tuple(self.input_batch.req_ids[:num_reqs_ib])
+        ):
+            return None
+        total_tok = scheduler_output.total_num_scheduled_tokens
+        if total_tok <= 0:
+            return None
+
+        out_b = {
+            "positions": self.draft_step_positions,
+            "input_ids": self.draft_step_input_ids,
+            "query_start_loc": self.draft_step_query_start_loc,
+            "seq_lens": self.draft_step_seq_lens,
+            "discard_request_mask": self.draft_step_discard_request_mask,
+            "num_decode_draft_tokens": self.draft_step_num_decode_draft_tokens,
+        }
+        logits_indices, spec_decode_metadata = self._prepare_inputs(
+            scheduler_output,
+            num_scheduled_tokens,
+            input_batch=ib,
+            requests=self.draft_requests,
+            out_buffers=out_b,
+            skip_lora_swap=True,
+        )
+
+        cascade_attn_prefix_lens = None
+        if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
+            cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
+                num_scheduled_tokens,
+                ib.num_computed_tokens_cpu[:num_reqs_ib],
+                scheduler_output.num_common_prefix_blocks,
+            )
+
+        num_reqs = num_reqs_ib
+        num_tokens_unpadded = total_tok
+        max_num_scheduled_tokens = int(num_scheduled_tokens.max())
+        (
+            cudagraph_mode,
+            batch_desc,
+            should_ubatch,
+            _num_tokens_across_dp,
+            _cudagraph_stats,
+        ) = self._determine_batch_execution_and_padding(
+            num_tokens=num_tokens_unpadded,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_np=num_scheduled_tokens,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            use_cascade_attn=cascade_attn_prefix_lens is not None,
+            num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+        )
+
+        num_tokens_padded = batch_desc.num_tokens
+        num_reqs_padded = (
+            batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+        )
+        ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+            should_ubatch,
+            num_scheduled_tokens,
+            num_tokens_padded,
+            num_reqs_padded,
+            self.parallel_config.num_ubatches,
+        )
+
+        has_separate_kv_update = not all(
+            all(
+                g.backend.forward_includes_kv_cache_update
+                for g in self.attn_groups[id]
+            )
+            for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+            if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+        )
+        pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+
+        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+
+        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+            num_tokens_padded=num_tokens_padded
+            if pad_attn or has_separate_kv_update
+            else num_tokens_unpadded,
+            num_reqs_padded=(
+                num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
+            ),
+            num_tokens_unpadded=num_tokens_unpadded,
+            ubatch_slices=ubatch_slices_padded,
+            input_batch=ib,
+        )
+
+        nat_buf = self.draft_num_accepted_tokens or self.num_accepted_tokens
+        attn_build = self._build_attention_metadata(
+            num_tokens=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded if pad_attn else None,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded if pad_attn else None,
+            max_query_len=max_num_scheduled_tokens,
+            ubatch_slices=ubatch_slices_attn,
+            logits_indices=logits_indices,
+            use_spec_decode=use_spec_decode,
+            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+            slot_mappings=slot_mappings_by_group,
+            input_batch=ib,
+            common_attn_query_start_loc=self.draft_step_query_start_loc,
+            common_attn_seq_lens=self.draft_step_seq_lens,
+            common_attn_num_accepted_tokens=nat_buf,
+            common_attn_num_decode_draft_tokens=self.draft_step_num_decode_draft_tokens,
+        )
+
+        return IntermediateFrontierPrepareResult(
+            logits_indices=logits_indices,
+            spec_decode_metadata=spec_decode_metadata,
+            attn_metadata=attn_build.attn_metadata,
+            spec_decode_common_attn_metadata=attn_build.spec_decode_common_attn_metadata,
+            slot_mappings_by_layer=slot_mappings,
+            spec_decode_common_attn_metadata_by_gid=(
+                attn_build.spec_decode_common_attn_metadata_by_gid
+            ),
+        )
+
+    def _advance_draft_frontier_after_round(
+        self,
+        decision: DitRoundDecision,
+        *,
+        batch_size: int,
+        eff_bs: int,
+        pivot_expansion_plan: PivotExpansionPlan | None,
+        before_prefix_lens: list[int],
+    ) -> None:
+        """Advance draft working frontier after inner-round acceptance."""
+        if not self._draft_kv_frontier_enabled():
+            return
+        if pivot_expansion_plan is not None and eff_bs != batch_size:
+            return
+        for b, emitted in enumerate(decision.emitted_rows):
+            if not emitted:
+                continue
+            origin_b = (
+                int(pivot_expansion_plan.expanded_to_origin[b])
+                if pivot_expansion_plan is not None
+                else b
+            )
+            if origin_b < 0 or origin_b >= batch_size:
+                continue
+            req_id = self.input_batch.req_ids[origin_b]
+            self._intermediate_assert_round_prefix_budget(
+                prefix_len=before_prefix_lens[b],
+                extra_accepted=len(emitted),
+                row_detail=f"draft_round_row={b}, req_id={req_id}",
+            )
+            if req_id not in self.draft_requests:
+                continue
+            mir = self.draft_requests[req_id]
+            mir.num_computed_tokens += len(emitted)
+            mir.output_token_ids.extend(emitted)
+            mir_idx = self.draft_input_batch.req_id_to_index.get(req_id)
+            if mir_idx is None:
+                continue
+            ib = self.draft_input_batch
+            ib.num_computed_tokens_cpu[mir_idx] = mir.num_computed_tokens
+        self.draft_input_batch.refresh_metadata()
+
+    def _sync_draft_num_accepted_from_target(self) -> None:
+        """Mirror hybrid ``num_accepted_tokens`` rows onto the draft batch."""
+        if not self._draft_kv_frontier_enabled():
+            return
+        ib = self.draft_input_batch
+        if ib is None or self.draft_num_accepted_tokens is None:
+            return
+        if not self.model_config.is_hybrid:
+            return
+        n = self.input_batch.num_reqs
+        if n <= 0 or ib.num_reqs < n:
+            return
+        ib.num_accepted_tokens_cpu[:n] = self.input_batch.num_accepted_tokens_cpu[:n]
+        self.draft_num_accepted_tokens.np[:n] = (
+            self.input_batch.num_accepted_tokens_cpu[:n]
+        )
+        self.draft_num_accepted_tokens.copy_to_gpu(n)
+
+    def _reconcile_draft_frontier_after_target(
+        self,
+        scheduler_output: "SchedulerOutput",
+        req_ids_in_output_order: list[str],
+        *,
+        sampled_token_ids: torch.Tensor | None = None,
+        spec_decode_metadata: SpecDecodeMetadata | None = None,
+    ) -> None:
+        """Align draft mirror with target after bookkeeping (same contract as intermediate)."""
+        if not self._draft_kv_frontier_enabled():
+            return
+        ib = self.draft_input_batch
+        assert ib is not None
+        scheduled_spec = scheduler_output.scheduled_spec_decode_tokens
+        for rid in req_ids_in_output_order:
+            if rid not in self.draft_requests or rid not in self.requests:
+                continue
+            tgt = self.requests[rid]
+            self.draft_committed_tokens[rid] = tgt.num_computed_tokens
+            mir = self.draft_requests[rid]
+            mir.num_computed_tokens = tgt.num_computed_tokens
+            mir.output_token_ids[:] = list(tgt.output_token_ids)
+            midx = ib.req_id_to_index.get(rid)
+            if midx is not None:
+                ib.num_computed_tokens_cpu[midx] = tgt.num_computed_tokens
+                ib.update_req_spec_token_ids(mir, scheduled_spec)
+        n_tgt = self.input_batch.num_reqs
+        if n_tgt > 0 and ib.num_reqs >= n_tgt:
+            ib.num_accepted_tokens_cpu[:n_tgt] = (
+                self.input_batch.num_accepted_tokens_cpu[:n_tgt]
+            )
+        if (
+            self.draft_num_accepted_tokens is not None
+            and sampled_token_ids is not None
+            and spec_decode_metadata is not None
+        ):
+            nd = spec_decode_metadata.num_draft_tokens
+            nrows = int(sampled_token_ids.shape[0])
+            if nd is not None and len(nd) == nrows:
+                lens = get_target_verification_accepted_draft_prefix_lens(
+                    sampled_token_ids,
+                    list(nd),
+                    placeholder_token_id=PLACEHOLDER_TOKEN_ID,
+                )
+                for i, rid in enumerate(self.input_batch.req_ids[: len(lens)]):
+                    midx = ib.req_id_to_index.get(rid)
+                    if midx is not None:
+                        self.draft_num_accepted_tokens.np[midx] = int(lens[i])
+                self.draft_num_accepted_tokens.copy_to_gpu(ib.num_reqs)
+        ib.refresh_metadata()
+        if ib.num_reqs > 0:
+            ib.block_table.commit_block_table(ib.num_reqs)
+        if self._is_dit_debug_enabled():
+            for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]:
+                if rid not in self.draft_requests or rid not in self.requests:
+                    continue
+                mir = self.draft_requests[rid]
+                tgt = self.requests[rid]
+                self._dit_debug_assert(
+                    mir.num_computed_tokens == tgt.num_computed_tokens,
+                    "draft_reconcile_num_computed_matches_target",
+                    detail=(
+                        f"req_id={rid}, mir_num_computed={mir.num_computed_tokens}, "
+                        f"tgt_num_computed={tgt.num_computed_tokens}"
+                    ),
+                )
+                self._dit_debug_assert(
+                    list(mir.output_token_ids) == list(tgt.output_token_ids),
+                    "draft_reconcile_output_tokens_match_target",
                     detail=f"req_id={rid}",
                 )
 
@@ -4556,6 +4944,116 @@ class GPUModelRunner(
             ib.update_req_spec_token_ids(mir, {rid: toks})
         ib.refresh_metadata()
 
+    def _run_hv_draft_step_from_frontier(
+        self,
+        draft: PinnedDraftNamespaceDraftModelProposer,
+        *,
+        base_next_token_ids: torch.Tensor,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+        chunk_len: int,
+        sampling_metadata: SamplingMetadata,
+        use_draft_probs: bool,
+    ) -> DitRoundProposal:
+        """Draft HV chunk using draft frontier ``_prepare_inputs`` (no prefix packing)."""
+        if not self._draft_kv_frontier_enabled():
+            raise RuntimeError(
+                "_run_hv_draft_step_from_frontier requires draft frontier mode."
+            )
+        if draft.supports_mm_inputs:
+            raise RuntimeError(
+                "hierarchical_verification draft frontier path does not support "
+                "multimodal draft inputs."
+            )
+        if getattr(draft, "method", None) == "eagle3":
+            raise RuntimeError(
+                "hierarchical_verification draft frontier path does not support Eagle3."
+            )
+        so = self._hv_scheduler_output
+        if so is None:
+            raise RuntimeError(
+                "hierarchical_verification: missing scheduler_output snapshot "
+                "(_hv_scheduler_output); propose_draft_token_ids must wrap propose()."
+            )
+        nsched = [
+            int(so.num_scheduled_tokens[str(rid)])
+            for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]
+        ]
+        nst = np.array(nsched, dtype=np.int32)
+        prep = self._prepare_draft_metadata(so, nst)
+        if prep is None:
+            raise RuntimeError(
+                "hierarchical_verification: draft frontier metadata preparation "
+                "returned None (batch mismatch, async prev-sample, mamba_cache_mode "
+                "align, or unsupported layout)."
+            )
+        gid = int(getattr(draft, "kv_cache_gid", -1))
+        cad_map = prep.spec_decode_common_attn_metadata_by_gid or {}
+        frontier_cad = cad_map.get(gid) or prep.spec_decode_common_attn_metadata
+        if frontier_cad is None:
+            raise RuntimeError(
+                "hierarchical_verification: missing speculative CommonAttentionMetadata "
+                f"for draft kv_cache_gid={gid}"
+            )
+        total_tok = int(so.total_num_scheduled_tokens)
+        batch_size = int(frontier_cad.batch_size())
+        if len(prefix_rows) != batch_size:
+            raise RuntimeError(
+                "hierarchical_verification: prefix_rows length mismatch "
+                f"(prefix_rows={len(prefix_rows)}, batch_size={batch_size})"
+            )
+        next_list = [
+            int(prefix_rows[b][-1]) if prefix_rows[b] else int(base_next_token_ids[b].item())
+            for b in range(batch_size)
+        ]
+        next_tok_tensor = torch.tensor(
+            next_list, dtype=torch.int32, device=base_next_token_ids.device
+        )
+        target_token_ids = self.draft_step_input_ids.gpu[:total_tok].contiguous()
+        target_positions = self.draft_step_positions.gpu[:total_tok].contiguous()
+        target_hidden_states = torch.zeros(
+            (total_tok, int(draft.hidden_size)),
+            dtype=draft.hidden_states.dtype,
+            device=draft.hidden_states.device,
+        )
+        cad = clone_common_attn_metadata(frontier_cad)
+        (
+            cad,
+            target_token_ids,
+            target_positions,
+            target_hidden_states,
+            next_tok_tensor,
+        ) = _canonicalize_reused_prefix_frontier(
+            draft,
+            cad=cad,
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_tok_tensor,
+        )
+        rows = draft.propose(
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_tok_tensor,
+            token_indices_to_sample=None,
+            common_attn_metadata=cad,
+            sampling_metadata=sampling_metadata,
+            mm_embed_inputs=None,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            slot_mappings=None,
+        ).to(torch.int32)
+        rows = rows[:, :chunk_len]
+        out_probs = None
+        if use_draft_probs:
+            probs_flat = getattr(draft, "last_draft_probs_flat", None)
+            if probs_flat is not None and probs_flat.numel() > 0:
+                bsz = int(rows.shape[0])
+                out_probs = probs_flat.view(bsz, -1, probs_flat.shape[-1])[
+                    :, : int(rows.shape[1])
+                ].to(torch.float32)
+        return DitRoundProposal(tokens=rows, probs=out_probs)
+
     def _run_hv_draft_step(
         self,
         draft: PinnedDraftNamespaceDraftModelProposer,
@@ -4573,11 +5071,22 @@ class GPUModelRunner(
     ) -> DitRoundProposal:
         """One draft HV chunk proposal using runner-built speculative CAD.
 
-        Prefix-conditioned token/CAD extension uses
-        ``hv_step_packing.build_prefix_conditioned_inputs`` (runner-local seam), not
-        ``adaptive_cascade._build_prefix_conditioned_inputs``. Standalone HV **verify**
-        does not use ``hv_step_packing`` on the hot path.
+        Standalone HV with draft frontier uses metadata-direct
+        ``_run_hv_draft_step_from_frontier`` (no ``hv_step_packing``). Adaptive/pivot
+        paths still use ``hv_step_packing.build_prefix_conditioned_inputs`` (runner-local
+        seam), not ``adaptive_cascade._build_prefix_conditioned_inputs``. Standalone HV
+        **verify** does not use ``hv_step_packing`` on the hot path.
         """
+        if self._draft_kv_frontier_enabled():
+            return self._run_hv_draft_step_from_frontier(
+                draft,
+                base_next_token_ids=next_token_ids,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                prefix_rows=prefix_rows,
+                chunk_len=chunk_len,
+                sampling_metadata=sampling_metadata,
+                use_draft_probs=use_draft_probs,
+            )
         cad = clone_common_attn_metadata(draft_cad)
         (
             cad,
@@ -4850,6 +5359,13 @@ class GPUModelRunner(
                 use_draft_probs=use_draft_probs,
             )
             self._advance_intermediate_frontier_after_round(
+                decision,
+                batch_size=batch_size,
+                eff_bs=batch_size,
+                pivot_expansion_plan=None,
+                before_prefix_lens=before_lens,
+            )
+            self._advance_draft_frontier_after_round(
                 decision,
                 batch_size=batch_size,
                 eff_bs=batch_size,
@@ -6687,6 +7203,7 @@ class GPUModelRunner(
             # Update persistent batch states.
             self._update_states(scheduler_output)
             self._sync_intermediate_states_with_scheduler(scheduler_output)
+            self._sync_draft_states_with_scheduler(scheduler_output)
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -7131,6 +7648,7 @@ class GPUModelRunner(
         # in _reconcile_intermediate_frontier_after_target after bookkeeping.
         if self._intermediate_kv_frontier_enabled():
             self._sync_intermediate_num_accepted_from_target()
+            self._sync_draft_num_accepted_from_target()
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -7259,6 +7777,12 @@ class GPUModelRunner(
             )
         if self._intermediate_kv_frontier_enabled():
             self._reconcile_intermediate_frontier_after_target(
+                scheduler_output,
+                req_ids_output_copy,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                spec_decode_metadata=spec_decode_metadata,
+            )
+            self._reconcile_draft_frontier_after_target(
                 scheduler_output,
                 req_ids_output_copy,
                 sampled_token_ids=sampler_output.sampled_token_ids,
@@ -8768,6 +9292,7 @@ class GPUModelRunner(
                     EagleProposer
                     | DraftModelProposer
                     | AdaptiveSpechiveProposer
+                    | HierarchicalVerificationProposer
                     | PivotProposer
                     | ExtractHiddenStatesProposer,
                 )
