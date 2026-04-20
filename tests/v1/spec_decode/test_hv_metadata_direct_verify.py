@@ -9,6 +9,7 @@ import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.adaptive_cascade import _build_prefix_conditioned_inputs
+from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.hv_step_packing import (
     build_prefix_conditioned_inputs,
     gather_hv_verification_logits_from_spec_decode_metadata,

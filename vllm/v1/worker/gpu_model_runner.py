@@ -174,7 +174,6 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.adaptive_cascade import (
     IntermediateDraftModelProposer,
-    _build_prefix_conditioned_inputs,
     _canonicalize_reused_prefix_frontier,
 )
 from vllm.v1.spec_decode.hierarchical_verification import HierarchicalVerificationProposer
@@ -1024,7 +1023,7 @@ class GPUModelRunner(
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
 
-        # Intermediate-model KV mirror (hierarchical spechive / pivot_spechive): shares
+        # Intermediate-model frontier batch (spechive / standalone HV): shares
         # target block_id lists with the scheduler; see _sync_intermediate_states.
         self.intermediate_input_batch: InputBatch | None = None
         self.intermediate_requests: dict[str, CachedRequestState] = {}
@@ -1438,23 +1437,24 @@ class GPUModelRunner(
         torch.cuda.synchronize()
 
     def _intermediate_shallow_req_clone(self, src: CachedRequestState) -> CachedRequestState:
-        """Clone request state for the intermediate mirror; shares ``block_ids`` lists.
+        """Clone request state for the intermediate frontier; shares ``block_ids`` lists.
 
-        Intermediate KV frontier — storage assumptions (see plan Phase A):
+        Intermediate frontier — storage assumptions (see plan Phase A):
 
-        - **Logical blocks**: Mirror ``CachedRequestState`` shares the same ``block_ids``
-          lists as the target request so the scheduler and block pool stay consistent
-          with a single allocation story per request.
+        - **Logical blocks**: Intermediate frontier ``CachedRequestState`` shares the
+          same ``block_ids`` lists as the target request so the scheduler and block
+          pool stay consistent with a single allocation story per request.
 
         - **Physical KV tensors**: The intermediate verifier model uses the draft /
           intermediate attention path (``SpecDecodeBaseProposer`` + ``set_forward_context``).
           Slot mappings for verify may be supplied from ``_prepare_intermediate_metadata``
-          so attention reads/writes align with the mirror ``InputBatch`` for that step.
+          so attention reads/writes align with the ``intermediate_input_batch`` for that
+          step.
 
         - **Rejected speculative suffix**: There is no separate GPU "delete" / rollback
-          kernel pass after target sampling; mirror ``num_computed_tokens`` /
-          ``output_token_ids`` are realigned to the authoritative target in
-          ``_reconcile_intermediate_frontier_after_target``, and the mirror
+          kernel pass after target sampling; intermediate frontier ``num_computed_tokens``
+          / ``output_token_ids`` are realigned to the authoritative target in
+          ``_reconcile_intermediate_frontier_after_target``, and the intermediate
           ``InputBatch`` block table is re-committed so device-side tables match.
           Stale KV bytes in shared blocks beyond the reconciled sequence length are
           not explicitly zeroed; later scheduled forwards overwrite those positions.
@@ -1463,7 +1463,7 @@ class GPUModelRunner(
 
         - **HV verify geometry**: Adaptive/pivot spechive inner verification may still
           use ``_verify_chunk_with_prefix`` (prefix + roll) with optional
-          ``mirror_kv_common_attn_metadata`` replacing only the **base**
+          ``mirror_kv_common_attn_metadata`` (legacy name) replacing only the **base**
           ``CommonAttentionMetadata``. Standalone ``hierarchical_verification`` uses
           intermediate frontier ``_prepare_intermediate_metadata`` + one direct
           intermediate forward and ``gather_hv_verification_logits_from_spec_decode_metadata``.
@@ -1512,7 +1512,7 @@ class GPUModelRunner(
     def _sync_intermediate_states_with_scheduler(
         self, scheduler_output: "SchedulerOutput"
     ) -> None:
-        """Mirror scheduler-driven lifecycle onto intermediate batch (shared new_block_ids)."""
+        """Sync scheduler-driven lifecycle onto intermediate frontier batch (shared new_block_ids)."""
         if not self._intermediate_kv_frontier_enabled():
             return
         ib = self.intermediate_input_batch
@@ -1568,10 +1568,10 @@ class GPUModelRunner(
         num_scheduled_tokens: np.ndarray,
         req_ids_subset: list[str] | None = None,
     ) -> IntermediateFrontierPrepareResult | None:
-        """Build step-shaped attention + spec metadata using the intermediate mirror batch.
+        """Build step-shaped attention + spec metadata using the intermediate frontier batch.
 
         Uses scratch buffers so the target ``_prepare_inputs`` tensors are untouched.
-        Returns ``None`` when the mirror batch diverges from the target row set, when
+        Returns ``None`` when the intermediate batch diverges from the target row set, when
         Mamba align-mode preprocessing would be required, or for unsupported layouts
         (M-RoPE / XD-RoPE / prompt embeds / async prev-sample path).
         """
@@ -4571,7 +4571,13 @@ class GPUModelRunner(
         sampling_metadata: SamplingMetadata,
         use_draft_probs: bool,
     ) -> DitRoundProposal:
-        """One draft HV chunk proposal using runner-built speculative CAD."""
+        """One draft HV chunk proposal using runner-built speculative CAD.
+
+        Prefix-conditioned token/CAD extension uses
+        ``hv_step_packing.build_prefix_conditioned_inputs`` (runner-local seam), not
+        ``adaptive_cascade._build_prefix_conditioned_inputs``. Standalone HV **verify**
+        does not use ``hv_step_packing`` on the hot path.
+        """
         cad = clone_common_attn_metadata(draft_cad)
         (
             cad,
@@ -4587,6 +4593,7 @@ class GPUModelRunner(
             target_hidden_states=target_hidden_states,
             next_token_ids=next_token_ids,
         )
+        block_size = int(draft.draft_attn_groups[0].kv_cache_spec.block_size)
         (
             pref_toks,
             pref_pos,
@@ -4596,8 +4603,7 @@ class GPUModelRunner(
             _,
             _,
             _,
-        ) = _build_prefix_conditioned_inputs(
-            draft,
+        ) = hv_build_prefix_conditioned_inputs(
             cad=cad,
             target_token_ids=target_token_ids,
             target_positions=target_positions,
@@ -4605,6 +4611,7 @@ class GPUModelRunner(
             next_token_ids=next_token_ids,
             prefix_rows=prefix_rows,
             roll_rows=None,
+            block_size=block_size,
         )
         rows = draft.propose(
             target_token_ids=pref_toks,
@@ -4636,7 +4643,7 @@ class GPUModelRunner(
         proposal_tokens: torch.Tensor,
         num_rejected_tokens_gpu: torch.Tensor | None,
     ) -> DitRoundVerification:
-        """Intermediate verify using frontier batch metadata + one direct forward."""
+        """Intermediate verify using intermediate frontier metadata + one direct forward."""
         if not self._intermediate_kv_frontier_enabled():
             raise RuntimeError(
                 "_run_hv_intermediate_verify_from_frontier requires "
@@ -4658,8 +4665,8 @@ class GPUModelRunner(
         if prep is None or prep.spec_decode_metadata is None:
             raise RuntimeError(
                 "hierarchical_verification: intermediate frontier metadata preparation "
-                "returned None (batch mismatch, async prev-sample, mamba align mode, "
-                "or unsupported layout)."
+                "returned None (batch mismatch, async prev-sample, mamba_cache_mode "
+                "align, or unsupported layout)."
             )
         gid = int(getattr(inter, "kv_cache_gid", -1))
         cad_map = prep.spec_decode_common_attn_metadata_by_gid or {}
@@ -4775,8 +4782,9 @@ class GPUModelRunner(
         if not self._intermediate_kv_frontier_enabled():
             raise ValueError(
                 "standalone hierarchical_verification requires intermediate frontier "
-                "mode: configure intermediate_model, intermediate_kv_mode='mirror_frontier', "
-                "and run on the last pipeline-parallel rank."
+                "mode: configure intermediate_model, set intermediate_kv_mode to "
+                "'mirror_frontier' (intermediate frontier batch), and run on the last "
+                "pipeline-parallel rank."
             )
         self._dit_debug_step_id += 1
         spec = self.speculative_config
@@ -7894,10 +7902,10 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
-            mirror_hv_meta = self._static_intermediate_kv_frontier_enabled(
-                self.vllm_config
+            intermediate_frontier_sched_capture = (
+                self._static_intermediate_kv_frontier_enabled(self.vllm_config)
             )
-            if mirror_hv_meta:
+            if intermediate_frontier_sched_capture:
                 self._hv_scheduler_output = scheduler_output
             try:
                 propose_kw: dict[str, Any] = dict(
@@ -7921,7 +7929,7 @@ class GPUModelRunner(
                 draft_token_ids = self.drafter.propose(**propose_kw)
                 self._take_drafter_staged_hybrid_and_publish(spec_decode_metadata)
             finally:
-                if mirror_hv_meta:
+                if intermediate_frontier_sched_capture:
                     self._hv_scheduler_output = None
 
         # ---- TETRIS post-processing ----------------------------------------

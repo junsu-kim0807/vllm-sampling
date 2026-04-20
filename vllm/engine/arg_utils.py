@@ -1822,6 +1822,17 @@ class EngineArgs:
             target_parallel_config=parallel_config,
         )
 
+        if (
+            speculative_config is not None
+            and speculative_config.method == "hierarchical_verification"
+            and cache_config.mamba_cache_mode == "align"
+        ):
+            raise ValueError(
+                "hierarchical_verification with intermediate frontier is incompatible "
+                "with cache_config.mamba_cache_mode='align' (intermediate frontier "
+                "metadata preparation returns None in this mode)."
+            )
+
         assert self.max_num_batched_tokens is not None, (
             "max_num_batched_tokens must be set by this point"
         )

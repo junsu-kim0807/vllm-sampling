@@ -225,7 +225,8 @@ class HierarchicalVerificationProposer:
         if mirror_kv_common_attn_metadata is not None:
             raise ValueError(
                 "standalone hierarchical_verification uses intermediate frontier "
-                "metadata from the runner; mirror_kv_common_attn_metadata must be None."
+                "metadata from the runner; the mirror_kv_common_attn_metadata argument "
+                "(adaptive/pivot legacy) must be None for standalone."
             )
         assert self.runner is not None
         return self.runner._run_hv_intermediate_verify_from_frontier(

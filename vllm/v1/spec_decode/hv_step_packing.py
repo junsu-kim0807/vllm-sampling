@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Packing helpers for hierarchical verification.
 
-Standalone HV verify uses intermediate frontier metadata + direct forward; the
-helpers here remain shared with adaptive/pivot prefix-conditioned paths and
-for unit tests / debugging.
+Standalone HV **verify** uses intermediate frontier metadata + direct forward and
+does not call these helpers on the hot path. Standalone HV **draft** still uses
+``build_prefix_conditioned_inputs`` via ``GPUModelRunner._run_hv_draft_step`` (runner
+seam, not ``adaptive_cascade._build_prefix_conditioned_inputs``). Adaptive/pivot
+prefix-conditioned verify and unit tests continue to use this module.
 """
 
 from __future__ import annotations

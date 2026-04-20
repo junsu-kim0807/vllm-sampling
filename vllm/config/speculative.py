@@ -278,14 +278,15 @@ class SpeculativeConfig:
     intermediate_revision: str | None = None
     """Optional revision for intermediate_model (defaults to draft revision)."""
     intermediate_kv_mode: IntermediateKvMode = "mirror_frontier"
-    """How hierarchical / pivot_spechive intermediate verify aligns attention geometry.
+    """How intermediate verify aligns attention geometry for spechive-style paths.
 
-    ``mirror_frontier`` (default): keep a scheduler-mirrored ``InputBatch`` and may
-    build mirror ``CommonAttentionMetadata`` for intermediate verify (legacy).
+    ``mirror_frontier`` (default): keep scheduler-aligned ``intermediate_input_batch``
+    / ``intermediate_requests`` (intermediate frontier) and build per-step
+    ``CommonAttentionMetadata`` for intermediate verify.
 
     ``draft_like``: intermediate verify consumes the same per-step speculative
-    ``common_attn_metadata`` as the draft path; no persistent intermediate mirror
-    frontier on the hot path.
+    ``common_attn_metadata`` as the draft path; no persistent intermediate frontier
+    batch on the hot path.
     """
     intermediate_tensor_parallel_size: int | None = Field(default=None, ge=1)
     """TP size for I; defaults to draft_tensor_parallel_size when unset."""
@@ -1250,19 +1251,13 @@ class SpeculativeConfig:
             if self.intermediate_kv_mode != "mirror_frontier":
                 raise ValueError(
                     "hierarchical_verification (standalone) requires "
-                    "intermediate_kv_mode='mirror_frontier' so the intermediate "
-                    "model uses intermediate frontier bookkeeping (same flag as "
-                    "adaptive_spechive / pivot_spechive)."
+                    "intermediate_kv_mode='mirror_frontier' (intermediate frontier "
+                    "batch mode; do not use intermediate_kv_mode='draft_like')."
                 )
             if self.target_model_config.is_hybrid:
                 raise ValueError(
                     "hierarchical_verification (standalone v1) does not support "
                     "hybrid target models with intermediate frontier verify."
-                )
-            if self.cache_config.mamba_cache_mode == "align":
-                raise ValueError(
-                    "hierarchical_verification (standalone v1) does not support "
-                    "mamba_cache_mode='align' for intermediate frontier metadata."
                 )
             # Standalone HV uses DraftModelProposer for draft and intermediate; those
             # paths do not pass target hiddens into the draft forward
