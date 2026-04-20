@@ -84,6 +84,19 @@ def test_hierarchical_verification_module_skips_adaptive_propose_chunk_import() 
     assert "_propose_chunk_from_prefix" not in text
 
 
+def test_hv_propose_prefill_fallback_pads_to_hv_cap_width() -> None:
+    """No scheduled spec slots: plain draft returns width L; pad to ``self.k`` for runner CPU copy."""
+    root = Path(__file__).resolve().parents[3]
+    text = (root / "vllm" / "v1" / "spec_decode" / "hierarchical_verification.py").read_text(
+        encoding="utf-8"
+    )
+    body = _func_body(text, "propose")
+    assert "not so.scheduled_spec_decode_tokens" in body
+    assert "if w < self.k:" in body
+    assert "PLACEHOLDER_TOKEN_ID" in body
+    assert "torch.cat([out, pad], dim=-1)" in body
+
+
 def test_create_engine_config_rejects_hv_with_mamba_align() -> None:
     """Engine-level gate: HV + intermediate frontier + mamba align is rejected early."""
     root = Path(__file__).resolve().parents[3]

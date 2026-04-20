@@ -10,6 +10,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.adaptive_cascade import (
     IntermediateDraftModelProposer,
     _collect_emitted_probs_from_sampled,
@@ -322,6 +323,17 @@ class HierarchicalVerificationProposer:
                 slot_mappings=slot_mappings,
             )
             self.clear_draft_probs()
+            # Plain draft returns width ``L``; the runner allocates
+            # ``draft_token_ids_cpu`` with HV cap ``self.k`` (``hv_max_spec_len``).
+            w = int(out.shape[-1])
+            if w < self.k:
+                pad = torch.full(
+                    (out.shape[0], self.k - w),
+                    PLACEHOLDER_TOKEN_ID,
+                    dtype=out.dtype,
+                    device=out.device,
+                )
+                out = torch.cat([out, pad], dim=-1)
             return out
         out, bundle = run.run_hv_rounds(
             drafter=self,
