@@ -731,6 +731,53 @@ def validate_hierarchical_verification_tail_len_rowwise(
     )
 
 
+def validate_hybrid_bundle_draft_layout(
+    bundle: HybridProposalBundle,
+    *,
+    expected_num_rows: int,
+) -> DitDebugCheckResult:
+    """Invariant checks for flattened draft rows vs per-row lengths (post- HV assembly)."""
+    n_rows = len(bundle.num_draft_tokens)
+    row_ok = n_rows == expected_num_rows
+    flat_n = int(bundle.draft_token_ids.numel())
+    sum_lens = sum(int(x) for x in bundle.num_draft_tokens)
+    flat_ok = sum_lens == flat_n
+    cu = bundle.cu_num_draft_tokens
+    cu_len_ok = int(cu.numel()) == n_rows
+    cu_last_ok = True
+    if cu.numel() > 0:
+        cu_last_ok = int(cu[-1].item()) == flat_n
+    elif n_rows == 0:
+        cu_last_ok = flat_n == 0
+    cu_monotone_ok = True
+    if cu.numel() >= 2:
+        diffs = cu[1:] - cu[:-1]
+        cu_monotone_ok = bool((diffs >= 0).all().item())
+    per_row_nonneg = all(int(x) >= 0 for x in bundle.num_draft_tokens)
+    req_ok = True
+    if bundle.bundle_row_req_ids is not None:
+        req_ok = len(bundle.bundle_row_req_ids) == expected_num_rows
+    ok = (
+        row_ok
+        and flat_ok
+        and cu_len_ok
+        and cu_last_ok
+        and cu_monotone_ok
+        and per_row_nonneg
+        and req_ok
+    )
+    return DitDebugCheckResult(
+        code="check_hv_hybrid_bundle_draft_layout",
+        ok=ok,
+        detail=(
+            f"expected_num_rows={expected_num_rows}, n_rows={n_rows}, "
+            f"flat_n={flat_n}, sum_lens={sum_lens}, cu_len={int(cu.numel())}, "
+            f"cu_last={int(cu[-1].item()) if cu.numel() else -1}, "
+            f"cu_monotone_ok={cu_monotone_ok}, bundle_req_ok={req_ok}"
+        ),
+    )
+
+
 def validate_hierarchical_verification_source_stage_row(
     *,
     source_stage_row: list[int],

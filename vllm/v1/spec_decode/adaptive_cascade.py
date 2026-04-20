@@ -47,6 +47,14 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     IntermediateRoundState,
     StagedHiddenStateBundle,
 )
+from vllm.v1.spec_decode.hybrid_bundle_utils import (
+    _build_hybrid_bundle_from_rows,
+    _flatten_prob_rows_for_output,
+)
+from vllm.v1.spec_decode.hv_step_packing import (
+    build_prefix_conditioned_inputs as _hv_build_prefix_conditioned_inputs,
+    slice_hv_verification_logits,
+)
 from vllm.v1.spec_decode.spec_stage_utils import clone_common_attn_metadata
 from vllm.v1.spec_decode.utils import (
     create_vllm_config_for_draft_model,
@@ -243,173 +251,16 @@ def _build_prefix_conditioned_inputs(
     list[int],
 ]:
     """Build proposer inputs conditioned on logical prefix rows per request."""
-    batch_size = cad.batch_size()
-    assert len(prefix_rows) == batch_size
-    if roll_rows is not None:
-        assert len(roll_rows) == batch_size
-    qsl = cad.query_start_loc
-    orig_seq_lens = cad.seq_lens.clone()
-    device = target_token_ids.device
     block_size = proposer.draft_attn_groups[0].kv_cache_spec.block_size
-    hidden_size = target_hidden_states.shape[-1]
-
-    token_pieces: list[torch.Tensor] = []
-    pos_pieces_1d: list[torch.Tensor] = []
-    pos_pieces_2d: list[torch.Tensor] = []
-    hidden_pieces: list[torch.Tensor] = []
-    slot_pieces: list[torch.Tensor] = []
-    next_out: list[int] = []
-    seq_lens = cad.seq_lens.clone()
-    new_qsl = [0]
-    max_query_len = 1
-    base_query_lens: list[int] = []
-    prefix_lens: list[int] = []
-    roll_lens: list[int] = []
-
-    for b in range(batch_size):
-        s = int(qsl[b].item())
-        e = int(qsl[b + 1].item())
-        base_query_lens.append(e - s)
-        base_next = int(next_token_ids[b].item())
-        logical = prefix_rows[b]
-        prefix_lens.append(len(logical))
-        forced = roll_rows[b] if roll_rows is not None else []
-        roll_lens.append(len(forced))
-        chain = [base_next, *logical, *forced]
-        ext = chain[:-1]
-        next_tok = chain[-1]
-        if _spechive_debug_enabled() and b < 2:
-            logger.info(
-                "SPECHIVE_DEBUG packing req=%d base_next=%s logical=%s forced=%s ext=%s next_tok=%s",
-                b,
-                base_next,
-                logical,
-                forced,
-                ext,
-                next_tok,
-            )
-
-        tok_piece = target_token_ids[s:e]
-        hid_piece = target_hidden_states[s:e]
-        slot_piece = cad.slot_mapping[s:e]
-        ext_len = len(ext)
-        if ext_len > 0:
-            ext_tensor = torch.tensor(ext, dtype=torch.int32, device=device)
-            tok_piece = torch.cat((tok_piece, ext_tensor), dim=0)
-            hid_piece = torch.cat(
-                (
-                    hid_piece,
-                    torch.zeros(
-                        (ext_len, hidden_size),
-                        dtype=target_hidden_states.dtype,
-                        device=target_hidden_states.device,
-                    ),
-                ),
-                dim=0,
-            )
-            seq_base = int(cad.seq_lens[b].item())
-            ext_positions = torch.arange(
-                seq_base,
-                seq_base + ext_len,
-                dtype=torch.int64,
-                device=device,
-            )
-            block_numbers = torch.div(
-                ext_positions, block_size, rounding_mode="floor"
-            ).to(torch.long)
-            block_ids = cad.block_table_tensor[b].gather(0, block_numbers)
-            ext_slot = block_ids * block_size + torch.remainder(
-                ext_positions, block_size
-            ).to(block_ids.dtype)
-            slot_piece = torch.cat(
-                (slot_piece, ext_slot.to(slot_piece.dtype)),
-                dim=0,
-            )
-            _spechive_debug_assert(
-                bool((ext_slot >= 0).all().item()),
-                "check_hv_packing_slot_mapping_non_negative",
-                detail=f"req={b}, ext_len={ext_len}",
-            )
-
-        if target_positions.dim() == 1:
-            pos_piece = target_positions[s:e]
-            if ext_len > 0:
-                ext_pos = torch.arange(
-                    int(pos_piece[-1].item()) + 1,
-                    int(pos_piece[-1].item()) + 1 + ext_len,
-                    dtype=target_positions.dtype,
-                    device=target_positions.device,
-                )
-                pos_piece = torch.cat((pos_piece, ext_pos), dim=0)
-            pos_pieces_1d.append(pos_piece)
-        else:
-            pos_piece_2d = target_positions[:, s:e]
-            if ext_len > 0:
-                increments = torch.arange(
-                    1,
-                    ext_len + 1,
-                    dtype=target_positions.dtype,
-                    device=target_positions.device,
-                ).view(1, -1)
-                ext_pos_2d = pos_piece_2d[:, -1:].repeat(1, ext_len) + increments
-                pos_piece_2d = torch.cat((pos_piece_2d, ext_pos_2d), dim=1)
-            pos_pieces_2d.append(pos_piece_2d)
-
-        token_pieces.append(tok_piece)
-        hidden_pieces.append(hid_piece)
-        slot_pieces.append(slot_piece)
-        next_out.append(next_tok)
-        seq_lens[b] = seq_lens[b] + ext_len
-        _spechive_debug_assert(
-            int(seq_lens[b].item()) == int(orig_seq_lens[b].item()) + ext_len,
-            "check_hv_packing_seq_lens_update",
-            detail=(
-                f"req={b}, orig={int(orig_seq_lens[b].item())}, "
-                f"ext_len={ext_len}, updated={int(seq_lens[b].item())}"
-            ),
-        )
-        query_len = (e - s) + ext_len
-        max_query_len = max(max_query_len, query_len)
-        new_qsl.append(new_qsl[-1] + query_len)
-
-    out_tokens = torch.cat(token_pieces, dim=0)
-    out_hidden = torch.cat(hidden_pieces, dim=0)
-    out_slot = torch.cat(slot_pieces, dim=0)
-    if target_positions.dim() == 1:
-        out_positions = torch.cat(pos_pieces_1d, dim=0)
-    else:
-        out_positions = torch.cat(pos_pieces_2d, dim=1)
-    out_next = torch.tensor(next_out, dtype=torch.int32, device=next_token_ids.device)
-    out_qsl = torch.tensor(new_qsl, dtype=qsl.dtype, device=qsl.device)
-    out_qsl_cpu = out_qsl.detach().cpu()
-    out_seq_lens_cpu = seq_lens.detach().cpu() if cad._seq_lens_cpu is not None else None
-    out_cad = cad.replace(
-        query_start_loc=out_qsl,
-        query_start_loc_cpu=out_qsl_cpu,
-        seq_lens=seq_lens,
-        num_reqs=batch_size,
-        num_actual_tokens=int(out_tokens.shape[0]),
-        max_query_len=max_query_len,
-        max_seq_len=int(seq_lens.max().item()),
-        slot_mapping=out_slot,
-        _seq_lens_cpu=out_seq_lens_cpu,
-        _num_computed_tokens_cpu=None,
-        _num_computed_tokens_cache=None,
-    )
-    _spechive_debug_assert(
-        int(new_qsl[-1]) == int(out_tokens.shape[0]),
-        "check_hv_packing_new_qsl_total_tokens",
-        detail=f"new_qsl_end={new_qsl[-1]}, total_tokens={out_tokens.shape[0]}",
-    )
-    return (
-        out_tokens,
-        out_positions,
-        out_hidden,
-        out_next,
-        out_cad,
-        base_query_lens,
-        prefix_lens,
-        roll_lens,
+    return _hv_build_prefix_conditioned_inputs(
+        cad=cad,
+        target_token_ids=target_token_ids,
+        target_positions=target_positions,
+        target_hidden_states=target_hidden_states,
+        next_token_ids=next_token_ids,
+        prefix_rows=prefix_rows,
+        roll_rows=roll_rows,
+        block_size=block_size,
     )
 
 
@@ -750,38 +601,16 @@ def _verify_chunk_with_prefix(
     )
     bsz = draft_tokens.shape[0]
     chunk_len = draft_tokens.shape[1]
-    qsl = pref_cad.query_start_loc
-    per_req_steps: list[torch.Tensor] = []
-    bonus_rows: list[torch.Tensor] = []
-    for b in range(bsz):
-        chain_len = prefix_lens[b] + roll_lens[b] + 1
-        start = int(qsl[b].item()) + base_query_lens[b] - 1
-        idx = torch.arange(
-            start,
-            start + chain_len,
-            dtype=torch.long,
-            device=all_logits.device,
-        )
-        chain_logits = all_logits[idx]
-        verify_start = prefix_lens[b]
-        verify_end = verify_start + chunk_len
-        bonus_index = verify_end
-        _spechive_debug_assert(
-            verify_start >= 0
-            and verify_end <= chain_logits.shape[0] - 1
-            and bonus_index < chain_logits.shape[0],
-            "check_hv_verify_slice_bounds",
-            detail=(
-                f"req={b}, base_query_len={base_query_lens[b]}, "
-                f"prefix_len={prefix_lens[b]}, chunk_len={chunk_len}, "
-                f"verify_start={verify_start}, verify_end={verify_end}, "
-                f"bonus_index={bonus_index}, chain_rows={chain_logits.shape[0]}"
-            ),
-        )
-        per_req_steps.append(chain_logits[verify_start:verify_end])
-        bonus_rows.append(chain_logits[verify_end])
-
+    logits_flat, bonus_logits = slice_hv_verification_logits(
+        all_logits,
+        pref_cad,
+        draft_tokens,
+        base_query_lens,
+        prefix_lens,
+        roll_lens,
+    )
     if _spechive_debug_enabled() and bsz <= 2 and chunk_len <= 4:
+        per_row = logits_flat.view(bsz, chunk_len, -1)
         ref_steps: list[list[torch.Tensor]] = [[] for _ in range(bsz)]
         for j in range(chunk_len):
             partial_roll = [
@@ -813,13 +642,13 @@ def _verify_chunk_with_prefix(
         for b in range(bsz):
             for j in range(chunk_len):
                 _spechive_debug_assert(
-                    torch.allclose(per_req_steps[b][j], ref_steps[b][j], atol=1e-5, rtol=1e-4),
+                    torch.allclose(
+                        per_row[b, j], ref_steps[b][j], atol=1e-5, rtol=1e-4
+                    ),
                     "check_hv_verify_slice_reference_allclose",
                     detail=f"req={b}, step={j}",
                 )
-    per_req = torch.stack(per_req_steps, dim=0).to(torch.float32)
-    bonus_logits = torch.stack(bonus_rows, dim=0).to(torch.float32)
-    return per_req.reshape(-1, per_req.shape[-1]), bonus_logits
+    return logits_flat, bonus_logits
 
 
 def verify_intermediate_chunk_with_prefix_prefab(
@@ -851,76 +680,6 @@ def verify_intermediate_chunk_with_prefix_prefab(
     )
 
 
-def _build_hybrid_bundle_from_rows(
-    rows_2d: torch.Tensor,
-    *,
-    mode: str,
-    draft_probs: torch.Tensor | None,
-    source_stage_2d: torch.Tensor | None = None,
-    bundle_row_req_ids: tuple[str, ...] | list[str] | None = None,
-) -> HybridProposalBundle:
-    """Build a flattened proposal bundle from fixed-width padded rows.
-
-    Uses mask-based vectorised ops instead of a per-row Python loop to
-    avoid repeated tensor slicing, list appends, and torch.cat overhead.
-
-    Args:
-        source_stage_2d: Optional int32 tensor with the same shape as
-            *rows_2d*.  Valid positions (where rows_2d != PLACEHOLDER)
-            carry the stage tag; padding positions are ignored.
-    """
-    num_rows = int(rows_2d.shape[0])
-
-    br_ids: tuple[str, ...] | None = None
-    if bundle_row_req_ids is not None:
-        br_list = list(bundle_row_req_ids)
-        if len(br_list) != num_rows:
-            logger.warning(
-                "bundle_row_req_ids length %s != num_rows %s; omitting req ids on bundle.",
-                len(br_list),
-                num_rows,
-            )
-        else:
-            br_ids = tuple(str(x) for x in br_list)
-
-    # --- vectorised valid-token extraction ---
-    valid_mask = rows_2d.ne(PLACEHOLDER_TOKEN_ID)
-    lengths_t = valid_mask.sum(dim=1, dtype=torch.int32)
-    lengths = lengths_t.tolist()
-
-    draft_token_ids = rows_2d.masked_select(valid_mask).to(torch.int32)
-    cu = torch.cumsum(lengths_t, dim=0, dtype=torch.int32)
-
-    # --- source_stage: single masked_select, no Python loop ---
-    source_stage: torch.Tensor | None = None
-    if source_stage_2d is not None:
-        if source_stage_2d.shape != rows_2d.shape:
-            raise ValueError(
-                "source_stage_2d shape must match rows_2d shape: "
-                f"{tuple(source_stage_2d.shape)} != {tuple(rows_2d.shape)}"
-            )
-        source_stage = source_stage_2d.masked_select(valid_mask).to(torch.int32)
-
-    if draft_probs is not None and int(draft_probs.shape[0]) != int(
-        draft_token_ids.shape[0]
-    ):
-        raise ValueError(
-            "draft_probs first dimension must equal flattened draft token count: "
-            f"{int(draft_probs.shape[0])} != {int(draft_token_ids.shape[0])}"
-        )
-
-    return HybridProposalBundle(
-        draft_token_ids=draft_token_ids,
-        draft_probs=draft_probs,
-        num_draft_tokens=lengths,
-        cu_num_draft_tokens=cu,
-        max_spec_len=int(rows_2d.shape[1]),
-        mode=mode,  # type: ignore[arg-type]
-        source_stage=source_stage,
-        bundle_row_req_ids=br_ids,
-    )
-
-
 def _collect_emitted_probs_from_sampled(
     sampled: torch.Tensor,
     per_step_probs: torch.Tensor,
@@ -941,24 +700,6 @@ def _collect_emitted_probs_from_sampled(
             else:
                 out[b].append(bonus_probs[b])
     return out
-
-
-def _flatten_prob_rows_for_output(
-    prob_rows: list[list[torch.Tensor]],
-    out_rows: torch.Tensor,
-) -> torch.Tensor | None:
-    """Flatten per-request per-token probs aligned to valid output rows."""
-    flat: list[torch.Tensor] = []
-    for b in range(out_rows.shape[0]):
-        valid = int((out_rows[b] != PLACEHOLDER_TOKEN_ID).sum().item())
-        if valid <= 0:
-            continue
-        if len(prob_rows[b]) < valid:
-            return None
-        flat.extend(prob_rows[b][:valid])
-    if not flat:
-        return None
-    return torch.stack(flat, dim=0).to(torch.float32)
 
 
 class AdaptiveSpechiveProposer:
@@ -1124,6 +865,11 @@ class AdaptiveSpechiveProposer:
         prefix_rows: list[list[int]],
         old_state: IntermediateRoundState | None,
     ) -> IntermediateRoundState:
+        # Full frontier rebuild from the updated prefix. ``old_state`` is ignored
+        # until incremental Eagle/KV advancement is implemented; the runner
+        # still passes it so call sites can evolve without signature churn.
+        # When ``GPUModelRunner`` enables the intermediate KV mirror, the runner
+        # disables staged fastpath and skips calling this on the hot path.
         del old_state
         return self.bootstrap_intermediate_round_state(
             base_target_token_ids=base_target_token_ids,
@@ -1218,6 +964,7 @@ class AdaptiveSpechiveProposer:
         base_num_rejected_tokens_gpu: torch.Tensor | None,
         prefix_rows: list[list[int]],
         candidate_tokens: torch.Tensor,
+        mirror_kv_common_attn_metadata: CommonAttentionMetadata | None = None,
     ) -> DitRoundVerification:
         return self.verify_chunk_with_inter_verifier(
             base_target_token_ids=base_target_token_ids,
@@ -1229,6 +976,7 @@ class AdaptiveSpechiveProposer:
             prefix_rows=prefix_rows,
             candidate_tokens=candidate_tokens,
             reuse_intermediate_state=inter_state,
+            mirror_kv_common_attn_metadata=mirror_kv_common_attn_metadata,
         )
 
     def propose_chunk_from_prefix(
@@ -1302,8 +1050,25 @@ class AdaptiveSpechiveProposer:
         prefix_rows: list[list[int]],
         candidate_tokens: torch.Tensor,
         reuse_intermediate_state: IntermediateRoundState | None = None,
+        mirror_kv_common_attn_metadata: CommonAttentionMetadata | None = None,
     ) -> DitRoundVerification:
-        """Intermediate verification logits conditioned on logical prefix."""
+        """Intermediate verification logits conditioned on logical prefix.
+
+        HV still runs ``_verify_chunk_with_prefix`` → ``_forward_prefix_conditioned_logits``
+        → ``_build_prefix_conditioned_inputs``: the logical prefix rows and draft
+        roll are **synthetic extensions** on top of the per-request base slice from
+        ``cad``.
+
+        ``intermediate_kv_mode="draft_like"``: use ``base_common_attn_metadata`` only;
+        pass ``mirror_kv_common_attn_metadata=None``.
+
+        ``mirror_kv_common_attn_metadata`` (``intermediate_kv_mode="mirror_frontier"``):
+        when set by ``GPUModelRunner._prepare_intermediate_metadata``, only that
+        **base** ``cad`` (slot mapping, seq_lens, query_start_loc for the mirror
+        ``InputBatch``) replaces ``base_common_attn_metadata``; prefix-conditioned
+        packing is unchanged. Prefab fastpaths are skipped because mirror CAD disagrees
+        with target-step prefab geometry.
+        """
         assert self._inter_dit is not None
         spec = self.vllm_config.speculative_config
         assert spec is not None
@@ -1322,6 +1087,9 @@ class AdaptiveSpechiveProposer:
                 prefix_rows=prefix_rows,
             )
             hb = rs.hidden_bundle
+        if mirror_kv_common_attn_metadata is not None:
+            # Prefab bundles are built from target-step CAD; skip when using mirror CAD.
+            hb = None
         if hb is not None and hb.prefix_prefab is not None and src != "target":
             logits_flat, bonus_logits = verify_intermediate_chunk_with_prefix_prefab(
                 self._inter_dit,
@@ -1333,9 +1101,14 @@ class AdaptiveSpechiveProposer:
                 logits_flat=logits_flat,
                 bonus_logits=bonus_logits,
             )
+        cad_verify = (
+            mirror_kv_common_attn_metadata
+            if mirror_kv_common_attn_metadata is not None
+            else base_common_attn_metadata
+        )
         logits_flat, bonus_logits = _verify_chunk_with_prefix(
             self._inter_dit,
-            cad=base_common_attn_metadata,
+            cad=cad_verify,
             target_token_ids=base_target_token_ids,
             target_positions=base_target_positions,
             target_hidden_states=base_target_hidden_states,

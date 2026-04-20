@@ -39,6 +39,7 @@ def is_speculative_method(method: str) -> bool:
         "eagle3",
         "magicdec",
         "adaptive_spechive",
+        "hierarchical_verification",
         "pivot",
         "tetris",
     )
@@ -55,12 +56,22 @@ def parse_args() -> argparse.Namespace:
         "--method",
         type=str,
         default="speculative",
-        choices=["speculative", "ar", "eagle3", "magicdec", "adaptive_spechive", "pivot", "tetris"],
+        choices=[
+            "speculative",
+            "ar",
+            "eagle3",
+            "magicdec",
+            "adaptive_spechive",
+            "hierarchical_verification",
+            "pivot",
+            "tetris",
+        ],
         help=(
             "Evaluation method: 'ar' (no speculative decoding), "
             "'speculative' (draft_model), 'eagle3' (EAGLE3 drafter), "
             "'magicdec' (draft_model + magicdec streaming KV view), "
             "'adaptive_spechive' (draft + intermediate staged proposer), "
+            "'hierarchical_verification' (standalone D→I→T HV proposer), "
             "'pivot' (intermediate pivot token + draft tail), "
             "'tetris' (TETRIS optimal draft token selection, ACL 2025)."
         ),
@@ -91,7 +102,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "When --method=adaptive_spechive: intermediate verifier model id."
+            "When --method=adaptive_spechive or hierarchical_verification: "
+            "intermediate verifier model id."
         ),
     )
     p.add_argument(
@@ -142,7 +154,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "When --method=adaptive_spechive: number of hierarchical verification rounds."
+            "When --method=adaptive_spechive: adaptive spechive round count. "
+            "When --method=hierarchical_verification: maps to num_hv_rounds."
         ),
     )
     p.add_argument(
@@ -1638,7 +1651,9 @@ def write_pair_info(
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.method == "adaptive_spechive" and not args.intermediate_model:
+    if args.method in ("adaptive_spechive", "hierarchical_verification") and not (
+        args.intermediate_model
+    ):
         raise SystemExit(
             f"--method={args.method} requires --intermediate-model"
         )
@@ -1741,6 +1756,16 @@ if __name__ == "__main__":
                 "num_speculative_tokens": args.num_spec_tokens,
                 "adaptive_spechive_mode": args.adaptive_spechive_mode,
                 "adaptive_spechive_num_rounds": args.round,
+                "max_model_len": args.max_model_len,
+                "enforce_eager": args.enforce_eager,
+            }
+        elif args.method == "hierarchical_verification":
+            speculative_config = {
+                "method": "hierarchical_verification",
+                "model": args.draft_model,
+                "intermediate_model": args.intermediate_model,
+                "num_speculative_tokens": args.num_spec_tokens,
+                "num_hv_rounds": args.round,
                 "max_model_len": args.max_model_len,
                 "enforce_eager": args.enforce_eager,
             }

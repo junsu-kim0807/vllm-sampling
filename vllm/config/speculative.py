@@ -20,6 +20,7 @@ PivotVerificationPipeline = Literal[
     "intermediate_tree_then_target_tree",
 ]
 PivotHiddenStateSource = Literal["target", "intermediate"]
+IntermediateKvMode = Literal["draft_like", "mirror_frontier"]
 
 from pydantic import Field, SkipValidation, model_validator
 from typing_extensions import Self
@@ -69,6 +70,7 @@ SpeculativeMethod = Literal[
     "mlp_speculator",
     "draft_model",
     "adaptive_spechive",
+    "hierarchical_verification",
     "pivot",
     "suffix",
     EagleModelTypes,
@@ -245,6 +247,16 @@ class SpeculativeConfig:
     """HF model id for the intermediate verifier (I) when method is adaptive_spechive."""
     intermediate_revision: str | None = None
     """Optional revision for intermediate_model (defaults to draft revision)."""
+    intermediate_kv_mode: IntermediateKvMode = "mirror_frontier"
+    """How hierarchical / pivot_spechive intermediate verify aligns attention geometry.
+
+    ``mirror_frontier`` (default): keep a scheduler-mirrored ``InputBatch`` and may
+    build mirror ``CommonAttentionMetadata`` for intermediate verify (legacy).
+
+    ``draft_like``: intermediate verify consumes the same per-step speculative
+    ``common_attn_metadata`` as the draft path; no persistent intermediate mirror
+    frontier on the hot path.
+    """
     intermediate_tensor_parallel_size: int | None = Field(default=None, ge=1)
     """TP size for I; defaults to draft_tensor_parallel_size when unset."""
     adaptive_spechive_num_interval_tokens: int = Field(default=1, ge=1)
@@ -262,6 +274,9 @@ class SpeculativeConfig:
     of hidden states for the eagle head (``intermediate`` verifier forward vs
     ``target``). If unset, defaults to ``intermediate`` (same idea as
     ``pivot_hidden_state_source`` for pivot)."""
+    num_hv_rounds: int = Field(default=1, ge=1)
+    """Number of D→I verification rounds per outer step when ``method`` is
+    ``hierarchical_verification`` (chunk length L remains ``num_speculative_tokens``)."""
     pivot_topk_selection: int = Field(default=5)
     """Pivot first-token expansion width; supported values are 2 or 5."""
     pivot_expansion_pct: float = Field(default=0.2, gt=0.0, le=1.0)
@@ -317,6 +332,7 @@ class SpeculativeConfig:
 
         if self.method == "adaptive_spechive":
             factors.append(self.intermediate_model)
+            factors.append(self.intermediate_kv_mode)
             factors.append(self.adaptive_spechive_num_interval_tokens)
             factors.append(self.adaptive_spechive_num_rounds)
             factors.append(self.adaptive_spechive_mode)
@@ -324,9 +340,15 @@ class SpeculativeConfig:
             factors.append(self.adaptive_spechive_enable_hierarchical_verification)
             factors.append(self.adaptive_spechive_hidden_state_source)
             factors.append(self.adaptive_spechive_draft_uses_eagle3_head())
+        elif self.method == "hierarchical_verification":
+            factors.append(self.intermediate_model)
+            factors.append(self.intermediate_kv_mode)
+            factors.append(self.num_hv_rounds)
+            factors.append(self.num_speculative_tokens)
         elif self.method == "pivot":
             mode = self.get_pivot_runtime_mode()
             factors.append(self.intermediate_model)
+            factors.append(self.intermediate_kv_mode)
             factors.append(self.pivot_topk_selection)
             factors.append(self.pivot_expansion_pct)
             factors.append(self.pivot_spechive)
@@ -681,6 +703,12 @@ class SpeculativeConfig:
                             "adaptive_spechive requires `intermediate_model` "
                             "(intermediate I) in addition to `model` (draft D)."
                         )
+                elif self.method == "hierarchical_verification":
+                    if not self.intermediate_model:
+                        raise ValueError(
+                            "hierarchical_verification requires `intermediate_model` "
+                            "(intermediate I) in addition to `model` (draft D)."
+                        )
                 elif self.method == "pivot":
                     mode = self.get_pivot_runtime_mode()
                     needs_intermediate = mode.verification_pipeline in (
@@ -726,7 +754,7 @@ class SpeculativeConfig:
                             "one layer. Might need some code changes "
                             "to support multiple layers."
                         )
-                elif self.method in ("draft_model", "pivot"):
+                elif self.method in ("draft_model", "pivot", "hierarchical_verification"):
                     pass
                 else:
                     raise NotImplementedError(
@@ -841,7 +869,7 @@ class SpeculativeConfig:
                     )
                 )
 
-                if self.method == "adaptive_spechive":
+                if self.method in ("adaptive_spechive", "hierarchical_verification"):
                     assert self.intermediate_model is not None
                     int_rev = (
                         self.intermediate_revision
@@ -1125,7 +1153,7 @@ class SpeculativeConfig:
             )
 
         if (
-            self.method in ("adaptive_spechive", "pivot")
+            self.method in ("adaptive_spechive", "pivot", "hierarchical_verification")
             and self.intermediate_model_config is not None
             and self.intermediate_parallel_config is not None
         ):
@@ -1184,6 +1212,42 @@ class SpeculativeConfig:
             if self.parallel_drafting:
                 raise ValueError(
                     "parallel_drafting is not supported with adaptive_spechive."
+                )
+        if self.method == "hierarchical_verification":
+            assert self.draft_model_config is not None
+            assert self.intermediate_model_config is not None
+            d_h = self.draft_model_config.get_hidden_size()
+            i_h = self.intermediate_model_config.get_hidden_size()
+            if d_h != i_h:
+                raise ValueError(
+                    "hierarchical_verification requires draft and intermediate models "
+                    f"to share the same hidden size (got draft={d_h}, "
+                    f"intermediate={i_h})."
+                )
+            outer_upper = self.hv_max_spec_len()
+            if outer_upper > _ADAPTIVE_CASCADE_MAX_SPEC_LEN:
+                raise ValueError(
+                    f"hierarchical_verification: implied max target verify length "
+                    f"{outer_upper} = hv_max_spec_len() exceeds "
+                    f"{_ADAPTIVE_CASCADE_MAX_SPEC_LEN} (sampler limit). "
+                    "Reduce num_speculative_tokens or num_hv_rounds."
+                )
+            if self.parallel_drafting:
+                raise ValueError(
+                    "parallel_drafting is not supported with hierarchical_verification."
+                )
+            dc = self.draft_model_config
+            if getattr(dc.hf_config, "method", None) == "eagle3" or "eagle3" in str(
+                dc.model
+            ).lower():
+                raise ValueError(
+                    "hierarchical_verification (standalone) does not support Eagle3 "
+                    "draft yet; use a draft_model method='draft_model' checkpoint."
+                )
+            if self.target_model_config.is_multimodal_model():
+                raise ValueError(
+                    "hierarchical_verification (v1) does not support multimodal "
+                    "target models."
                 )
         if self.method == "pivot" and self.parallel_drafting:
             raise ValueError("parallel_drafting is not supported with pivot.")
@@ -1316,7 +1380,7 @@ class SpeculativeConfig:
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
-            self.method in ("draft_model", "adaptive_spechive")
+            self.method in ("draft_model", "adaptive_spechive", "hierarchical_verification")
             and self.target_model_config is not None
             and self.draft_model_config is not None
         ):
@@ -1348,7 +1412,7 @@ class SpeculativeConfig:
                 )
         if self.target_model_config is None or self.intermediate_model_config is None:
             return
-        if self.method == "adaptive_spechive":
+        if self.method in ("adaptive_spechive", "hierarchical_verification"):
             target_vocab_size = self.target_model_config.get_vocab_size()
             i_vocab = self.intermediate_model_config.get_vocab_size()
             if target_vocab_size != i_vocab:
@@ -1399,8 +1463,32 @@ class SpeculativeConfig:
             slots_per_req += 1
         return slots_per_req
 
+    def hv_chunk_len(self) -> int:
+        """Per-round draft proposal chunk length L (``num_speculative_tokens``)."""
+        return int(self.num_speculative_tokens)
+
+    def hv_max_spec_len(self) -> int:
+        """Exact upper bound on accepted speculative length before final target verify.
+
+        For R = ``num_hv_rounds`` and L = chunk length, each inner round contributes at
+        most L+1 tokens; the final tail adds at most L: ``R * (L + 1) + L``.
+        """
+        l = int(self.num_speculative_tokens)
+        r = int(self.num_hv_rounds)
+        return r * (l + 1) + l
+
     def runner_num_speculative_tokens(self) -> int:
-        """Tensor width for draft outputs / scheduler lookahead (may differ for DIT)."""
+        """Tensor width aligned with the **authoritative target verification** contract.
+
+        For most methods this equals ``num_speculative_tokens``. For staged
+        hierarchical modes (adaptive/pivot intermediate pipelines, or standalone
+        ``hierarchical_verification``), this is the **final padded width** ``K_final``
+        (``hv_max_spec_len()`` for the standalone method)—**not** the per-round chunk
+        length L. Scheduler lookahead, ``GPUModelRunner.num_spec_tokens``, and hybrid
+        bundle sanitization all use this value.
+        """
+        if self.method == "hierarchical_verification":
+            return self.hv_max_spec_len()
         if (
             self.method == "adaptive_spechive"
             and self.adaptive_spechive_mode == "hierarchical_verification"
@@ -1419,7 +1507,16 @@ class SpeculativeConfig:
         return self.num_speculative_tokens
 
     def runner_num_partial_speculative_tokens(self) -> int:
-        """Accepted-prefix metric width for intermediate verification stages."""
+        """Budget axis for **inner-round draft proposals**, not final target width.
+
+        For hierarchical D→I rounds this is ``R * L`` (number of inner rounds times
+        chunk length): the cumulative draft-proposal token count across intermediate
+        verification rounds **before** the tail and **before** the single authoritative
+        target pass. This differs from ``runner_num_speculative_tokens()`` which is
+        ``K_final`` for the same configs—do not mix the two in scheduler or metrics code.
+        """
+        if self.method == "hierarchical_verification":
+            return int(self.num_hv_rounds) * int(self.num_speculative_tokens)
         if (
             self.method == "adaptive_spechive"
             and self.adaptive_spechive_mode == "hierarchical_verification"
@@ -1439,7 +1536,7 @@ class SpeculativeConfig:
     def uses_draft_model(self) -> bool:
         if self.method == "pivot":
             return self.get_pivot_runtime_mode().proposal_engine == "draft_model"
-        return self.method in ("draft_model", "adaptive_spechive")
+        return self.method in ("draft_model", "adaptive_spechive", "hierarchical_verification")
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"
@@ -1488,6 +1585,10 @@ class SpeculativeConfig:
             acm = self.adaptive_spechive_mode
             rounds = self.adaptive_spechive_num_rounds
             return f"SpeculativeConfig({method=}, {model=}, {im=}, {acm=}, {num_spec_tokens=}, {rounds=})"
+        if method == "hierarchical_verification":
+            im = self.intermediate_model
+            hv_r = self.num_hv_rounds
+            return f"SpeculativeConfig({method=}, {model=}, {im=}, {num_spec_tokens=}, num_hv_rounds={hv_r})"
         if method == "pivot":
             mode = self.get_pivot_runtime_mode()
             im = self.intermediate_model

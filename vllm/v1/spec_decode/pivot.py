@@ -27,12 +27,14 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.adaptive_cascade import (
-    _build_hybrid_bundle_from_rows,
-    _flatten_prob_rows_for_output,
     _propose_chunk_from_prefix,
     _spechive_debug_enabled,
     _verify_chunk_with_prefix,
     verify_intermediate_chunk_with_prefix_prefab,
+)
+from vllm.v1.spec_decode.hybrid_bundle_utils import (
+    _build_hybrid_bundle_from_rows,
+    _flatten_prob_rows_for_output,
 )
 from vllm.v1.spec_decode.draft_model import (
     DraftModelProposer,
@@ -708,6 +710,8 @@ class PivotProposer:
         prefix_rows: list[list[int]],
         old_state: IntermediateRoundState | None,
     ) -> IntermediateRoundState:
+        # Same contract as adaptive: re-bootstrap hidden bundle for the new
+        # prefix; ``old_state`` reserved for future incremental refresh.
         del old_state
         return self.bootstrap_intermediate_round_state(
             base_target_token_ids=base_target_token_ids,
@@ -765,6 +769,7 @@ class PivotProposer:
         base_num_rejected_tokens_gpu: torch.Tensor | None,
         prefix_rows: list[list[int]],
         candidate_tokens: torch.Tensor,
+        mirror_kv_common_attn_metadata: CommonAttentionMetadata | None = None,
     ) -> DitRoundVerification:
         return self.verify_chunk_with_inter_verifier(
             base_target_token_ids=base_target_token_ids,
@@ -776,6 +781,7 @@ class PivotProposer:
             prefix_rows=prefix_rows,
             candidate_tokens=candidate_tokens,
             reuse_intermediate_state=inter_state,
+            mirror_kv_common_attn_metadata=mirror_kv_common_attn_metadata,
         )
 
     def _select_low_confidence_indices(self, pivot_probs: torch.Tensor) -> list[int]:
@@ -2092,7 +2098,16 @@ class PivotProposer:
         prefix_rows: list[list[int]],
         candidate_tokens: torch.Tensor,
         reuse_intermediate_state: IntermediateRoundState | None = None,
+        mirror_kv_common_attn_metadata: CommonAttentionMetadata | None = None,
     ) -> DitRoundVerification:
+        """Pivot intermediate verify.
+
+        ``draft_like``: pass ``mirror_kv_common_attn_metadata=None``; base CAD is
+        ``base_common_attn_metadata`` (same step geometry as the draft path).
+
+        ``mirror_frontier``: optional ``mirror_kv_common_attn_metadata`` replaces the
+        **base** CAD only (see ``AdaptiveSpechiveProposer.verify_chunk_with_inter_verifier``).
+        """
         # When topk expansion is active, prefix_rows is expanded (length P)
         # while the base tensors / CAD still reflect the origin batch (B).
         # Expand frontier inputs so the intermediate verifier sees matching
@@ -2159,6 +2174,8 @@ class PivotProposer:
         verify_prefab = None
         if verifier_round_state is not None and verifier_round_state.hidden_bundle is not None:
             verify_prefab = verifier_round_state.hidden_bundle.prefix_prefab
+        if mirror_kv_common_attn_metadata is not None:
+            verify_prefab = None
         if verify_prefab is not None:
             logits_flat, bonus_logits = verify_intermediate_chunk_with_prefix_prefab(
                 self._intermediate,
@@ -2167,9 +2184,14 @@ class PivotProposer:
                 draft_tokens=candidate_tokens,
             )
         else:
+            cad_verify = (
+                mirror_kv_common_attn_metadata
+                if mirror_kv_common_attn_metadata is not None
+                else base_common_attn_metadata
+            )
             logits_flat, bonus_logits = _verify_chunk_with_prefix(
                 self._intermediate,
-                cad=base_common_attn_metadata,
+                cad=cad_verify,
                 target_token_ids=base_target_token_ids,
                 target_positions=base_target_positions,
                 target_hidden_states=verifier_hidden_states,

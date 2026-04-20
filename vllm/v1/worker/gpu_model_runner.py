@@ -165,14 +165,23 @@ from vllm.v1.sample.rejection_sampler import (
     apply_sampling_constraints,
 )
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.spec_decode.adaptive_cascade import (
-    _build_hybrid_bundle_from_rows,
-    _flatten_prob_rows_for_output,
-)
 from vllm.v1.spec_decode.adaptive_spechive import AdaptiveSpechiveProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm.v1.spec_decode.adaptive_cascade import (
+    IntermediateDraftModelProposer,
+    _canonicalize_reused_prefix_frontier,
+)
+from vllm.v1.spec_decode.hierarchical_verification import HierarchicalVerificationProposer
+from vllm.v1.spec_decode.hv_step_packing import (
+    build_prefix_conditioned_inputs as hv_build_prefix_conditioned_inputs,
+    slice_hv_verification_logits,
+)
+from vllm.v1.spec_decode.hybrid_bundle_utils import (
+    _build_hybrid_bundle_from_rows,
+    _flatten_prob_rows_for_output,
+)
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.pivot import PivotProposer
@@ -181,6 +190,7 @@ from vllm.v1.spec_decode.spec_stage_ops import (
     collapse_family_tree_sampled_to_family_paths,
     collapse_pivot_expanded_sampled_to_origin,
     expand_intermediate_state_for_pivot_plan,
+    validate_hybrid_bundle_draft_layout,
     validate_hierarchical_verification_tail_len_rowwise,
     get_accepted_draft_lens_from_sampled_tokens,
     get_target_verification_accepted_draft_prefix_lens,
@@ -191,6 +201,8 @@ from vllm.v1.spec_decode.spec_stage_ops import (
     validate_root_only_pivot_expansion,
 )
 from vllm.v1.spec_decode.spec_stage_runtime import (
+    DitRoundDecision,
+    DitRoundVerification,
     HybridProposalBundle,
     IntermediateRoundState,
     PivotExpandedTreePlan,
@@ -201,7 +213,10 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     expand_hybrid_bundle_for_pivot_expansion,
     pivot_expansion_indices_fit_prepare_batch,
 )
-from vllm.v1.spec_decode.spec_stage_utils import slice_sampling_metadata_for_subbatch
+from vllm.v1.spec_decode.spec_stage_utils import (
+    clone_common_attn_metadata,
+    slice_sampling_metadata_for_subbatch,
+)
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.tetris import apply_tetris
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
@@ -486,6 +501,45 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+@dataclass(frozen=True)
+class AttentionMetadataBuildResult:
+    """Result of ``_build_attention_metadata`` (single object return; no hidden runner state)."""
+
+    attn_metadata: PerLayerAttnMetadata
+    spec_decode_common_attn_metadata: CommonAttentionMetadata | None
+    spec_decode_common_attn_metadata_by_gid: dict[int, CommonAttentionMetadata]
+
+
+@dataclass
+class HvVerifyPrefabrication:
+    """Packed intermediate-verify step inputs (no ``set_inputs_first_pass`` yet)."""
+
+    pref_toks: torch.Tensor
+    pref_pos: torch.Tensor
+    pref_hidden: torch.Tensor
+    pref_next: torch.Tensor
+    pref_cad: CommonAttentionMetadata
+    base_query_lens: list[int]
+    prefix_lens: list[int]
+    roll_lens: list[int]
+    candidate_tokens: torch.Tensor
+
+
+class IntermediateFrontierPrepareResult(NamedTuple):
+    """Attention + spec metadata for one step using ``intermediate_input_batch`` buffers."""
+
+    logits_indices: torch.Tensor
+    spec_decode_metadata: SpecDecodeMetadata | None
+    attn_metadata: PerLayerAttnMetadata
+    spec_decode_common_attn_metadata: CommonAttentionMetadata | None
+    slot_mappings_by_layer: dict[str, torch.Tensor] | list[
+        dict[str, torch.Tensor]
+    ] | None
+    spec_decode_common_attn_metadata_by_gid: (
+        dict[int, CommonAttentionMetadata] | None
+    ) = None
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -652,12 +706,35 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    spec_decode_common_attn_metadata_by_gid: (
+        dict[int, CommonAttentionMetadata] | None
+    ) = None
     full_verification_time_sec: float = 0.0
 
 
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
+    @staticmethod
+    def _static_intermediate_kv_frontier_enabled(vllm_config: VllmConfig) -> bool:
+        spec = vllm_config.speculative_config
+        if spec is None or spec.intermediate_model is None:
+            return False
+        if getattr(spec, "intermediate_kv_mode", "mirror_frontier") != "mirror_frontier":
+            return False
+        if spec.method == "adaptive_spechive":
+            return spec.adaptive_spechive_mode == "hierarchical_verification"
+        if spec.method == "pivot":
+            return bool(spec.pivot_spechive)
+        return False
+
+    def _intermediate_kv_frontier_enabled(self) -> bool:
+        if not self._static_intermediate_kv_frontier_enabled(self.vllm_config):
+            return False
+        if not get_pp_group().is_last_rank:
+            return False
+        return self.intermediate_input_batch is not None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -789,6 +866,7 @@ class GPUModelRunner(
                 | EagleProposer
                 | DraftModelProposer
                 | AdaptiveSpechiveProposer
+                | HierarchicalVerificationProposer
                 | PivotProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
@@ -824,6 +902,12 @@ class GPUModelRunner(
                         False,
                     )
                     self.use_aux_hidden_state_outputs = bool(aux_from_delegate)
+            elif self.speculative_config.method == "hierarchical_verification":
+                self.drafter = HierarchicalVerificationProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
+                )
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
                     vllm_config=self.vllm_config,
@@ -931,6 +1015,57 @@ class GPUModelRunner(
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
+
+        # Intermediate-model KV mirror (hierarchical spechive / pivot_spechive): shares
+        # target block_id lists with the scheduler; see _sync_intermediate_states.
+        self.intermediate_input_batch: InputBatch | None = None
+        self.intermediate_requests: dict[str, CachedRequestState] = {}
+        self.intermediate_committed_tokens: dict[str, int] = {}
+        self.intermediate_num_accepted_tokens: CpuGpuBuffer | None = None
+        if self._static_intermediate_kv_frontier_enabled(self.vllm_config):
+            self.intermediate_input_batch = InputBatch(
+                max_num_reqs=self.max_num_reqs,
+                max_model_len=max(self.max_model_len, self.max_encoder_len),
+                max_num_batched_tokens=self.max_num_tokens,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                vocab_size=self.model_config.get_vocab_size(),
+                block_sizes=[self.cache_config.block_size],
+                kernel_block_sizes=[self.cache_config.block_size],
+                is_spec_decode=bool(self.vllm_config.speculative_config),
+                logitsprocs=self.input_batch.logitsprocs,
+                logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
+                is_pooling_model=self.is_pooling_model,
+                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            )
+            self.intermediate_num_accepted_tokens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int64
+            )
+            # Scratch tensors for ``_prepare_inputs`` on the intermediate mirror
+            # (keeps target persistent buffers untouched).
+            self._interm_positions = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int64
+            )
+            self._interm_input_ids = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int32
+            )
+            self._interm_query_start_loc = self._make_buffer(
+                self.max_num_reqs + 1, dtype=torch.int32
+            )
+            self._interm_seq_lens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self._interm_discard_request_mask = self._make_buffer(
+                self.max_num_reqs, dtype=torch.bool
+            )
+            self._interm_num_decode_draft_tokens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+
+        # Set for the duration of ``propose_draft_token_ids`` (mirror_frontier only)
+        # so ``run_hierarchical_verification_rounds`` can call
+        # ``_prepare_intermediate_metadata`` with the current scheduler output.
+        self._hv_scheduler_output: Any = None
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
         # GPU to CPU when async scheduling is enabled.
@@ -1293,6 +1428,431 @@ class GPUModelRunner(
     # Note: used for model runner override.
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
+
+    def _intermediate_shallow_req_clone(self, src: CachedRequestState) -> CachedRequestState:
+        """Clone request state for the intermediate mirror; shares ``block_ids`` lists.
+
+        Intermediate KV frontier — storage assumptions (see plan Phase A):
+
+        - **Logical blocks**: Mirror ``CachedRequestState`` shares the same ``block_ids``
+          lists as the target request so the scheduler and block pool stay consistent
+          with a single allocation story per request.
+
+        - **Physical KV tensors**: The intermediate verifier model uses the draft /
+          intermediate attention path (``SpecDecodeBaseProposer`` + ``set_forward_context``).
+          Slot mappings for verify may be supplied from ``_prepare_intermediate_metadata``
+          so attention reads/writes align with the mirror ``InputBatch`` for that step.
+
+        - **Rejected speculative suffix**: There is no separate GPU "delete" / rollback
+          kernel pass after target sampling; mirror ``num_computed_tokens`` /
+          ``output_token_ids`` are realigned to the authoritative target in
+          ``_reconcile_intermediate_frontier_after_target``, and the mirror
+          ``InputBatch`` block table is re-committed so device-side tables match.
+          Stale KV bytes in shared blocks beyond the reconciled sequence length are
+          not explicitly zeroed; later scheduled forwards overwrite those positions.
+          Debug builds may add stricter checks if a backend requires explicit
+          invalidation.
+
+        - **HV verify geometry**: Inner verification remains
+          ``_verify_chunk_with_prefix`` → ``_build_prefix_conditioned_inputs`` (logical
+          prefix + roll). ``mirror_kv_common_attn_metadata`` only replaces the **base**
+          ``CommonAttentionMetadata`` for that path; it does **not** switch HV to a
+          pure single-step runner forward using only ``IntermediateFrontierPrepareResult``
+          per-layer metadata (that would be a separate, larger change).
+        """
+        return CachedRequestState(
+            req_id=src.req_id,
+            prompt_token_ids=src.prompt_token_ids,
+            prompt_embeds=src.prompt_embeds,
+            mm_features=src.mm_features,
+            sampling_params=src.sampling_params,
+            pooling_params=src.pooling_params,
+            generator=src.generator,
+            block_ids=src.block_ids,
+            num_computed_tokens=src.num_computed_tokens,
+            output_token_ids=list(src.output_token_ids),
+            mrope_positions=src.mrope_positions,
+            mrope_position_delta=src.mrope_position_delta,
+            xdrope_positions=src.xdrope_positions,
+            lora_request=src.lora_request,
+            prev_num_draft_len=src.prev_num_draft_len,
+        )
+
+    def _intermediate_speculative_token_budget(self) -> int:
+        assert self.speculative_config is not None
+        return int(self.speculative_config.runner_num_speculative_tokens())
+
+    def _intermediate_assert_round_prefix_budget(
+        self,
+        *,
+        prefix_len: int,
+        extra_accepted: int,
+        row_detail: str,
+    ) -> None:
+        """Invariant: inner HV prefix + acceptance must fit runner spec token budget."""
+        budget = self._intermediate_speculative_token_budget()
+        if prefix_len + extra_accepted <= budget:
+            return
+        msg = (
+            "intermediate KV frontier: prefix+accept exceeds speculative budget "
+            f"(prefix={prefix_len}, +={extra_accepted}, budget={budget}, {row_detail})"
+        )
+        if self._dit_debug_enabled or os.environ.get("VLLM_SPEC_SPECHIVE_DEBUG", "0") == "1":
+            raise AssertionError(msg)
+        logger.error(msg)
+
+    def _sync_intermediate_states_with_scheduler(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Mirror scheduler-driven lifecycle onto intermediate batch (shared new_block_ids)."""
+        if not self._intermediate_kv_frontier_enabled():
+            return
+        ib = self.intermediate_input_batch
+        assert ib is not None
+        for req_id in scheduler_output.finished_req_ids:
+            self.intermediate_requests.pop(req_id, None)
+            self.intermediate_committed_tokens.pop(req_id, None)
+            if req_id in ib.req_id_to_index:
+                ib.remove_request(req_id)
+        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+        cached_req_ids = set(ib.req_id_to_index.keys())
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        unscheduled_req_ids = cached_req_ids - (
+            set(scheduled_req_ids) - set(resumed_req_ids)
+        )
+        for req_id in unscheduled_req_ids:
+            ib.remove_request(req_id)
+
+        active = set(self.input_batch.req_id_to_index.keys())
+        for req_id in list(ib.req_id_to_index.keys()):
+            if req_id not in active:
+                ib.remove_request(req_id)
+
+        scheduled_spec = scheduler_output.scheduled_spec_decode_tokens
+        for req_index in range(self.input_batch.num_reqs):
+            req_id = self.input_batch.req_ids[req_index]
+            tgt = self.requests[req_id]
+            committed = self.intermediate_committed_tokens.get(
+                req_id, tgt.num_computed_tokens
+            )
+            if req_id in ib.req_id_to_index:
+                mir = self.intermediate_requests[req_id]
+                mir.num_computed_tokens = committed
+                mir_idx = ib.req_id_to_index[req_id]
+                ib.num_computed_tokens_cpu[mir_idx] = committed
+                ib.update_req_spec_token_ids(mir, scheduled_spec)
+            else:
+                mir = self.intermediate_requests.get(req_id)
+                if mir is None:
+                    mir = self._intermediate_shallow_req_clone(tgt)
+                    self.intermediate_requests[req_id] = mir
+                mir.num_computed_tokens = committed
+                ib.add_request(mir)
+                mir_idx = ib.req_id_to_index[req_id]
+                ib.num_computed_tokens_cpu[mir_idx] = committed
+                ib.update_req_spec_token_ids(mir, scheduled_spec)
+        ib.condense()
+        ib.refresh_metadata()
+
+    def _prepare_intermediate_metadata(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+        req_ids_subset: list[str] | None = None,
+    ) -> IntermediateFrontierPrepareResult | None:
+        """Build step-shaped attention + spec metadata using the intermediate mirror batch.
+
+        Uses scratch buffers so the target ``_prepare_inputs`` tensors are untouched.
+        Returns ``None`` when the mirror batch diverges from the target row set, when
+        Mamba align-mode preprocessing would be required, or for unsupported layouts
+        (M-RoPE / XD-RoPE / prompt embeds / async prev-sample path).
+        """
+        if not self._intermediate_kv_frontier_enabled():
+            return None
+        if req_ids_subset is not None:
+            return None
+        ib = self.intermediate_input_batch
+        assert ib is not None
+        if self.input_batch.prev_sampled_token_ids is not None:
+            return None
+        if self.cache_config.mamba_cache_mode == "align":
+            return None
+        if len(self.kv_cache_config.kv_cache_groups) == 0:
+            return None
+        num_reqs_ib = ib.num_reqs
+        if (
+            num_reqs_ib != self.input_batch.num_reqs
+            or num_reqs_ib <= 0
+            or tuple(ib.req_ids[:num_reqs_ib])
+            != tuple(self.input_batch.req_ids[:num_reqs_ib])
+        ):
+            return None
+        total_tok = scheduler_output.total_num_scheduled_tokens
+        if total_tok <= 0:
+            return None
+
+        out_b = {
+            "positions": self._interm_positions,
+            "input_ids": self._interm_input_ids,
+            "query_start_loc": self._interm_query_start_loc,
+            "seq_lens": self._interm_seq_lens,
+            "discard_request_mask": self._interm_discard_request_mask,
+            "num_decode_draft_tokens": self._interm_num_decode_draft_tokens,
+        }
+        logits_indices, spec_decode_metadata = self._prepare_inputs(
+            scheduler_output,
+            num_scheduled_tokens,
+            input_batch=ib,
+            requests=self.intermediate_requests,
+            out_buffers=out_b,
+            skip_lora_swap=True,
+        )
+
+        cascade_attn_prefix_lens = None
+        if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
+            cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
+                num_scheduled_tokens,
+                ib.num_computed_tokens_cpu[:num_reqs_ib],
+                scheduler_output.num_common_prefix_blocks,
+            )
+
+        num_reqs = num_reqs_ib
+        num_tokens_unpadded = total_tok
+        max_num_scheduled_tokens = int(num_scheduled_tokens.max())
+        (
+            cudagraph_mode,
+            batch_desc,
+            should_ubatch,
+            _num_tokens_across_dp,
+            _cudagraph_stats,
+        ) = self._determine_batch_execution_and_padding(
+            num_tokens=num_tokens_unpadded,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_np=num_scheduled_tokens,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            use_cascade_attn=cascade_attn_prefix_lens is not None,
+            num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+        )
+
+        num_tokens_padded = batch_desc.num_tokens
+        num_reqs_padded = (
+            batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+        )
+        ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+            should_ubatch,
+            num_scheduled_tokens,
+            num_tokens_padded,
+            num_reqs_padded,
+            self.parallel_config.num_ubatches,
+        )
+
+        has_separate_kv_update = not all(
+            all(
+                g.backend.forward_includes_kv_cache_update
+                for g in self.attn_groups[id]
+            )
+            for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+            if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+        )
+        pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+
+        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+
+        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+            num_tokens_padded=num_tokens_padded
+            if pad_attn or has_separate_kv_update
+            else num_tokens_unpadded,
+            num_reqs_padded=(
+                num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
+            ),
+            num_tokens_unpadded=num_tokens_unpadded,
+            ubatch_slices=ubatch_slices_padded,
+            input_batch=ib,
+        )
+
+        nat_buf = self.intermediate_num_accepted_tokens or self.num_accepted_tokens
+        attn_build = self._build_attention_metadata(
+            num_tokens=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded if pad_attn else None,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded if pad_attn else None,
+            max_query_len=max_num_scheduled_tokens,
+            ubatch_slices=ubatch_slices_attn,
+            logits_indices=logits_indices,
+            use_spec_decode=use_spec_decode,
+            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+            slot_mappings=slot_mappings_by_group,
+            input_batch=ib,
+            common_attn_query_start_loc=self._interm_query_start_loc,
+            common_attn_seq_lens=self._interm_seq_lens,
+            common_attn_num_accepted_tokens=nat_buf,
+            common_attn_num_decode_draft_tokens=self._interm_num_decode_draft_tokens,
+        )
+
+        return IntermediateFrontierPrepareResult(
+            logits_indices=logits_indices,
+            spec_decode_metadata=spec_decode_metadata,
+            attn_metadata=attn_build.attn_metadata,
+            spec_decode_common_attn_metadata=attn_build.spec_decode_common_attn_metadata,
+            slot_mappings_by_layer=slot_mappings,
+            spec_decode_common_attn_metadata_by_gid=(
+                attn_build.spec_decode_common_attn_metadata_by_gid
+            ),
+        )
+
+    def _advance_intermediate_frontier_after_round(
+        self,
+        decision: DitRoundDecision,
+        *,
+        batch_size: int,
+        eff_bs: int,
+        pivot_expansion_plan: PivotExpansionPlan | None,
+        before_prefix_lens: list[int],
+    ) -> None:
+        """Advance intermediate working frontier after inner-round acceptance (no new blocks).
+
+        When pivot expands the effective batch (``eff_bs != batch_size``), the mirror
+        only tracks origin requests, so we skip advancing here; post-target reconcile
+        realigns ``intermediate_requests`` to the authoritative target state.
+        """
+        if not self._intermediate_kv_frontier_enabled():
+            return
+        if pivot_expansion_plan is not None and eff_bs != batch_size:
+            return
+        for b, emitted in enumerate(decision.emitted_rows):
+            if not emitted:
+                continue
+            origin_b = (
+                int(pivot_expansion_plan.expanded_to_origin[b])
+                if pivot_expansion_plan is not None
+                else b
+            )
+            if origin_b < 0 or origin_b >= batch_size:
+                continue
+            req_id = self.input_batch.req_ids[origin_b]
+            self._intermediate_assert_round_prefix_budget(
+                prefix_len=before_prefix_lens[b],
+                extra_accepted=len(emitted),
+                row_detail=f"round_row={b}, req_id={req_id}",
+            )
+            if req_id not in self.intermediate_requests:
+                continue
+            mir = self.intermediate_requests[req_id]
+            mir.num_computed_tokens += len(emitted)
+            mir.output_token_ids.extend(emitted)
+            mir_idx = self.intermediate_input_batch.req_id_to_index.get(req_id)
+            if mir_idx is None:
+                continue
+            ib = self.intermediate_input_batch
+            ib.num_computed_tokens_cpu[mir_idx] = mir.num_computed_tokens
+        self.intermediate_input_batch.refresh_metadata()
+
+    def _sync_intermediate_num_accepted_from_target(self) -> None:
+        """Mirror hybrid ``num_accepted_tokens`` rows onto the intermediate batch."""
+        if not self._intermediate_kv_frontier_enabled():
+            return
+        ib = self.intermediate_input_batch
+        if ib is None or self.intermediate_num_accepted_tokens is None:
+            return
+        if not self.model_config.is_hybrid:
+            return
+        n = self.input_batch.num_reqs
+        if n <= 0 or ib.num_reqs < n:
+            return
+        ib.num_accepted_tokens_cpu[:n] = self.input_batch.num_accepted_tokens_cpu[:n]
+        self.intermediate_num_accepted_tokens.np[:n] = (
+            self.input_batch.num_accepted_tokens_cpu[:n]
+        )
+        self.intermediate_num_accepted_tokens.copy_to_gpu(n)
+
+    def _reconcile_intermediate_frontier_after_target(
+        self,
+        scheduler_output: "SchedulerOutput",
+        req_ids_in_output_order: list[str],
+        *,
+        sampled_token_ids: torch.Tensor | None = None,
+        spec_decode_metadata: SpecDecodeMetadata | None = None,
+    ) -> None:
+        """Align intermediate mirror with target after bookkeeping (drop provisional).
+
+        Called from ``sample_tokens`` **after** ``_bookkeeping_sync`` so
+        ``self.requests`` / ``output_token_ids`` match the scheduler-visible target
+        state. An earlier hook right after ``_update_states_after_model_execute`` is
+        not used here because hybrid bookkeeping has not yet appended accepted tokens
+        to ``output_token_ids``; reconciling too early would fight the authoritative
+        bookkeeping pass. Hybrid ``num_accepted_tokens`` are mirrored earlier via
+        ``_sync_intermediate_num_accepted_from_target``. See
+        ``_intermediate_shallow_req_clone`` docstring for physical KV policy.
+
+        Ordering note: reconciling here (post-bookkeeping) means the authoritative
+        ``num_computed_tokens`` / ``output_token_ids`` on ``self.requests`` already
+        include target-verified acceptance; regression tests should assume mirror
+        truncation is relative to that snapshot, not to the pre-bookkeeping hybrid view.
+        """
+        if not self._intermediate_kv_frontier_enabled():
+            return
+        ib = self.intermediate_input_batch
+        assert ib is not None
+        scheduled_spec = scheduler_output.scheduled_spec_decode_tokens
+        for rid in req_ids_in_output_order:
+            if rid not in self.intermediate_requests or rid not in self.requests:
+                continue
+            tgt = self.requests[rid]
+            self.intermediate_committed_tokens[rid] = tgt.num_computed_tokens
+            mir = self.intermediate_requests[rid]
+            mir.num_computed_tokens = tgt.num_computed_tokens
+            mir.output_token_ids[:] = list(tgt.output_token_ids)
+            midx = ib.req_id_to_index.get(rid)
+            if midx is not None:
+                ib.num_computed_tokens_cpu[midx] = tgt.num_computed_tokens
+                ib.update_req_spec_token_ids(mir, scheduled_spec)
+        n_tgt = self.input_batch.num_reqs
+        if n_tgt > 0 and ib.num_reqs >= n_tgt:
+            ib.num_accepted_tokens_cpu[:n_tgt] = (
+                self.input_batch.num_accepted_tokens_cpu[:n_tgt]
+            )
+        if (
+            self.intermediate_num_accepted_tokens is not None
+            and sampled_token_ids is not None
+            and spec_decode_metadata is not None
+        ):
+            nd = spec_decode_metadata.num_draft_tokens
+            nrows = int(sampled_token_ids.shape[0])
+            if nd is not None and len(nd) == nrows:
+                lens = get_target_verification_accepted_draft_prefix_lens(
+                    sampled_token_ids,
+                    list(nd),
+                    placeholder_token_id=PLACEHOLDER_TOKEN_ID,
+                )
+                for i, rid in enumerate(self.input_batch.req_ids[: len(lens)]):
+                    midx = ib.req_id_to_index.get(rid)
+                    if midx is not None:
+                        self.intermediate_num_accepted_tokens.np[midx] = int(lens[i])
+                self.intermediate_num_accepted_tokens.copy_to_gpu(ib.num_reqs)
+        ib.refresh_metadata()
+        if ib.num_reqs > 0:
+            ib.block_table.commit_block_table(ib.num_reqs)
+        if self._is_dit_debug_enabled():
+            for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]:
+                if rid not in self.intermediate_requests or rid not in self.requests:
+                    continue
+                mir = self.intermediate_requests[rid]
+                tgt = self.requests[rid]
+                self._dit_debug_assert(
+                    mir.num_computed_tokens == tgt.num_computed_tokens,
+                    "intermediate_reconcile_num_computed_matches_target",
+                    detail=(
+                        f"req_id={rid}, mir_num_computed={mir.num_computed_tokens}, "
+                        f"tgt_num_computed={tgt.num_computed_tokens}"
+                    ),
+                )
+                self._dit_debug_assert(
+                    list(mir.output_token_ids) == list(tgt.output_token_ids),
+                    "intermediate_reconcile_output_tokens_match_target",
+                    detail=f"req_id={rid}",
+                )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -1725,6 +2285,9 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         total_num_scheduled_tokens: int,
         cu_num_tokens: np.ndarray,
+        *,
+        input_batch: InputBatch | None = None,
+        input_ids_buffer: CpuGpuBuffer | None = None,
     ) -> None:
         """Prepare the input IDs for the current batch.
 
@@ -1732,9 +2295,12 @@ class GPUModelRunner(
         from the previous engine iteration, in which case those tokens on the
         GPU need to be copied into the corresponding slots into input_ids."""
 
-        if self.input_batch.prev_sampled_token_ids is None:
+        ib = input_batch if input_batch is not None else self.input_batch
+        ids_b = input_ids_buffer if input_ids_buffer is not None else self.input_ids
+
+        if ib.prev_sampled_token_ids is None:
             # Normal scheduling case
-            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+            ids_b.copy_to_gpu(total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
@@ -1743,7 +2309,7 @@ class GPUModelRunner(
         # Async scheduling case, where some decode requests from the previous
         # iteration won't have entries in input_ids_cpu and need to be copied
         # on the GPU from prev_sampled_token_ids.
-        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        prev_req_id_to_index = ib.prev_req_id_to_index
         assert prev_req_id_to_index is not None
         sample_flattened_indices: list[int] = []
         spec_flattened_indices: list[int] = []
@@ -1754,7 +2320,7 @@ class GPUModelRunner(
         total_num_spec_tokens = 0
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
 
-        for req_id, cur_index in self.input_batch.req_id_to_index.items():
+        for req_id, cur_index in ib.req_id_to_index.items():
             if (prev_index := prev_req_id_to_index.get(req_id)) is not None:
                 prev_common_req_indices.append(prev_index)
                 # We need to compute the flattened input_ids index of the
@@ -1784,7 +2350,7 @@ class GPUModelRunner(
         if num_commmon_tokens < total_without_spec:
             # If not all requests are decodes from the last iteration,
             # We need to copy the input_ids_cpu to the GPU first.
-            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+            ids_b.copy_to_gpu(total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
@@ -1797,8 +2363,8 @@ class GPUModelRunner(
             # and no reordering happened.
             # The indices are both the same permutation of 0..N-1 so
             # we can copy directly using a single slice.
-            self.input_ids.gpu[:num_commmon_tokens].copy_(
-                self.input_batch.prev_sampled_token_ids[:num_commmon_tokens, 0],
+            ids_b.gpu[:num_commmon_tokens].copy_(
+                ib.prev_sampled_token_ids[:num_commmon_tokens, 0],
                 non_blocking=True,
             )
             if self.enable_prompt_embeds:
@@ -1811,10 +2377,10 @@ class GPUModelRunner(
         prev_common_req_indices_tensor = torch.tensor(
             prev_common_req_indices, dtype=torch.int64, pin_memory=self.pin_memory
         ).to(self.device, non_blocking=True)
-        self.input_ids.gpu.scatter_(
+        ids_b.gpu.scatter_(
             dim=0,
             index=sampled_tokens_index_tensor,
-            src=self.input_batch.prev_sampled_token_ids[
+            src=ib.prev_sampled_token_ids[
                 prev_common_req_indices_tensor, 0
             ],
         )
@@ -1835,7 +2401,7 @@ class GPUModelRunner(
         # so convert draft_token_ids to torch.int32 here.
         draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
 
-        self.input_ids.gpu.scatter_(
+        ids_b.gpu.scatter_(
             dim=0,
             index=draft_tokens_index_tensor,
             src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
@@ -1890,6 +2456,11 @@ class GPUModelRunner(
         self,
         scheduler_output: "SchedulerOutput",
         num_scheduled_tokens: np.ndarray,
+        *,
+        input_batch: InputBatch | None = None,
+        requests: dict[str, CachedRequestState] | None = None,
+        out_buffers: dict[str, CpuGpuBuffer] | None = None,
+        skip_lora_swap: bool = False,
     ) -> tuple[
         torch.Tensor,
         SpecDecodeMetadata | None,
@@ -1901,12 +2472,38 @@ class GPUModelRunner(
         """
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
-        num_reqs = self.input_batch.num_reqs
+        ib = self.input_batch if input_batch is None else input_batch
+        rq = self.requests if requests is None else requests
+        if out_buffers is None:
+            pos_buf = self.positions
+            in_buf = self.input_ids
+            qsl_buf = self.query_start_loc
+            sl_buf = self.seq_lens
+            drm_buf = self.discard_request_mask
+            nddt_buf = self.num_decode_draft_tokens
+        else:
+            assert not ib.req_prompt_embeds, (
+                "scratch _prepare_inputs requires token-id rows (no req_prompt_embeds)"
+            )
+            assert not self.uses_mrope and self.uses_xdrope_dim == 0, (
+                "scratch _prepare_inputs does not support M-RoPE / XD-RoPE yet"
+            )
+            assert not self.enable_prompt_embeds, (
+                "scratch _prepare_inputs does not support prompt embeds yet"
+            )
+            pos_buf = out_buffers["positions"]
+            in_buf = out_buffers["input_ids"]
+            qsl_buf = out_buffers["query_start_loc"]
+            sl_buf = out_buffers["seq_lens"]
+            drm_buf = out_buffers["discard_request_mask"]
+            nddt_buf = out_buffers["num_decode_draft_tokens"]
+
+        num_reqs = ib.num_reqs
         assert num_reqs > 0
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit_block_table(num_reqs)
+        ib.block_table.commit_block_table(num_reqs)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1917,9 +2514,9 @@ class GPUModelRunner(
         cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
 
         # Get positions.
-        positions_np = self.positions.np[:total_num_scheduled_tokens]
+        positions_np = pos_buf.np[:total_num_scheduled_tokens]
         np.add(
-            self.input_batch.num_computed_tokens_cpu[req_indices],
+            ib.num_computed_tokens_cpu[req_indices],
             arange,
             out=positions_np,
         )
@@ -1927,19 +2524,19 @@ class GPUModelRunner(
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
-            self._calc_mrope_positions(scheduler_output)
+            self._calc_mrope_positions(scheduler_output, input_batch=ib, requests=rq)
 
         # Calculate XD-RoPE positions.
         # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
         if self.uses_xdrope_dim > 0:
-            self._calc_xdrope_positions(scheduler_output)
+            self._calc_xdrope_positions(scheduler_output, input_batch=ib, requests=rq)
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
         token_indices = (
-            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+            positions_np + req_indices * ib.token_ids_cpu.shape[1]
         )
         token_indices_tensor = torch.from_numpy(token_indices)
 
@@ -1947,13 +2544,13 @@ class GPUModelRunner(
         # because torch.index_select is much faster than np.take for large
         # tensors.
         torch.index_select(
-            self.input_batch.token_ids_cpu_tensor.flatten(),
+            ib.token_ids_cpu_tensor.flatten(),
             0,
             token_indices_tensor,
-            out=self.input_ids.cpu[:total_num_scheduled_tokens],
+            out=in_buf.cpu[:total_num_scheduled_tokens],
         )
         if self.enable_prompt_embeds:
-            is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
+            is_token_ids = ib.is_token_ids_tensor.flatten()
             torch.index_select(
                 is_token_ids,
                 0,
@@ -1964,13 +2561,13 @@ class GPUModelRunner(
         # Because we did not pre-allocate a massive prompt_embeds CPU tensor on
         # the InputBatch, we need to fill in the prompt embeds into the expected
         # spots in the GpuModelRunner's pre-allocated prompt_embeds tensor.
-        if self.input_batch.req_prompt_embeds:
+        if ib.req_prompt_embeds:
             output_idx = 0
             for req_idx in range(num_reqs):
                 num_sched = num_scheduled_tokens[req_idx]
 
                 # Skip if this request doesn't have embeddings
-                if req_idx not in self.input_batch.req_prompt_embeds:
+                if req_idx not in ib.req_prompt_embeds:
                     output_idx += num_sched
                     continue
 
@@ -1979,8 +2576,8 @@ class GPUModelRunner(
                     output_idx += num_sched
                     continue
 
-                req_embeds = self.input_batch.req_prompt_embeds[req_idx]
-                start_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
+                req_embeds = ib.req_prompt_embeds[req_idx]
+                start_pos = ib.num_computed_tokens_cpu[req_idx]
 
                 # Skip if trying to read beyond available embeddings
                 if start_pos >= req_embeds.shape[0]:
@@ -1999,40 +2596,42 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        ib.block_table.compute_slot_mapping(req_indices, positions_np)
+        ib.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Prepare the attention metadata.
-        self.query_start_loc.np[0] = 0
-        self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+        qsl_buf.np[0] = 0
+        qsl_buf.np[1 : num_reqs + 1] = cu_num_tokens
         # Note: pad query_start_loc to be non-decreasing, as kernels
         # like FlashAttention requires that
-        self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
-        query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
+        qsl_buf.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+        qsl_buf.copy_to_gpu()
+        query_start_loc = qsl_buf.gpu[: num_reqs + 1]
 
-        self.seq_lens.np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+        sl_buf.np[:num_reqs] = (
+            ib.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
         )
         # Fill unused with 0 for full cuda graph mode.
-        self.seq_lens.np[num_reqs:].fill(0)
-        self.seq_lens.copy_to_gpu()
+        sl_buf.np[num_reqs:].fill(0)
+        sl_buf.copy_to_gpu()
 
-        num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
+        num_tokens = [rq[r].num_tokens for r in ib.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
 
         # Record which requests should not be sampled,
         # so that we could clear the sampled tokens before returning
-        self.discard_request_mask.np[:num_reqs] = (
-            self.seq_lens.np[:num_reqs] < num_tokens_np
+        drm_buf.np[:num_reqs] = (
+            sl_buf.np[:num_reqs] < num_tokens_np
         )
-        self.discard_request_mask.copy_to_gpu(num_reqs)
+        drm_buf.copy_to_gpu(num_reqs)
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
             scheduler_output,
             total_num_scheduled_tokens,
             cu_num_tokens,
+            input_batch=ib,
+            input_ids_buffer=in_buf,
         )
 
         if self.uses_mrope:
@@ -2049,7 +2648,7 @@ class GPUModelRunner(
             )
         else:
             # Common case (1D positions)
-            self.positions.copy_to_gpu(total_num_scheduled_tokens)
+            pos_buf.copy_to_gpu(total_num_scheduled_tokens)
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
@@ -2073,11 +2672,11 @@ class GPUModelRunner(
                 req_id,
                 draft_token_ids,
             ) in scheduler_output.scheduled_spec_decode_tokens.items():
-                req_idx = self.input_batch.req_id_to_index[req_id]
+                req_idx = ib.req_id_to_index[req_id]
                 num_draft_tokens[req_idx] = len(draft_token_ids)
                 if (
-                    self.input_batch.num_computed_tokens_cpu[req_idx]
-                    >= self.input_batch.num_prompt_tokens[req_idx]
+                    ib.num_computed_tokens_cpu[req_idx]
+                    >= ib.num_prompt_tokens[req_idx]
                 ):
                     num_decode_draft_tokens[req_idx] = len(draft_token_ids)
             pivot_plan = self.pending_pivot_expansion_plan
@@ -2213,12 +2812,12 @@ class GPUModelRunner(
             else:
                 num_sampled_tokens = num_draft_tokens + 1
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
-            self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
-            self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
-            self.num_decode_draft_tokens.copy_to_gpu()
+            nddt_buf.np[:num_reqs] = num_decode_draft_tokens
+            nddt_buf.np[num_reqs:].fill(-1)
+            nddt_buf.copy_to_gpu()
 
         # Hot-Swap lora model
-        if self.lora_config:
+        if self.lora_config and not skip_lora_swap:
             assert (
                 np.sum(num_sampled_tokens)
                 <= self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -2233,7 +2832,7 @@ class GPUModelRunner(
             if packed_lora:
                 exp_plan = spec_decode_metadata.expansion_plan
                 assert exp_plan.packed_sm_origin is not None
-                req_lora = self.input_batch.request_lora_mapping[:num_reqs]
+                req_lora = ib.request_lora_mapping[:num_reqs]
                 sm = exp_plan.packed_sm_origin
                 P = exp_plan.packed_batch_size
                 prompt_lora_mapping = tuple(
@@ -2249,12 +2848,12 @@ class GPUModelRunner(
                 self._set_active_loras(
                     prompt_lora_mapping,
                     token_lora_mapping,
-                    set(self.input_batch.lora_id_to_lora_request.values()),
+                    set(ib.lora_id_to_lora_request.values()),
                     LoRAMappingType.LANGUAGE,
                 )
             else:
                 self.set_active_loras(
-                    self.input_batch, num_scheduled_tokens, num_sampled_tokens
+                    ib, num_scheduled_tokens, num_sampled_tokens
                 )
 
         return (
@@ -2276,13 +2875,24 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
-    ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
+        input_batch: InputBatch | None = None,
+        common_attn_query_start_loc: CpuGpuBuffer | None = None,
+        common_attn_seq_lens: CpuGpuBuffer | None = None,
+        common_attn_num_accepted_tokens: CpuGpuBuffer | None = None,
+        common_attn_num_decode_draft_tokens: CpuGpuBuffer | None = None,
+    ) -> AttentionMetadataBuildResult:
         """
-        :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
+        :return: ``AttentionMetadataBuildResult`` with per-``kv_cache_gid`` speculative
+        ``CommonAttentionMetadata`` when spec decode is active.
         """
+        ib = input_batch if input_batch is not None else self.input_batch
+        qsl_cm = common_attn_query_start_loc or self.query_start_loc
+        sl_cm = common_attn_seq_lens or self.seq_lens
+        nat_cm = common_attn_num_accepted_tokens or self.num_accepted_tokens
+        nddt_cm = common_attn_num_decode_draft_tokens or self.num_decode_draft_tokens
         # Attention metadata is not needed for attention free models
         if len(self.kv_cache_config.kv_cache_groups) == 0:
-            return {}, None
+            return AttentionMetadataBuildResult({}, None, {})
 
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
@@ -2298,14 +2908,14 @@ class GPUModelRunner(
             # window size when capturing to make sure the correct kernel is selected.
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = self.seq_lens.np[:num_reqs].max().item()
+            max_seq_len = sl_cm.np[:num_reqs].max().item()
 
         if use_spec_decode:
-            self.num_accepted_tokens.np[:num_reqs] = (
-                self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+            nat_cm.np[:num_reqs] = (
+                ib.num_accepted_tokens_cpu[:num_reqs]
             )
-            self.num_accepted_tokens.np[num_reqs:].fill(1)
-            self.num_accepted_tokens.copy_to_gpu()
+            nat_cm.np[num_reqs:].fill(1)
+            nat_cm.copy_to_gpu()
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -2319,7 +2929,7 @@ class GPUModelRunner(
                     device=self.device,
                 )
             else:
-                blk_table = self.input_batch.block_table[kv_cache_gid]
+                blk_table = ib.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)
 
             # Fill unused with -1. Needed for reshape_and_cache in full cuda
@@ -2334,13 +2944,11 @@ class GPUModelRunner(
         if self.model_config.enable_return_routed_experts:
             self.slot_mapping = slot_mapping_gid_0[:num_tokens].cpu().numpy()
         cm_base = CommonAttentionMetadata(
-            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
-            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
-            seq_lens=self.seq_lens.gpu[:num_reqs_padded],
-            _seq_lens_cpu=self.seq_lens.cpu[:num_reqs_padded],
-            _num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[
-                :num_reqs_padded
-            ],
+            query_start_loc=qsl_cm.gpu[: num_reqs_padded + 1],
+            query_start_loc_cpu=qsl_cm.cpu[: num_reqs_padded + 1],
+            seq_lens=sl_cm.gpu[:num_reqs_padded],
+            _seq_lens_cpu=sl_cm.cpu[:num_reqs_padded],
+            _num_computed_tokens_cpu=ib.num_computed_tokens_cpu_tensor[:num_reqs_padded],
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens_padded,
             max_query_len=max_query_len,
@@ -2352,7 +2960,7 @@ class GPUModelRunner(
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
-                self.seq_lens.cpu[:num_reqs],
+                sl_cm.cpu[:num_reqs],
                 self.dcp_world_size,
                 self.dcp_rank,
                 self.parallel_config.cp_kv_cache_interleave_size,
@@ -2405,8 +3013,8 @@ class GPUModelRunner(
             ):
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args = dict(
-                    num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
-                    num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[
+                    num_accepted_tokens=nat_cm.gpu[:num_reqs_padded],
+                    num_decode_draft_tokens_cpu=nddt_cm.cpu[
                         :num_reqs_padded
                     ],
                 )
@@ -2446,6 +3054,7 @@ class GPUModelRunner(
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
+        spec_decode_cad_by_gid: dict[int, CommonAttentionMetadata] = {}
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
 
@@ -2460,6 +3069,8 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+
+            spec_decode_cad_by_gid[int(kv_cache_gid)] = cm
 
             if (
                 self.speculative_config
@@ -2483,14 +3094,15 @@ class GPUModelRunner(
 
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
-            for req_id in self.input_batch.req_ids:
+            for req_index in range(ib.num_reqs):
+                req_id = ib.req_ids[req_index]
                 image_doc_ranges = []
                 req_state = self.requests[req_id]
                 for mm_feature in req_state.mm_features:
                     pos_info = mm_feature.mm_position
                     img_doc_range = pos_info.extract_embeds_range()
                     image_doc_ranges.extend(img_doc_range)
-                req_idx = self.input_batch.req_id_to_index[req_id]
+                req_idx = ib.req_id_to_index[req_id]
                 req_doc_ranges[req_idx] = image_doc_ranges
 
             if isinstance(attn_metadata, list):
@@ -2510,8 +3122,16 @@ class GPUModelRunner(
             spec_decode_common_attn_metadata = (
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
             )
+            spec_decode_cad_by_gid = {
+                gid: cm_i.unpadded(num_tokens, num_reqs)
+                for gid, cm_i in spec_decode_cad_by_gid.items()
+            }
 
-        return attn_metadata, spec_decode_common_attn_metadata
+        return AttentionMetadataBuildResult(
+            attn_metadata=attn_metadata,
+            spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
+            spec_decode_common_attn_metadata_by_gid=spec_decode_cad_by_gid,
+        )
 
     def _compute_cascade_attn_prefix_lens(
         self,
@@ -2646,13 +3266,21 @@ class GPUModelRunner(
         )
         return common_prefix_len if use_cascade else 0
 
-    def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
+    def _calc_mrope_positions(
+        self,
+        scheduler_output: "SchedulerOutput",
+        *,
+        input_batch: InputBatch | None = None,
+        requests: dict[str, CachedRequestState] | None = None,
+    ):
+        ib = input_batch if input_batch is not None else self.input_batch
+        rq = requests if requests is not None else self.requests
         mrope_pos_ptr = 0
-        for index, req_id in enumerate(self.input_batch.req_ids):
-            req = self.requests[req_id]
+        for index, req_id in enumerate(ib.req_ids):
+            req = rq[req_id]
             assert req.mrope_positions is not None
 
-            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
+            num_computed_tokens = ib.num_computed_tokens_cpu[index]
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
                 req.prompt_token_ids, req.prompt_embeds
@@ -2695,13 +3323,21 @@ class GPUModelRunner(
 
                 mrope_pos_ptr += completion_part_len
 
-    def _calc_xdrope_positions(self, scheduler_output: "SchedulerOutput"):
+    def _calc_xdrope_positions(
+        self,
+        scheduler_output: "SchedulerOutput",
+        *,
+        input_batch: InputBatch | None = None,
+        requests: dict[str, CachedRequestState] | None = None,
+    ):
+        ib = input_batch if input_batch is not None else self.input_batch
+        rq = requests if requests is not None else self.requests
         xdrope_pos_ptr = 0
-        for index, req_id in enumerate(self.input_batch.req_ids):
-            req = self.requests[req_id]
+        for index, req_id in enumerate(ib.req_ids):
+            req = rq[req_id]
             assert req.xdrope_positions is not None
 
-            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
+            num_computed_tokens = ib.num_computed_tokens_cpu[index]
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
                 req.prompt_token_ids, req.prompt_embeds
@@ -3733,6 +4369,381 @@ class GPUModelRunner(
     # DIT shadow replay helpers were removed. DIT now runs with local round
     # orchestration and token buffers inside run_hierarchical_verification_rounds().
 
+    def _prepare_hv_step(
+        self,
+        inter: IntermediateDraftModelProposer,
+        inter_cad: CommonAttentionMetadata,
+        *,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+        candidate_tokens: torch.Tensor,
+    ) -> HvVerifyPrefabrication:
+        for ag in inter.draft_attn_groups:
+            m_builder = ag.get_metadata_builder()
+            if isinstance(
+                m_builder,
+                (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
+            ):
+                raise NotImplementedError(
+                    "standalone hierarchical_verification (v1) does not support "
+                    "Mamba2/GDN attention metadata builders on the intermediate verifier."
+                )
+        cad = clone_common_attn_metadata(inter_cad)
+        (
+            cad,
+            target_token_ids,
+            target_positions,
+            target_hidden_states,
+            next_token_ids,
+        ) = _canonicalize_reused_prefix_frontier(
+            inter,
+            cad=cad,
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+        )
+        block_size = inter.draft_attn_groups[0].kv_cache_spec.block_size
+        roll_rows = [
+            [int(tok) for tok in candidate_tokens[b].tolist()]
+            for b in range(candidate_tokens.shape[0])
+        ]
+        (
+            pref_toks,
+            pref_pos,
+            pref_hidden,
+            pref_next,
+            pref_cad,
+            base_query_lens,
+            prefix_lens,
+            roll_lens,
+        ) = hv_build_prefix_conditioned_inputs(
+            cad=cad,
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            prefix_rows=prefix_rows,
+            roll_rows=roll_rows,
+            block_size=block_size,
+        )
+        return HvVerifyPrefabrication(
+            pref_toks=pref_toks,
+            pref_pos=pref_pos,
+            pref_hidden=pref_hidden,
+            pref_next=pref_next,
+            pref_cad=pref_cad,
+            base_query_lens=base_query_lens,
+            prefix_lens=prefix_lens,
+            roll_lens=roll_lens,
+            candidate_tokens=candidate_tokens.to(torch.int32),
+        )
+
+    def _run_hv_verify_step(
+        self,
+        inter: IntermediateDraftModelProposer,
+        pre: HvVerifyPrefabrication,
+        *,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> DitRoundVerification:
+        num_tokens, token_indices_to_sample, pref_cad = inter.set_inputs_first_pass(
+            target_token_ids=pre.pref_toks,
+            next_token_ids=pre.pref_next,
+            target_positions=pre.pref_pos,
+            target_hidden_states=pre.pref_hidden,
+            token_indices_to_sample=None,
+            cad=pre.pref_cad,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        )
+        assert token_indices_to_sample is not None
+
+        per_layer_attn_metadata: dict[str, object] = {}
+        attn_metadata = None
+        for attn_group in inter.draft_attn_groups:
+            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
+                common_attn_metadata=pref_cad,
+                draft_index=0,
+            )
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
+
+        inter._check_per_layer_attn_metadata_contract(per_layer_attn_metadata)
+
+        if inter.allowed_attn_types is not None and not isinstance(
+            attn_metadata,
+            inter.allowed_attn_types,
+        ):
+            raise ValueError(
+                "hierarchical_verification: unsupported attention metadata type "
+                f"{type(attn_metadata)}; allowed: {inter.allowed_attn_types}"
+            )
+
+        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+            inter._determine_batch_execution_and_padding(num_tokens)
+        )
+        if inter.supports_mm_inputs:
+            inter.inputs_embeds[:num_tokens] = inter.model.embed_input_ids(
+                inter.input_ids[:num_tokens],
+            )
+            input_ids = None
+            inputs_embeds = inter.inputs_embeds[:num_input_tokens]
+        else:
+            input_ids = inter.input_ids[:num_input_tokens]
+            inputs_embeds = None
+
+        model_kwargs = {
+            "input_ids": input_ids,
+            "positions": inter._get_positions(num_input_tokens),
+            "inputs_embeds": inputs_embeds,
+        }
+        if inter.pass_hidden_states_to_model:
+            model_kwargs["hidden_states"] = inter.hidden_states[:num_input_tokens]
+
+        with set_forward_context(
+            per_layer_attn_metadata,
+            inter.vllm_config,
+            num_tokens=num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            slot_mapping=inter._get_slot_mapping(
+                num_input_tokens, pref_cad.slot_mapping
+            ),
+        ):
+            ret_hidden_states = inter.model(**model_kwargs)
+            if inter.model_returns_tuple():
+                last_hidden_states, _ = ret_hidden_states
+            else:
+                last_hidden_states = ret_hidden_states
+        all_logits = inter.model.compute_logits(last_hidden_states).to(torch.float32)
+        logits_flat, bonus_logits = slice_hv_verification_logits(
+            all_logits,
+            pref_cad,
+            pre.candidate_tokens,
+            pre.base_query_lens,
+            pre.prefix_lens,
+            pre.roll_lens,
+        )
+        return DitRoundVerification(
+            logits_flat=logits_flat, bonus_logits=bonus_logits
+        )
+
+    def run_hv_rounds(
+        self,
+        *,
+        drafter: HierarchicalVerificationProposer,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata: SamplingMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        spec_decode_cad_by_gid: dict[int, CommonAttentionMetadata] | None = None,
+    ) -> tuple[torch.Tensor, HybridProposalBundle]:
+        """Standalone hierarchical verification: fixed full-batch rounds, no mirror/pivot."""
+        assert self.speculative_config is not None
+        if self._static_intermediate_kv_frontier_enabled(self.vllm_config):
+            raise ValueError(
+                "standalone hierarchical_verification (metadata-direct path) "
+                "does not support intermediate_kv_mode=mirror_frontier for this "
+                "configuration; disable mirror intermediate KV or use adaptive_spechive."
+            )
+        self._dit_debug_step_id += 1
+        spec = self.speculative_config
+        cap = int(spec.hv_max_spec_len())
+        L = int(spec.num_speculative_tokens)
+        n_inner = int(spec.num_hv_rounds)
+        batch_size = common_attn_metadata.batch_size()
+        use_draft_probs = spec.use_draft_probs_in_rejection and not sampling_metadata.all_greedy
+        vocab_size = self.model_config.get_vocab_size()
+
+        cad_map = spec_decode_cad_by_gid or {}
+        draft_gid = getattr(drafter.draft, "kv_cache_gid", None)
+        inter_gid = getattr(drafter.inter, "kv_cache_gid", None)
+        draft_cad = (
+            cad_map[int(draft_gid)]
+            if draft_gid is not None and int(draft_gid) in cad_map
+            else common_attn_metadata
+        )
+        inter_cad = (
+            cad_map[int(inter_gid)]
+            if inter_gid is not None and int(inter_gid) in cad_map
+            else common_attn_metadata
+        )
+
+        prefix_rows: list[list[int]] = [[] for _ in range(batch_size)]
+        prefix_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+        source_stage_rows: list[list[int]] = [[] for _ in range(batch_size)]
+        inter_verified_rows: list[int] = [0 for _ in range(batch_size)]
+        inter_accepted_rows: list[int] = [0 for _ in range(batch_size)]
+
+        for _ in range(n_inner):
+            sm_idxs = list(range(batch_size))
+            round_sm = slice_sampling_metadata_for_subbatch(
+                sampling_metadata,
+                sm_idxs,
+                provisional_prefix_rows=prefix_rows,
+                sampled_ids_only=True,
+            )
+            proposal = drafter.propose_chunk_from_prefix(
+                base_target_token_ids=target_token_ids,
+                base_target_positions=target_positions,
+                base_target_hidden_states=target_hidden_states,
+                base_next_token_ids=next_token_ids,
+                base_common_attn_metadata=draft_cad,
+                base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                prefix_rows=prefix_rows,
+                chunk_len=L,
+                sampling_metadata=round_sm,
+                use_draft_probs=use_draft_probs,
+            )
+            eff_bs = int(proposal.tokens.shape[0])
+            if eff_bs != batch_size:
+                raise RuntimeError(
+                    "hierarchical_verification expects draft proposals for every "
+                    f"batch row; got effective batch {eff_bs} != {batch_size}"
+                )
+            hv_pre = self._prepare_hv_step(
+                drafter.inter,
+                inter_cad,
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                prefix_rows=prefix_rows,
+                candidate_tokens=proposal.tokens,
+            )
+            verification = self._run_hv_verify_step(
+                drafter.inter,
+                hv_pre,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            )
+            decision = drafter.run_inter_verification_acceptance(
+                proposal=proposal,
+                verification=verification,
+                sampling_metadata=round_sm,
+                rejection_sampler=self.rejection_sampler,
+                vocab_size=vocab_size,
+                use_draft_probs=use_draft_probs,
+            )
+            for b in range(batch_size):
+                inter_verified_rows[b] += L
+                inter_accepted_rows[b] += len(decision.emitted_rows[b])
+            for b, emitted in enumerate(decision.emitted_rows):
+                prefix_rows[b].extend(emitted)
+                source_stage_rows[b].extend([0] * len(emitted))
+                if use_draft_probs:
+                    prefix_prob_rows[b].extend(decision.emitted_prob_rows[b])
+
+        tail_len = L
+        remaining_cap_per_row = [
+            max(0, cap - len(prefix_rows[b])) for b in range(batch_size)
+        ]
+        if self._is_dit_debug_enabled():
+            _tail_chk = validate_hierarchical_verification_tail_len_rowwise(
+                tail_len=tail_len,
+                interval_tokens=L,
+                remaining_cap_per_row=remaining_cap_per_row,
+            )
+            self._dit_debug_assert(
+                _tail_chk.ok,
+                _tail_chk.code,
+                detail=_tail_chk.detail,
+            )
+        tail_sm = slice_sampling_metadata_for_subbatch(
+            sampling_metadata,
+            list(range(batch_size)),
+            provisional_prefix_rows=prefix_rows,
+            sampled_ids_only=True,
+        )
+        tail = drafter.propose_chunk_from_prefix(
+            base_target_token_ids=target_token_ids,
+            base_target_positions=target_positions,
+            base_target_hidden_states=target_hidden_states,
+            base_next_token_ids=next_token_ids,
+            base_common_attn_metadata=draft_cad,
+            base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            prefix_rows=prefix_rows,
+            chunk_len=tail_len,
+            sampling_metadata=tail_sm,
+            use_draft_probs=use_draft_probs,
+        )
+        if int(tail.tokens.shape[0]) != batch_size:
+            raise RuntimeError(
+                "hierarchical_verification tail expects full batch "
+                f"{batch_size}, got {int(tail.tokens.shape[0])}"
+            )
+        tail_rows = [
+            [int(tok) for tok in tail.tokens[b].tolist()] for b in range(batch_size)
+        ]
+        tail_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+        if use_draft_probs and tail.probs is not None:
+            for b in range(batch_size):
+                tail_prob_rows[b] = [tail.probs[b, j] for j in range(tail_len)]
+        for b in range(batch_size):
+            prefix_rows[b].extend(tail_rows[b])
+            source_stage_rows[b].extend([1] * len(tail_rows[b]))
+            if use_draft_probs:
+                prefix_prob_rows[b].extend(tail_prob_rows[b])
+
+        dev = target_token_ids.device
+        out_exp = torch.full(
+            (batch_size, cap),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=dev,
+        )
+        source_stage_2d = torch.zeros(
+            (batch_size, cap), dtype=torch.int32, device=dev
+        )
+        for b in range(batch_size):
+            valid = min(cap, len(prefix_rows[b]))
+            if valid > 0:
+                out_exp[b, :valid] = torch.tensor(
+                    prefix_rows[b][:valid],
+                    dtype=torch.int32,
+                    device=dev,
+                )
+                source_stage_2d[b, :valid] = torch.tensor(
+                    source_stage_rows[b][:valid],
+                    dtype=torch.int32,
+                    device=dev,
+                )
+        draft_probs_flat = (
+            _flatten_prob_rows_for_output(prefix_prob_rows, out_exp)
+            if use_draft_probs
+            else None
+        )
+        row_req_ids = _hybrid_bundle_row_req_ids_for_batch(
+            self.input_batch,
+            origin_batch_size=batch_size,
+            num_bundle_rows=batch_size,
+            pivot_expansion_plan=None,
+        )
+        bundle = _build_hybrid_bundle_from_rows(
+            out_exp,
+            mode="hierarchical_verification",
+            draft_probs=draft_probs_flat,
+            source_stage_2d=source_stage_2d,
+            bundle_row_req_ids=row_req_ids,
+        )
+        bundle = dataclass_replace(
+            bundle,
+            inter_verified_counts=inter_verified_rows,
+            inter_accepted_counts=inter_accepted_rows,
+            staged_verification_depth=int(n_inner),
+        )
+        out = _collapse_draft_tensor_rows_for_scheduler(
+            out_exp, pivot_expansion_plan=None, batch_size=batch_size
+        )
+        return out, bundle
+
     def run_hierarchical_verification_rounds(
         self,
         *,
@@ -3850,6 +4861,10 @@ class GPUModelRunner(
             staged_fast = getattr(
                 drafter, "supports_staged_eagle_fastpath", lambda: False
             )()
+            if self._intermediate_kv_frontier_enabled():
+                # mirror_frontier: disable staged fastpath; mirror batch drives metadata.
+                # draft_like (frontier off): keep staged fastpath + per-round refresh.
+                staged_fast = False
             if staged_fast:
                 if inter_state is None:
                     inter_state = drafter.bootstrap_intermediate_round_state(
@@ -4014,6 +5029,29 @@ class GPUModelRunner(
                 inter_state = expand_intermediate_state_for_pivot_plan(
                     inter_state, pivot_expansion_plan
                 )
+            mirror_kv_common_attn_metadata = None
+            if (
+                self._intermediate_kv_frontier_enabled()
+                and self._hv_scheduler_output is not None
+                and self.intermediate_input_batch is not None
+                and eff_bs == batch_size
+                and int(common_attn_metadata.batch_size())
+                == int(self.input_batch.num_reqs)
+            ):
+                so = self._hv_scheduler_output
+                nsched = [
+                    int(so.num_scheduled_tokens[str(rid)])
+                    for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]
+                ]
+                nst = np.array(nsched, dtype=np.int32)
+                prep = self._prepare_intermediate_metadata(so, nst)
+                if prep is not None and prep.spec_decode_common_attn_metadata is not None:
+                    mirror_kv_common_attn_metadata = (
+                        prep.spec_decode_common_attn_metadata
+                    )
+            # ``mirror_kv_common_attn_metadata`` supplies mirror CAD for adaptive/pivot
+            # prefix-conditioned verify. Standalone ``hierarchical_verification`` uses
+            # ``run_hv_rounds`` (metadata-direct path) instead of this block.
             # -- Profiler: intermediate_verify (inter-verifier forward) --
             _hv_prof.snapshot_memory_before("intermediate_verify",
                                            invocation_idx=round_idx)
@@ -4030,6 +5068,7 @@ class GPUModelRunner(
                     base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                     prefix_rows=prefix_rows,
                     candidate_tokens=proposal.tokens,
+                    mirror_kv_common_attn_metadata=mirror_kv_common_attn_metadata,
                 )
             else:
                 verification = drafter.verify_chunk_with_inter_verifier(
@@ -4041,6 +5080,7 @@ class GPUModelRunner(
                     base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                     prefix_rows=prefix_rows,
                     candidate_tokens=proposal.tokens,
+                    mirror_kv_common_attn_metadata=mirror_kv_common_attn_metadata,
                 )
             _hv_prof.end_stage("intermediate_verify",
                                invocation_idx=round_idx)
@@ -4126,7 +5166,7 @@ class GPUModelRunner(
                     detail=f"round={round_idx}, prefix_prob_lens={[len(r) for r in prefix_prob_rows]}",
                 )
 
-            if staged_fast:
+            if staged_fast and not self._intermediate_kv_frontier_enabled():
                 inter_state = drafter.refresh_intermediate_round_state(
                     base_target_token_ids=target_token_ids,
                     base_target_positions=target_positions,
@@ -4136,6 +5176,14 @@ class GPUModelRunner(
                     base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                     prefix_rows=prefix_rows,
                     old_state=inter_state,
+                )
+            elif self._intermediate_kv_frontier_enabled():
+                self._advance_intermediate_frontier_after_round(
+                    decision,
+                    batch_size=batch_size,
+                    eff_bs=eff_bs,
+                    pivot_expansion_plan=pivot_expansion_plan,
+                    before_prefix_lens=before_lens,
                 )
 
         expected_rounds = (
@@ -4171,6 +5219,8 @@ class GPUModelRunner(
         staged_fast_outer = getattr(
             drafter, "supports_staged_eagle_fastpath", lambda: False
         )()
+        if self._intermediate_kv_frontier_enabled():
+            staged_fast_outer = False
         if tail_len > 0:
             tail_sm_idxs = (
                 _pivot_plan_sm_indices(pivot_expansion_plan)
@@ -4305,6 +5355,16 @@ class GPUModelRunner(
         )
         if pivot_expansion_plan is not None:
             bundle = dataclass_replace(bundle, expansion_plan=pivot_expansion_plan)
+        if self._is_dit_debug_enabled():
+            _layout_chk = validate_hybrid_bundle_draft_layout(
+                bundle,
+                expected_num_rows=eff_rows,
+            )
+            self._dit_debug_assert(
+                _layout_chk.ok,
+                _layout_chk.code,
+                detail=_layout_chk.detail,
+            )
         inter_verified_lens = [
             sum(1 for stage in source_stage_rows[b] if stage == 0)
             for b in range(eff_rows)
@@ -5299,6 +6359,8 @@ class GPUModelRunner(
         num_reqs_padded: int,
         num_tokens_unpadded: int,
         ubatch_slices: "UBatchSlices | None" = None,
+        *,
+        input_batch: InputBatch | None = None,
     ) -> tuple[
         dict[int, torch.Tensor] | None,
         dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
@@ -5324,6 +6386,8 @@ class GPUModelRunner(
         ):
             return None, None
 
+        ib = input_batch if input_batch is not None else self.input_batch
+
         def _get_slot_mapping(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = self.kv_cache_config.kv_cache_groups[
@@ -5336,7 +6400,7 @@ class GPUModelRunner(
                     device=self.device,
                 )
             else:
-                blk_table = self.input_batch.block_table[kv_cache_gid]
+                blk_table = ib.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
 
             # Fill unused with -1. Needed for reshape_and_cache in full cuda
@@ -5398,6 +6462,7 @@ class GPUModelRunner(
         ):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+            self._sync_intermediate_states_with_scheduler(scheduler_output)
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -5536,20 +6601,25 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            attn_metadata, spec_decode_common_attn_metadata = (
-                self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded if pad_attn else None,
-                    max_query_len=max_num_scheduled_tokens,
-                    ubatch_slices=ubatch_slices_attn,
-                    logits_indices=logits_indices,
-                    use_spec_decode=use_spec_decode,
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                    slot_mappings=slot_mappings_by_group,
-                )
+            attn_build = self._build_attention_metadata(
+                num_tokens=num_tokens_unpadded,
+                num_tokens_padded=num_tokens_padded if pad_attn else None,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded if pad_attn else None,
+                max_query_len=max_num_scheduled_tokens,
+                ubatch_slices=ubatch_slices_attn,
+                logits_indices=logits_indices,
+                use_spec_decode=use_spec_decode,
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                slot_mappings=slot_mappings_by_group,
+            )
+            attn_metadata = attn_build.attn_metadata
+            spec_decode_common_attn_metadata = (
+                attn_build.spec_decode_common_attn_metadata
+            )
+            spec_decode_common_attn_metadata_by_gid = (
+                attn_build.spec_decode_common_attn_metadata_by_gid
             )
 
             (
@@ -5767,6 +6837,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            spec_decode_common_attn_metadata_by_gid,
             full_verification_time_sec,
         )
         self.kv_connector_output = kv_connector_output
@@ -5806,6 +6877,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            spec_decode_common_attn_metadata_by_gid,
             full_verification_time_sec,
         ) = self.execute_model_state
         # Clear ephemeral state.
@@ -5831,6 +6903,10 @@ class GPUModelRunner(
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        # Mirror hybrid acceptance counts; full mirror vs target token alignment runs
+        # in _reconcile_intermediate_frontier_after_target after bookkeeping.
+        if self._intermediate_kv_frontier_enabled():
+            self._sync_intermediate_num_accepted_from_target()
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -5861,6 +6937,7 @@ class GPUModelRunner(
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     slot_mappings,
+                    spec_decode_common_attn_metadata_by_gid,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -5875,13 +6952,14 @@ class GPUModelRunner(
                 spec_config.uses_gpu_sampled_tokens_for_drafting()
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
-                # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
-                # as inputs, and does not need to wait for bookkeeping to finish.
+                # EAGLE/DraftModel/HV/etc. can use the GPU sampled tokens as inputs and
+                # does not need to wait for bookkeeping to finish.
                 assert isinstance(
                     self.drafter,
                     EagleProposer
                     | DraftModelProposer
                     | AdaptiveSpechiveProposer
+                    | HierarchicalVerificationProposer
                     | PivotProposer
                     | ExtractHiddenStatesProposer,
                 )
@@ -5954,6 +7032,13 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
+            )
+        if self._intermediate_kv_frontier_enabled():
+            self._reconcile_intermediate_frontier_after_target(
+                scheduler_output,
+                req_ids_output_copy,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                spec_decode_metadata=spec_decode_metadata,
             )
         self._spec_profiler.end_stage("bookkeeping")
         if self._current_profile_ctx is not None:
@@ -6396,6 +7481,7 @@ class GPUModelRunner(
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        spec_decode_cad_by_gid: dict[int, CommonAttentionMetadata] | None = None,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
@@ -6489,7 +7575,11 @@ class GPUModelRunner(
         elif spec_config.uses_model_based_drafter():
             assert isinstance(
                 self.drafter,
-                EagleProposer | DraftModelProposer | AdaptiveSpechiveProposer | PivotProposer,
+                EagleProposer
+                | DraftModelProposer
+                | AdaptiveSpechiveProposer
+                | HierarchicalVerificationProposer
+                | PivotProposer,
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -6588,19 +7678,35 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
-            draft_token_ids = self.drafter.propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                token_indices_to_sample=token_indices_to_sample,
-                sampling_metadata=sampling_metadata,
-                common_attn_metadata=common_attn_metadata,
-                mm_embed_inputs=mm_embed_inputs,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                slot_mappings=slot_mappings,
+            mirror_hv_meta = self._static_intermediate_kv_frontier_enabled(
+                self.vllm_config
             )
-            self._take_drafter_staged_hybrid_and_publish(spec_decode_metadata)
+            if mirror_hv_meta:
+                self._hv_scheduler_output = scheduler_output
+            try:
+                propose_kw: dict[str, Any] = dict(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    token_indices_to_sample=token_indices_to_sample,
+                    sampling_metadata=sampling_metadata,
+                    common_attn_metadata=common_attn_metadata,
+                    mm_embed_inputs=mm_embed_inputs,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    slot_mappings=slot_mappings,
+                )
+                if spec_config.method == "hierarchical_verification" and isinstance(
+                    self.drafter, HierarchicalVerificationProposer
+                ):
+                    propose_kw["spec_decode_common_attn_metadata_by_gid"] = (
+                        spec_decode_cad_by_gid
+                    )
+                draft_token_ids = self.drafter.propose(**propose_kw)
+                self._take_drafter_staged_hybrid_and_publish(spec_decode_metadata)
+            finally:
+                if mirror_hv_meta:
+                    self._hv_scheduler_output = None
 
         # ---- TETRIS post-processing ----------------------------------------
         spec_config = self.speculative_config
@@ -7335,7 +8441,7 @@ class GPUModelRunner(
                 self.query_start_loc.copy_to_gpu()
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-                attn_metadata, _ = self._build_attention_metadata(
+                attn_build_dummy = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
                     num_reqs=num_reqs_padded,
@@ -7345,6 +8451,7 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                 )
+                attn_metadata = attn_build_dummy.attn_metadata
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -7998,7 +9105,11 @@ class GPUModelRunner(
         if self.speculative_config and self.speculative_config.uses_model_based_drafter():
             assert isinstance(
                 self.drafter,
-                EagleProposer | DraftModelProposer | AdaptiveSpechiveProposer | PivotProposer,
+                EagleProposer
+                | DraftModelProposer
+                | AdaptiveSpechiveProposer
+                | HierarchicalVerificationProposer
+                | PivotProposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -8163,6 +9274,7 @@ class GPUModelRunner(
                 EagleProposer
                 | DraftModelProposer
                 | AdaptiveSpechiveProposer
+                | HierarchicalVerificationProposer
                 | PivotProposer
                 | ExtractHiddenStatesProposer,
             )
@@ -8244,6 +9356,25 @@ class GPUModelRunner(
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
             )
+            if self._static_intermediate_kv_frontier_enabled(self.vllm_config):
+                self.intermediate_input_batch = InputBatch(
+                    max_num_reqs=self.max_num_reqs,
+                    max_model_len=max_model_len,
+                    max_num_batched_tokens=self.max_num_tokens,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    vocab_size=self.model_config.get_vocab_size(),
+                    block_sizes=block_sizes,
+                    kernel_block_sizes=kernel_block_sizes,
+                    max_num_blocks_per_req=max_num_blocks,
+                    is_spec_decode=bool(self.vllm_config.speculative_config),
+                    logitsprocs=self.input_batch.logitsprocs,
+                    logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
+                    is_pooling_model=self.is_pooling_model,
+                    cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+                )
+                self.intermediate_requests.clear()
+                self.intermediate_committed_tokens.clear()
 
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig

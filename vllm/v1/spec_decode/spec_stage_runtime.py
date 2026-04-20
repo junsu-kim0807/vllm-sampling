@@ -285,7 +285,7 @@ class StagedHiddenStateBundle:
 
 @dataclass
 class IntermediateRoundState:
-    """Mutable staged round state for intermediate frontier advancement."""
+    """Round-local cache for one outer engine step (proposal / verify), not a request-lifetime frontier."""
 
     hidden_bundle: StagedHiddenStateBundle | None = None
     verification_metadata: dict[str, object] | None = None

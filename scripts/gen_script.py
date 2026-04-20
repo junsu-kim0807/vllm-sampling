@@ -29,7 +29,7 @@ import getpass
 import os
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -745,6 +745,16 @@ def build_python_command(
         parts.append(
             f"--round {adaptive_spechive_rounds}"
         )
+    elif method == "hierarchical_verification":
+        if not adaptive_spechive_intermediate_model:
+            raise SystemExit(
+                f"--method={method} requires intermediate model in generator "
+                "(pass --adaptive-spechive-intermediate-model)."
+            )
+        parts.append(
+            f"--intermediate-model {shquote(adaptive_spechive_intermediate_model)}"
+        )
+        parts.append(f"--round {adaptive_spechive_rounds}")
     elif method == "pivot":
         if pivot_spechive and not adaptive_spechive_intermediate_model:
             raise SystemExit(
@@ -1168,8 +1178,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Intermediate verifier model id to pass when generating "
-            "method=adaptive_spechive jobs."
+            "Intermediate verifier model id for method=adaptive_spechive, "
+            "method=hierarchical_verification, pivot+spechive, or batch HV add-ons."
         ),
     )
     parser.add_argument(
@@ -1183,7 +1193,11 @@ def parse_args() -> argparse.Namespace:
         "--round",
         type=int,
         default=1,
-        help="Number of adaptive_spechive hierarchical verification rounds.",
+        help=(
+            "Rounds: adaptive_spechive hierarchical mode uses "
+            "adaptive_spechive_num_rounds; standalone hierarchical_verification "
+            "uses num_hv_rounds (both passed as --round to run_spec_decode_metrics)."
+        ),
     )
     parser.add_argument(
         "--topk-selection",
@@ -1204,14 +1218,39 @@ def parse_args() -> argparse.Namespace:
         help="When --spec-method=pivot: enable staged D=>I rounds before D=>T verification.",
     )
     parser.add_argument(
+        "--batch-adaptive-spechive-draft",
+        action="store_true",
+        help=(
+            "With --batch or --length: also emit method=adaptive_spechive "
+            "(hierarchical SpecHive) jobs for each speculative pair, using the "
+            "pair's draft model (vanilla speculative + SpecHive pipeline)."
+        ),
+    )
+    parser.add_argument(
+        "--batch-adaptive-spechive-eagle3",
+        action="store_true",
+        help=(
+            "With --batch or --length: also emit method=adaptive_spechive "
+            "jobs for each EAGLE3 pair, using the EAGLE3 speculator repo as "
+            "draft (EAGLE3 + SpecHive)."
+        ),
+    )
+    parser.add_argument(
         "--spec-method",
         type=str,
         default="speculative",
-        choices=["speculative", "adaptive_spechive", "pivot", "tetris"],
+        choices=[
+            "speculative",
+            "adaptive_spechive",
+            "hierarchical_verification",
+            "pivot",
+            "tetris",
+        ],
         help=(
             "Method used for speculative jobs in this generator. "
-            "Use adaptive_spechive for staged D/I/T runs, pivot for "
-            "intermediate-pivot plus draft-tail, or tetris for TETRIS "
+            "Use adaptive_spechive for staged D/I/T runs, "
+            "hierarchical_verification for standalone HierarchicalVerificationProposer, "
+            "pivot for intermediate-pivot plus draft-tail, or tetris for TETRIS "
             "optimal draft token selection (ACL 2025)."
         ),
     )
@@ -1338,7 +1377,11 @@ def main() -> None:
     ensure_dirs()
     debug_enabled = args.debug or args.spechive_debug
     spechive_variants: list[tuple[str | None, int, str]] = []
-    if args.spec_method not in ("adaptive_spechive", "pivot"):
+    if args.spec_method not in (
+        "adaptive_spechive",
+        "hierarchical_verification",
+        "pivot",
+    ):
         spechive_variants = [(None, args.round, "")]
     elif args.spec_method == "adaptive_spechive" and debug_enabled:
         # Debug preset: run two intermediate verifiers with 3 rounds.
@@ -1347,6 +1390,15 @@ def main() -> None:
             ("meta-llama/Meta-Llama-3.1-8B-Instruct", 3, "im_llama31_8b_r3"),
         ]
     elif args.spec_method == "adaptive_spechive":
+        if not args.adaptive_spechive_intermediate_model:
+            raise SystemExit(
+                f"--spec-method={args.spec_method} requires "
+                "--adaptive-spechive-intermediate-model"
+            )
+        spechive_variants = [
+            (args.adaptive_spechive_intermediate_model, args.round, "")
+        ]
+    elif args.spec_method == "hierarchical_verification":
         if not args.adaptive_spechive_intermediate_model:
             raise SystemExit(
                 f"--spec-method={args.spec_method} requires "
@@ -1377,6 +1429,19 @@ def main() -> None:
     if sum(1 for x in selected_modes if x) > 1:
         raise SystemExit(
             "Use only one of --batch, --length, --ablation, --test, --draft, or --verify."
+        )
+
+    if (args.batch_adaptive_spechive_draft or args.batch_adaptive_spechive_eagle3) and not (
+        args.batch or args.length
+    ):
+        raise SystemExit(
+            "--batch-adaptive-spechive-draft / --batch-adaptive-spechive-eagle3 "
+            "require --batch or --length."
+        )
+    if (args.batch_adaptive_spechive_draft or args.batch_adaptive_spechive_eagle3) and args.ablation:
+        raise SystemExit(
+            "--batch-adaptive-spechive-* is not supported with --ablation "
+            "(use --batch or --length)."
         )
 
     datasets = filter_by_attr(DATASETS, set(args.datasets), "name")
@@ -1672,8 +1737,13 @@ def main() -> None:
                 base_result_subdir = base_result_subdir / pivot_path_component
             if pivot_mode_tag:
                 base_result_subdir = base_result_subdir / pivot_mode_tag
-            if method == "adaptive_spechive":
-                variants = spechive_variants
+            if method in ("adaptive_spechive", "hierarchical_verification"):
+                if adaptive_spechive_intermediate_model is not None:
+                    variants = [
+                        (adaptive_spechive_intermediate_model, args.round, "")
+                    ]
+                else:
+                    variants = spechive_variants
             elif method == "pivot" and pivot_spechive:
                 im_model = (
                     adaptive_spechive_intermediate_model
@@ -1770,6 +1840,20 @@ def main() -> None:
                 "--adaptive-spechive-intermediate-model"
             )
 
+        ashive_need_pairs: list[PairConfig] = []
+        if args.batch_adaptive_spechive_draft:
+            ashive_need_pairs.extend(speculative_pairs)
+        if args.batch_adaptive_spechive_eagle3:
+            ashive_need_pairs.extend(eagle_pairs)
+        if ashive_need_pairs and not any(
+            resolve_pivot_intermediate(p.pair_id) is not None for p in ashive_need_pairs
+        ):
+            raise SystemExit(
+                "--batch-adaptive-spechive-draft / --batch-adaptive-spechive-eagle3 "
+                "require --adaptive-spechive-intermediate-model or per-pair "
+                "pivot_intermediate_key in batch pair config."
+            )
+
         for num_spec in num_spec_values:
             for bs in batch_sizes_list:
                 tl = time_limit_for_batch(bs)
@@ -1814,6 +1898,50 @@ def main() -> None:
                                 tetris_turn_on_batch_size=args.tetris_turn_on_batch_size,
                                 time_limit_override=tl,
                             )
+
+                        # Speculative (draft LM) + hierarchical SpecHive
+                        if (
+                            args.batch_adaptive_spechive_draft
+                            and args.spec_method
+                            not in ("adaptive_spechive", "hierarchical_verification")
+                        ):
+                            for pair in speculative_pairs:
+                                im = resolve_pivot_intermediate(pair.pair_id)
+                                if im is None:
+                                    continue
+                                _write_one(
+                                    pair=pair,
+                                    dataset=dataset,
+                                    bs=bs,
+                                    num_spec_tokens=num_spec,
+                                    method="adaptive_spechive",
+                                    eagle_model=None,
+                                    adaptive_spechive_intermediate_model=im,
+                                    time_limit_override=tl,
+                                )
+
+                        # EAGLE3 draft head + hierarchical SpecHive
+                        if args.batch_adaptive_spechive_eagle3:
+                            for pair in eagle_pairs:
+                                im = resolve_pivot_intermediate(pair.pair_id)
+                                if im is None:
+                                    continue
+                                eagle_model = (
+                                    eagle_llama33_speculator
+                                    if pair.target_model == llama33_70b
+                                    else eagle_qwen30b_a3b_speculator
+                                )
+                                pair_ash = replace(pair, draft_model=eagle_model)
+                                _write_one(
+                                    pair=pair_ash,
+                                    dataset=dataset,
+                                    bs=bs,
+                                    num_spec_tokens=num_spec,
+                                    method="adaptive_spechive",
+                                    eagle_model=None,
+                                    adaptive_spechive_intermediate_model=im,
+                                    time_limit_override=tl,
+                                )
 
                     for pivot_topk, pivot_exp in pivot_ablation_pairs:
                         pivot_pc = pivot_config_path_tag(pivot_topk, pivot_exp)
