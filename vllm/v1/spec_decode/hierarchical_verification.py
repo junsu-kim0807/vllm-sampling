@@ -195,7 +195,19 @@ class HierarchicalVerificationProposer:
         use_draft_probs: bool,
     ) -> DitRoundProposal:
         assert self.runner is not None
-        return self.runner._run_hv_draft_step(
+        run = self.runner
+        # Standalone HV + draft KV frontier: metadata-direct draft (no prefix packing).
+        if run._draft_kv_frontier_enabled():
+            return run._run_hv_draft_step_from_frontier(
+                self.draft,
+                base_next_token_ids=base_next_token_ids,
+                num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                prefix_rows=prefix_rows,
+                chunk_len=chunk_len,
+                sampling_metadata=sampling_metadata,
+                use_draft_probs=use_draft_probs,
+            )
+        return run._run_hv_draft_step(
             self.draft,
             base_common_attn_metadata,
             target_token_ids=base_target_token_ids,

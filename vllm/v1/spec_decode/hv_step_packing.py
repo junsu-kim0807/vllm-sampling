@@ -4,6 +4,7 @@
 
 Standalone HV **verify** uses intermediate frontier metadata + direct forward and
 does not call these helpers on the hot path. Standalone HV **draft** uses
+``HierarchicalVerificationProposer.propose_chunk_from_prefix`` →
 ``GPUModelRunner._run_hv_draft_step_from_frontier`` (draft frontier + metadata-direct
 ``_prepare_inputs``) when draft KV frontier mode is enabled, so it does not call
 ``build_prefix_conditioned_inputs`` on that hot path. Adaptive/pivot and other

@@ -4944,6 +4944,66 @@ class GPUModelRunner(
             ib.update_req_spec_token_ids(mir, {rid: toks})
         ib.refresh_metadata()
 
+    @contextmanager
+    def _hv_suspend_cached_prev_sampled_tokens(self):
+        """Temporarily clear async bookkeeping fields for frontier ``_prepare_*_metadata``.
+
+        When ``use_async_scheduling`` is on, ``_bookkeeping_sync`` may stash sampled
+        token ids in ``input_batch.prev_sampled_token_ids`` before delayed
+        ``propose_draft_token_ids``. Frontier metadata helpers intentionally return
+        ``None`` if those fields are set; suspend them only for the metadata build.
+        """
+        ib = self.input_batch
+        prev_tok = ib.prev_sampled_token_ids
+        prev_map = ib.prev_req_id_to_index
+        dirty = prev_tok is not None or prev_map is not None
+        if dirty:
+            ib.prev_sampled_token_ids = None
+            ib.prev_req_id_to_index = None
+        try:
+            yield
+        finally:
+            if dirty:
+                ib.prev_sampled_token_ids = prev_tok
+                ib.prev_req_id_to_index = prev_map
+
+    def _describe_frontier_prepare_blockers(
+        self,
+        *,
+        frontier: str,
+        scheduler_output: "SchedulerOutput",
+        mirror_batch: InputBatch,
+    ) -> str:
+        """Best-effort diagnostics when ``_prepare_intermediate_metadata`` / draft returns None."""
+        parts: list[str] = []
+        if self.input_batch.prev_sampled_token_ids is not None:
+            parts.append(
+                "input_batch.prev_sampled_token_ids is set "
+                "(async scheduling bookkeeping cache; should be suspended for prepare)"
+            )
+        if self.cache_config.mamba_cache_mode == "align":
+            parts.append("mamba_cache_mode=align")
+        if len(self.kv_cache_config.kv_cache_groups) == 0:
+            parts.append("kv_cache_groups_empty")
+        n_m = mirror_batch.num_reqs
+        n_tgt = self.input_batch.num_reqs
+        if n_m != n_tgt or n_m <= 0:
+            parts.append(
+                f"{frontier}_vs_target_num_reqs(mirror={n_m}, target={n_tgt})"
+            )
+        elif tuple(mirror_batch.req_ids[:n_m]) != tuple(
+            self.input_batch.req_ids[:n_m]
+        ):
+            parts.append(
+                f"{frontier}_vs_target_req_id_mismatch(mirror="
+                f"{tuple(mirror_batch.req_ids[:n_m])}, "
+                f"target={tuple(self.input_batch.req_ids[:n_m])})"
+            )
+        tot = int(scheduler_output.total_num_scheduled_tokens)
+        if tot <= 0:
+            parts.append(f"total_num_scheduled_tokens={tot}")
+        return "; ".join(parts) if parts else "(no known gate hit; see spec_decode_metadata)"
+
     def _run_hv_draft_step_from_frontier(
         self,
         draft: PinnedDraftNamespaceDraftModelProposer,
@@ -4980,12 +5040,19 @@ class GPUModelRunner(
             for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]
         ]
         nst = np.array(nsched, dtype=np.int32)
-        prep = self._prepare_draft_metadata(so, nst)
+        ib_draft = self.draft_input_batch
+        assert ib_draft is not None
+        with self._hv_suspend_cached_prev_sampled_tokens():
+            prep = self._prepare_draft_metadata(so, nst)
         if prep is None:
+            detail = self._describe_frontier_prepare_blockers(
+                frontier="draft",
+                scheduler_output=so,
+                mirror_batch=ib_draft,
+            )
             raise RuntimeError(
                 "hierarchical_verification: draft frontier metadata preparation "
-                "returned None (batch mismatch, async prev-sample, mamba_cache_mode "
-                "align, or unsupported layout)."
+                f"returned None ({detail})."
             )
         gid = int(getattr(draft, "kv_cache_gid", -1))
         cad_map = prep.spec_decode_common_attn_metadata_by_gid or {}
@@ -5069,24 +5136,15 @@ class GPUModelRunner(
         sampling_metadata: SamplingMetadata,
         use_draft_probs: bool,
     ) -> DitRoundProposal:
-        """One draft HV chunk proposal using runner-built speculative CAD.
+        """Legacy draft HV chunk: prefix packing via ``hv_step_packing``.
 
-        Standalone HV with draft frontier uses metadata-direct
-        ``_run_hv_draft_step_from_frontier`` (no ``hv_step_packing``). Adaptive/pivot
-        paths still use ``hv_step_packing.build_prefix_conditioned_inputs`` (runner-local
-        seam), not ``adaptive_cascade._build_prefix_conditioned_inputs``. Standalone HV
-        **verify** does not use ``hv_step_packing`` on the hot path.
+        Standalone HV with draft KV frontier should call
+        ``HierarchicalVerificationProposer.propose_chunk_from_prefix`` →
+        ``_run_hv_draft_step_from_frontier`` (no ``hv_step_packing``). This entry
+        remains for adaptive/pivot-style paths that still use
+        ``hv_build_prefix_conditioned_inputs`` (runner-local seam), not
+        ``adaptive_cascade._build_prefix_conditioned_inputs``.
         """
-        if self._draft_kv_frontier_enabled():
-            return self._run_hv_draft_step_from_frontier(
-                draft,
-                base_next_token_ids=next_token_ids,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                prefix_rows=prefix_rows,
-                chunk_len=chunk_len,
-                sampling_metadata=sampling_metadata,
-                use_draft_probs=use_draft_probs,
-            )
         cad = clone_common_attn_metadata(draft_cad)
         (
             cad,
@@ -5170,12 +5228,21 @@ class GPUModelRunner(
             for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]
         ]
         nst = np.array(nsched, dtype=np.int32)
-        prep = self._prepare_intermediate_metadata(so, nst)
+        ib_inter = self.intermediate_input_batch
+        assert ib_inter is not None
+        with self._hv_suspend_cached_prev_sampled_tokens():
+            prep = self._prepare_intermediate_metadata(so, nst)
         if prep is None or prep.spec_decode_metadata is None:
+            detail = self._describe_frontier_prepare_blockers(
+                frontier="intermediate",
+                scheduler_output=so,
+                mirror_batch=ib_inter,
+            )
+            if prep is not None and prep.spec_decode_metadata is None:
+                detail = f"spec_decode_metadata_is_none; {detail}"
             raise RuntimeError(
                 "hierarchical_verification: intermediate frontier metadata preparation "
-                "returned None (batch mismatch, async prev-sample, mamba_cache_mode "
-                "align, or unsupported layout)."
+                f"returned None or missing spec_decode_metadata ({detail})."
             )
         gid = int(getattr(inter, "kv_cache_gid", -1))
         cad_map = prep.spec_decode_common_attn_metadata_by_gid or {}
