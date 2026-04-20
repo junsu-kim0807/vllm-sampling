@@ -13,8 +13,9 @@ Modes:
   --eager  : add --enforce-eager to generated metrics command (combine with any mode)
   default  : generate regular jobs from PAIRS
   --test   : smoke test jobs
-  --batch  : vary batch size
-  --length : fixed batch 256, sweep num_spec_tokens (5,7,9,11) like --batch
+  --batch  : vary batch size (optional add-ons: --batch-adaptive-spechive-draft,
+             --batch-adaptive-spechive-eagle3, --batch-hierarchical-verification)
+  --length : fixed batch 256, sweep num_spec_tokens; same add-ons as --batch
   --ablation: pivot only; sweep topk x expansion_pct and num_spec_tokens 3,7,11
   --draft  : vary num_spec_tokens while varying draft model, fixed target
   --verify : vary num_spec_tokens while varying target model along an ordered model chain
@@ -1110,7 +1111,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Generate speculative decoding jobs for batch sizes "
-            "(1,4,16,64,256,512) with fixed time limits."
+            "(1,4,16,64,256) with fixed time limits. "
+            "Use --spec-method hierarchical_verification for standalone HV, or "
+            "--batch-hierarchical-verification to emit HV jobs alongside another "
+            "--spec-method."
         ),
     )
     parser.add_argument(
@@ -1118,7 +1122,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Like --batch but batch size fixed at 256 and num_spec_tokens "
-            "swept over 5, 7, 9, 11 for each method."
+            "swept over 7 and 11. Same HV options as --batch "
+            "(--spec-method hierarchical_verification or "
+            "--batch-hierarchical-verification)."
         ),
     )
     parser.add_argument(
@@ -1233,6 +1239,17 @@ def parse_args() -> argparse.Namespace:
             "With --batch or --length: also emit method=adaptive_spechive "
             "jobs for each EAGLE3 pair, using the EAGLE3 speculator repo as "
             "draft (EAGLE3 + SpecHive)."
+        ),
+    )
+    parser.add_argument(
+        "--batch-hierarchical-verification",
+        action="store_true",
+        help=(
+            "With --batch or --length: also emit method=hierarchical_verification "
+            "(standalone HierarchicalVerificationProposer) jobs per speculative pair "
+            "when --spec-method is not already hierarchical_verification. "
+            "Requires --adaptive-spechive-intermediate-model or per-pair "
+            "pivot_intermediate_key (same resolution as pivot HV add-ons)."
         ),
     )
     parser.add_argument(
@@ -1431,17 +1448,23 @@ def main() -> None:
             "Use only one of --batch, --length, --ablation, --test, --draft, or --verify."
         )
 
-    if (args.batch_adaptive_spechive_draft or args.batch_adaptive_spechive_eagle3) and not (
-        args.batch or args.length
-    ):
+    if (
+        args.batch_adaptive_spechive_draft
+        or args.batch_adaptive_spechive_eagle3
+        or args.batch_hierarchical_verification
+    ) and not (args.batch or args.length):
         raise SystemExit(
-            "--batch-adaptive-spechive-draft / --batch-adaptive-spechive-eagle3 "
-            "require --batch or --length."
+            "--batch-adaptive-spechive-draft / --batch-adaptive-spechive-eagle3 / "
+            "--batch-hierarchical-verification require --batch or --length."
         )
-    if (args.batch_adaptive_spechive_draft or args.batch_adaptive_spechive_eagle3) and args.ablation:
+    if (
+        args.batch_adaptive_spechive_draft
+        or args.batch_adaptive_spechive_eagle3
+        or args.batch_hierarchical_verification
+    ) and args.ablation:
         raise SystemExit(
-            "--batch-adaptive-spechive-* is not supported with --ablation "
-            "(use --batch or --length)."
+            "--batch-adaptive-spechive-* and --batch-hierarchical-verification "
+            "are not supported with --ablation (use --batch or --length)."
         )
 
     datasets = filter_by_attr(DATASETS, set(args.datasets), "name")
@@ -1845,12 +1868,15 @@ def main() -> None:
             ashive_need_pairs.extend(speculative_pairs)
         if args.batch_adaptive_spechive_eagle3:
             ashive_need_pairs.extend(eagle_pairs)
+        if args.batch_hierarchical_verification:
+            ashive_need_pairs.extend(speculative_pairs)
         if ashive_need_pairs and not any(
             resolve_pivot_intermediate(p.pair_id) is not None for p in ashive_need_pairs
         ):
             raise SystemExit(
-                "--batch-adaptive-spechive-draft / --batch-adaptive-spechive-eagle3 "
-                "require --adaptive-spechive-intermediate-model or per-pair "
+                "--batch-adaptive-spechive-draft / --batch-adaptive-spechive-eagle3 / "
+                "--batch-hierarchical-verification require "
+                "--adaptive-spechive-intermediate-model or per-pair "
                 "pivot_intermediate_key in batch pair config."
             )
 
@@ -1915,6 +1941,26 @@ def main() -> None:
                                     bs=bs,
                                     num_spec_tokens=num_spec,
                                     method="adaptive_spechive",
+                                    eagle_model=None,
+                                    adaptive_spechive_intermediate_model=im,
+                                    time_limit_override=tl,
+                                )
+
+                        # Standalone hierarchical_verification (add-on)
+                        if (
+                            args.batch_hierarchical_verification
+                            and args.spec_method != "hierarchical_verification"
+                        ):
+                            for pair in speculative_pairs:
+                                im = resolve_pivot_intermediate(pair.pair_id)
+                                if im is None:
+                                    continue
+                                _write_one(
+                                    pair=pair,
+                                    dataset=dataset,
+                                    bs=bs,
+                                    num_spec_tokens=num_spec,
+                                    method="hierarchical_verification",
                                     eagle_model=None,
                                     adaptive_spechive_intermediate_model=im,
                                     time_limit_override=tl,
