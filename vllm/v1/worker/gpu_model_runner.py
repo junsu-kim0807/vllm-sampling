@@ -5589,7 +5589,7 @@ class GPUModelRunner(
             staged_verification_depth=int(n_inner),
         )
         out = _collapse_draft_tensor_rows_for_scheduler(
-            out_exp, pivot_expansion_plan=None, batch_size=batch_size
+            out_exp, None, batch_size
         )
         return out, bundle
 
