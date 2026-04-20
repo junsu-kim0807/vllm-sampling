@@ -15,6 +15,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sampl
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
 from vllm.v1.sample.sampler import Sampler, _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.spec_stage_runtime import (
     EagleTreeTemplate,
     FamilyTreeReduceResult,
@@ -24,6 +25,7 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     PivotExpansionFamily,
     PivotExpansionPlan,
     PivotTreeFamily,
+    StagedHiddenStateBundle,
     _split_flat_tokens_by_lengths,
     _split_probs_by_lengths,
 )
@@ -537,11 +539,120 @@ def validate_root_only_pivot_expansion(
     )
 
 
+def build_pivot_expansion_gather_indices(
+    plan: PivotExpansionPlan,
+    base_query_start_loc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build flat gather indices mapping expanded batch P to origin layout (shared with pivot)."""
+    p_len = int(plan.expanded_batch_size)
+    sm = plan.packed_sm_origin
+    if sm is None:
+        sm = plan.expanded_to_origin
+    assert len(sm) == p_len
+
+    device = base_query_start_loc.device
+    row_gather_idx = torch.tensor(sm, dtype=torch.long, device=device)
+
+    origin_query_lens = base_query_start_loc[1:] - base_query_start_loc[:-1]
+    expanded_query_lens = origin_query_lens[row_gather_idx]
+
+    new_qsl = torch.zeros(
+        p_len + 1, dtype=base_query_start_loc.dtype, device=device
+    )
+    torch.cumsum(expanded_query_lens, dim=0, out=new_qsl[1:])
+    total_tokens = int(new_qsl[p_len].item())
+
+    origin_starts = base_query_start_loc[row_gather_idx]
+
+    token_row_id = torch.repeat_interleave(
+        torch.arange(p_len, device=device),
+        expanded_query_lens,
+    )
+    flat_token_gather_idx = (
+        torch.arange(total_tokens, device=device)
+        - new_qsl[token_row_id]
+        + origin_starts[token_row_id]
+    )
+
+    return flat_token_gather_idx, row_gather_idx, new_qsl
+
+
+def expand_staged_hidden_bundle_for_pivot_plan(
+    bundle: StagedHiddenStateBundle,
+    plan: PivotExpansionPlan,
+) -> StagedHiddenStateBundle:
+    """Duplicate intermediate prefix tensors per packed pivot rows (P from B)."""
+    if bundle.prefix_prefab is None:
+        return bundle
+    pref_toks, pref_pos, pref_hid, pref_next, pref_cad = bundle.prefix_prefab
+    flat_idx, row_idx, new_qsl = build_pivot_expansion_gather_indices(
+        plan, pref_cad.query_start_loc
+    )
+    p_len = int(plan.expanded_batch_size)
+    out_tokens = pref_toks.index_select(0, flat_idx)
+    out_hidden = pref_hid.index_select(0, flat_idx)
+    out_slot = pref_cad.slot_mapping.index_select(0, flat_idx)
+    positions_2d = pref_pos.dim() > 1
+    if positions_2d:
+        out_positions = pref_pos.index_select(1, flat_idx)
+    else:
+        out_positions = pref_pos.index_select(0, flat_idx)
+    out_next = pref_next.index_select(0, row_idx).to(torch.int32)
+    out_seq_lens = pref_cad.seq_lens.index_select(0, row_idx)
+    out_block = pref_cad.block_table_tensor.index_select(0, row_idx)
+    query_lens = new_qsl[1:] - new_qsl[:-1]
+    max_q = int(query_lens.max().item()) if p_len > 0 else 0
+    out_qsl_cpu = None
+    out_seq_lens_cpu = None
+    if pref_cad.query_start_loc_cpu is not None and pref_cad._seq_lens_cpu is not None:
+        sm = plan.packed_sm_origin if plan.packed_sm_origin is not None else plan.expanded_to_origin
+        row_idx_cpu = torch.tensor(sm, dtype=torch.long)
+        origin_qsl_cpu = pref_cad.query_start_loc_cpu
+        origin_query_lens_cpu = origin_qsl_cpu[1:] - origin_qsl_cpu[:-1]
+        expanded_query_lens_cpu = origin_query_lens_cpu.index_select(0, row_idx_cpu)
+        out_qsl_cpu = torch.empty(p_len + 1, dtype=origin_qsl_cpu.dtype)
+        out_qsl_cpu[0] = 0
+        if p_len > 0:
+            torch.cumsum(expanded_query_lens_cpu, dim=0, out=out_qsl_cpu[1:])
+        out_seq_lens_cpu = pref_cad._seq_lens_cpu.index_select(0, row_idx_cpu)
+
+    out_cad = pref_cad.replace(
+        query_start_loc=new_qsl,
+        query_start_loc_cpu=out_qsl_cpu,
+        seq_lens=out_seq_lens,
+        block_table_tensor=out_block,
+        slot_mapping=out_slot,
+        num_reqs=p_len,
+        num_actual_tokens=int(new_qsl[p_len].item()),
+        max_query_len=max_q,
+        max_seq_len=int(out_seq_lens.max().item()) if p_len > 0 else 0,
+        _seq_lens_cpu=out_seq_lens_cpu,
+        _num_computed_tokens_cpu=None,
+        _num_computed_tokens_cache=None,
+    )
+    new_prefab: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, CommonAttentionMetadata
+    ] = (out_tokens, out_positions, out_hidden, out_next, out_cad)
+    return StagedHiddenStateBundle(
+        hidden_states=out_hidden,
+        aux_hidden_states=bundle.aux_hidden_states,
+        batch_size=p_len,
+        owns_provisional_frontier=bundle.owns_provisional_frontier,
+        prefix_prefab=new_prefab,
+    )
+
+
 def expand_intermediate_state_for_pivot_plan(
     state: IntermediateRoundState,
     plan: PivotExpansionPlan,
 ) -> IntermediateRoundState:
-    """Expand provisional frontier metadata according to pivot expansion plan."""
+    """Expand provisional frontier metadata and optional staged hidden bundle."""
+    if state.hidden_bundle is not None and int(state.hidden_bundle.batch_size) != int(
+        plan.expanded_batch_size
+    ):
+        state.hidden_bundle = expand_staged_hidden_bundle_for_pivot_plan(
+            state.hidden_bundle, plan
+        )
     if state.frontier_metadata is None:
         return state
     if len(state.frontier_metadata) == plan.expanded_batch_size:
@@ -588,6 +699,7 @@ def validate_hierarchical_verification_tail_len(
     interval_tokens: int,
     remaining_cap: int,
 ) -> DitDebugCheckResult:
+    """Scalar remaining_cap (max across rows). Prefer rowwise helper for staged HV."""
     expected = min(interval_tokens, max(0, remaining_cap))
     return DitDebugCheckResult(
         code="check4_pre_target_tail_draft",
@@ -595,6 +707,26 @@ def validate_hierarchical_verification_tail_len(
         detail=(
             f"tail_len={tail_len}, expected={expected}, "
             f"interval_tokens={interval_tokens}, remaining_cap={remaining_cap}"
+        ),
+    )
+
+
+def validate_hierarchical_verification_tail_len_rowwise(
+    *,
+    tail_len: int,
+    interval_tokens: int,
+    remaining_cap_per_row: list[int],
+) -> DitDebugCheckResult:
+    """Tail draft width vs per-row remaining slots (matches gpu_model_runner tail trim)."""
+    remaining_max = max(remaining_cap_per_row, default=0)
+    expected = min(interval_tokens, remaining_max)
+    return DitDebugCheckResult(
+        code="check4_pre_target_tail_draft_rowwise",
+        ok=(tail_len == expected),
+        detail=(
+            f"tail_len={tail_len}, expected={expected}, "
+            f"interval_tokens={interval_tokens}, "
+            f"remaining_cap_per_row={remaining_cap_per_row}, remaining_max={remaining_max}"
         ),
     )
 

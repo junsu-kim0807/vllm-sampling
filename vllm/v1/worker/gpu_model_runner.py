@@ -180,6 +180,8 @@ from vllm.v1.spec_decode.spec_stage_ops import (
     collapse_family_paths_to_origin,
     collapse_family_tree_sampled_to_family_paths,
     collapse_pivot_expanded_sampled_to_origin,
+    expand_intermediate_state_for_pivot_plan,
+    validate_hierarchical_verification_tail_len_rowwise,
     get_accepted_draft_lens_from_sampled_tokens,
     get_target_verification_accepted_draft_prefix_lens,
     get_unselected_cleanup_rows,
@@ -190,6 +192,7 @@ from vllm.v1.spec_decode.spec_stage_ops import (
 )
 from vllm.v1.spec_decode.spec_stage_runtime import (
     HybridProposalBundle,
+    IntermediateRoundState,
     PivotExpandedTreePlan,
     PivotExpansionPlan,
     RootTopKInfo,
@@ -800,6 +803,14 @@ class GPUModelRunner(
                     device=self.device,
                     runner=self,
                 )
+                if self.speculative_config.requires_aux_hidden_state_outputs():
+                    self.use_aux_hidden_state_outputs = bool(
+                        getattr(
+                            self.drafter._delegate,
+                            "eagle3_use_aux_hidden_state",
+                            False,
+                        )
+                    )
             elif self.speculative_config.method == "pivot":
                 self.drafter = PivotProposer(
                     vllm_config=self.vllm_config,
@@ -3725,7 +3736,7 @@ class GPUModelRunner(
     def run_hierarchical_verification_rounds(
         self,
         *,
-        drafter: AdaptiveSpechiveProposer,
+        drafter: AdaptiveSpechiveProposer | PivotProposer,
         target_token_ids: torch.Tensor,
         target_positions: torch.Tensor,
         target_hidden_states: torch.Tensor,
@@ -3777,17 +3788,30 @@ class GPUModelRunner(
         prefix_rows: list[list[int]] = [[] for _ in range(batch_size)]
         prefix_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
         source_stage_rows: list[list[int]] = [[] for _ in range(batch_size)]
-        expected_prefix_rows: list[list[int]] = [[] for _ in range(batch_size)]
         inter_verified_rows: list[int] = [0 for _ in range(batch_size)]
         inter_accepted_rows: list[int] = [0 for _ in range(batch_size)]
         pivot_expansion_plan: PivotExpansionPlan | None = None
+        inter_state: IntermediateRoundState | None = None
 
         for round_idx in range(n_inner):
-            self._dit_debug_assert(
-                prefix_rows == expected_prefix_rows,
-                "check3_next_draft_starts_from_intermediate_prefix",
-                detail=f"round={round_idx}",
-            )
+            if self._is_dit_debug_enabled():
+                self._dit_debug_assert(
+                    all(
+                        len(prefix_rows[b]) == len(source_stage_rows[b])
+                        for b in range(len(prefix_rows))
+                    ),
+                    "check_hv_prefix_source_stage_alignment",
+                    detail=f"round={round_idx}",
+                )
+                if use_draft_probs:
+                    self._dit_debug_assert(
+                        all(
+                            len(prefix_prob_rows[b]) == len(prefix_rows[b])
+                            for b in range(len(prefix_rows))
+                        ),
+                        "check_hv_prefix_prob_alignment",
+                        detail=f"round={round_idx}",
+                    )
             sm_idxs = (
                 _pivot_plan_sm_indices(pivot_expansion_plan)
                 if pivot_expansion_plan is not None
@@ -3823,18 +3847,46 @@ class GPUModelRunner(
                                            invocation_idx=round_idx)
             _hv_prof.start_stage("draft_forward",
                                  invocation_idx=round_idx)
-            proposal = drafter.propose_chunk_from_prefix(
-                base_target_token_ids=target_token_ids,
-                base_target_positions=target_positions,
-                base_target_hidden_states=target_hidden_states,
-                base_next_token_ids=next_token_ids,
-                base_common_attn_metadata=common_attn_metadata,
-                base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                prefix_rows=prefix_rows,
-                chunk_len=L,
-                sampling_metadata=round_sm,
-                use_draft_probs=use_draft_probs,
-            )
+            staged_fast = getattr(
+                drafter, "supports_staged_eagle_fastpath", lambda: False
+            )()
+            if staged_fast:
+                if inter_state is None:
+                    inter_state = drafter.bootstrap_intermediate_round_state(
+                        base_target_token_ids=target_token_ids,
+                        base_target_positions=target_positions,
+                        base_target_hidden_states=target_hidden_states,
+                        base_next_token_ids=next_token_ids,
+                        base_common_attn_metadata=common_attn_metadata,
+                        base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                        prefix_rows=prefix_rows,
+                    )
+                proposal = drafter.propose_chunk_from_intermediate_state(
+                    inter_state=inter_state,
+                    base_target_token_ids=target_token_ids,
+                    base_target_positions=target_positions,
+                    base_target_hidden_states=target_hidden_states,
+                    base_next_token_ids=next_token_ids,
+                    base_common_attn_metadata=common_attn_metadata,
+                    base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    prefix_rows=prefix_rows,
+                    chunk_len=L,
+                    sampling_metadata=round_sm,
+                    use_draft_probs=use_draft_probs,
+                )
+            else:
+                proposal = drafter.propose_chunk_from_prefix(
+                    base_target_token_ids=target_token_ids,
+                    base_target_positions=target_positions,
+                    base_target_hidden_states=target_hidden_states,
+                    base_next_token_ids=next_token_ids,
+                    base_common_attn_metadata=common_attn_metadata,
+                    base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    prefix_rows=prefix_rows,
+                    chunk_len=L,
+                    sampling_metadata=round_sm,
+                    use_draft_probs=use_draft_probs,
+                )
             _hv_prof.end_stage("draft_forward",
                                invocation_idx=round_idx)
             _hv_prof.snapshot_memory_after("draft_forward",
@@ -3885,9 +3937,6 @@ class GPUModelRunner(
                     inter_accepted_rows[o]
                     for o in _pivot_plan_sm_indices(pivot_expansion_plan)
                 ]
-                expected_prefix_rows = _expand_list_rows_by_pivot_plan(
-                    expected_prefix_rows, pivot_expansion_plan
-                )
                 _hv_prof.end_stage("expand_prefix_rows",
                                    invocation_idx=round_idx)
                 (
@@ -3961,21 +4010,38 @@ class GPUModelRunner(
                     f"proposal_shape={tuple(proposal.tokens.shape)}"
                 ),
             )
+            if inter_state is not None and pivot_expansion_plan is not None:
+                inter_state = expand_intermediate_state_for_pivot_plan(
+                    inter_state, pivot_expansion_plan
+                )
             # -- Profiler: intermediate_verify (inter-verifier forward) --
             _hv_prof.snapshot_memory_before("intermediate_verify",
                                            invocation_idx=round_idx)
             _hv_prof.start_stage("intermediate_verify",
                                  invocation_idx=round_idx)
-            verification = drafter.verify_chunk_with_inter_verifier(
-                base_target_token_ids=target_token_ids,
-                base_target_positions=target_positions,
-                base_target_hidden_states=target_hidden_states,
-                base_next_token_ids=next_token_ids,
-                base_common_attn_metadata=common_attn_metadata,
-                base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                prefix_rows=prefix_rows,
-                candidate_tokens=proposal.tokens,
-            )
+            if staged_fast and inter_state is not None:
+                verification = drafter.verify_chunk_with_intermediate_state(
+                    inter_state=inter_state,
+                    base_target_token_ids=target_token_ids,
+                    base_target_positions=target_positions,
+                    base_target_hidden_states=target_hidden_states,
+                    base_next_token_ids=next_token_ids,
+                    base_common_attn_metadata=common_attn_metadata,
+                    base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    prefix_rows=prefix_rows,
+                    candidate_tokens=proposal.tokens,
+                )
+            else:
+                verification = drafter.verify_chunk_with_inter_verifier(
+                    base_target_token_ids=target_token_ids,
+                    base_target_positions=target_positions,
+                    base_target_hidden_states=target_hidden_states,
+                    base_next_token_ids=next_token_ids,
+                    base_common_attn_metadata=common_attn_metadata,
+                    base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    prefix_rows=prefix_rows,
+                    candidate_tokens=proposal.tokens,
+                )
             _hv_prof.end_stage("intermediate_verify",
                                invocation_idx=round_idx)
             _hv_prof.snapshot_memory_after("intermediate_verify",
@@ -4030,7 +4096,6 @@ class GPUModelRunner(
             before_lens = [len(r) for r in prefix_rows]
             for b, emitted in enumerate(decision.emitted_rows):
                 prefix_rows[b].extend(emitted)
-                expected_prefix_rows[b].extend(emitted)
                 source_stage_rows[b].extend([0] * len(emitted))
                 if use_draft_probs:
                     prefix_prob_rows[b].extend(decision.emitted_prob_rows[b])
@@ -4061,6 +4126,18 @@ class GPUModelRunner(
                     detail=f"round={round_idx}, prefix_prob_lens={[len(r) for r in prefix_prob_rows]}",
                 )
 
+            if staged_fast:
+                inter_state = drafter.refresh_intermediate_round_state(
+                    base_target_token_ids=target_token_ids,
+                    base_target_positions=target_positions,
+                    base_target_hidden_states=target_hidden_states,
+                    base_next_token_ids=next_token_ids,
+                    base_common_attn_metadata=common_attn_metadata,
+                    base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    prefix_rows=prefix_rows,
+                    old_state=inter_state,
+                )
+
         expected_rounds = (
             self.speculative_config.pivot_spechive_num_rounds
             if (
@@ -4075,11 +4152,25 @@ class GPUModelRunner(
             detail=f"executed_rounds={n_inner}, expected_rounds={expected_rounds}",
         )
 
-        remaining_cap = max(
-            (max(0, cap - len(prefix_rows[b])) for b in range(len(prefix_rows))),
-            default=0,
-        )
+        remaining_cap_per_row = [
+            max(0, cap - len(prefix_rows[b])) for b in range(len(prefix_rows))
+        ]
+        remaining_cap = max(remaining_cap_per_row, default=0)
         tail_len = min(L, remaining_cap)
+        if self._is_dit_debug_enabled():
+            _tail_chk = validate_hierarchical_verification_tail_len_rowwise(
+                tail_len=tail_len,
+                interval_tokens=L,
+                remaining_cap_per_row=remaining_cap_per_row,
+            )
+            self._dit_debug_assert(
+                _tail_chk.ok,
+                _tail_chk.code,
+                detail=_tail_chk.detail,
+            )
+        staged_fast_outer = getattr(
+            drafter, "supports_staged_eagle_fastpath", lambda: False
+        )()
         if tail_len > 0:
             tail_sm_idxs = (
                 _pivot_plan_sm_indices(pivot_expansion_plan)
@@ -4103,6 +4194,9 @@ class GPUModelRunner(
                 chunk_len=tail_len,
                 sampling_metadata=tail_sm,
                 use_draft_probs=use_draft_probs,
+                reuse_intermediate_state=(
+                    inter_state if staged_fast_outer else None
+                ),
             )
             if tail.expansion_plan is not None and pivot_expansion_plan is None:
                 pivot_expansion_plan = tail.expansion_plan
@@ -4135,10 +4229,15 @@ class GPUModelRunner(
                 for b in range(tail_eff):
                     tail_prob_rows[b] = [tail.probs[b, j] for j in range(tail_len)]
             for b, emitted in enumerate(tail_rows):
-                prefix_rows[b].extend(emitted)
-                source_stage_rows[b].extend([1] * len(emitted))
+                slots_left = max(0, cap - len(prefix_rows[b]))
+                if slots_left <= 0:
+                    continue
+                take = min(len(emitted), slots_left, tail_len)
+                emitted_trim = emitted[:take]
+                prefix_rows[b].extend(emitted_trim)
+                source_stage_rows[b].extend([1] * len(emitted_trim))
                 if use_draft_probs:
-                    prefix_prob_rows[b].extend(tail_prob_rows[b])
+                    prefix_prob_rows[b].extend(tail_prob_rows[b][:take])
             self._dit_debug_assert(
                 all(
                     len(source_stage_rows[b]) == len(prefix_rows[b]) for b in range(tail_eff)
@@ -4265,7 +4364,7 @@ class GPUModelRunner(
     def run_hierarchical_tree_verification_rounds(
         self,
         *,
-        drafter: AdaptiveSpechiveProposer,
+        drafter: AdaptiveSpechiveProposer | PivotProposer,
         target_token_ids: torch.Tensor,
         target_positions: torch.Tensor,
         target_hidden_states: torch.Tensor,

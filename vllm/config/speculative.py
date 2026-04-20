@@ -257,6 +257,11 @@ class SpeculativeConfig:
     """Must be True when adaptive_spechive_mode is ``inter_verification``."""
     adaptive_spechive_enable_hierarchical_verification: bool = True
     """Must be True when adaptive_spechive_mode is ``hierarchical_verification``."""
+    adaptive_spechive_hidden_state_source: PivotHiddenStateSource | None = None
+    """When the draft is Eagle3 and staged hierarchical spechive is active: source
+    of hidden states for the eagle head (``intermediate`` verifier forward vs
+    ``target``). If unset, defaults to ``intermediate`` (same idea as
+    ``pivot_hidden_state_source`` for pivot)."""
     pivot_topk_selection: int = Field(default=5)
     """Pivot first-token expansion width; supported values are 2 or 5."""
     pivot_expansion_pct: float = Field(default=0.2, gt=0.0, le=1.0)
@@ -317,6 +322,8 @@ class SpeculativeConfig:
             factors.append(self.adaptive_spechive_mode)
             factors.append(self.adaptive_spechive_enable_inter_verification)
             factors.append(self.adaptive_spechive_enable_hierarchical_verification)
+            factors.append(self.adaptive_spechive_hidden_state_source)
+            factors.append(self.adaptive_spechive_draft_uses_eagle3_head())
         elif self.method == "pivot":
             mode = self.get_pivot_runtime_mode()
             factors.append(self.intermediate_model)
@@ -1451,11 +1458,21 @@ class SpeculativeConfig:
             or self.uses_extract_hidden_states()
         )
 
+    def adaptive_spechive_draft_uses_eagle3_head(self) -> bool:
+        """True when adaptive_spechive uses an Eagle3 head as draft (staged spechive fast path)."""
+        if self.method != "adaptive_spechive" or self.draft_model_config is None:
+            return False
+        if getattr(self.draft_model_config.hf_config, "method", None) == "eagle3":
+            return True
+        return "eagle3" in str(self.draft_model_config.model).lower()
+
     def requires_aux_hidden_state_outputs(self) -> bool:
         if self.method in ("eagle3", "extract_hidden_states"):
             return True
         if self.method == "pivot":
             return self.get_pivot_runtime_mode().proposal_engine == "eagle3_head"
+        if self.method == "adaptive_spechive":
+            return self.adaptive_spechive_draft_uses_eagle3_head()
         return False
 
     def __repr__(self) -> str:

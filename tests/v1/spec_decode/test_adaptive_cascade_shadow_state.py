@@ -5,6 +5,7 @@
 from vllm.v1.spec_decode.spec_stage_ops import (
     validate_hierarchical_verification_source_stage_row,
     validate_hierarchical_verification_tail_len,
+    validate_hierarchical_verification_tail_len_rowwise,
 )
 
 
@@ -23,6 +24,16 @@ def test_validate_dit_tail_len_failure_code() -> None:
     assert result.code == "check4_pre_target_tail_draft"
     assert result.ok is False
     assert "expected=1" in result.detail
+
+
+def test_validate_dit_tail_len_rowwise_matches_scalar_max() -> None:
+    result = validate_hierarchical_verification_tail_len_rowwise(
+        tail_len=2,
+        interval_tokens=2,
+        remaining_cap_per_row=[1, 2, 0],
+    )
+    assert result.code == "check4_pre_target_tail_draft_rowwise"
+    assert result.ok is True
 
 
 def test_validate_dit_source_stage_row_success() -> None:

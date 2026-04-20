@@ -32,6 +32,7 @@ from vllm.v1.spec_decode.adaptive_cascade import (
     _propose_chunk_from_prefix,
     _spechive_debug_enabled,
     _verify_chunk_with_prefix,
+    verify_intermediate_chunk_with_prefix_prefab,
 )
 from vllm.v1.spec_decode.draft_model import (
     DraftModelProposer,
@@ -51,6 +52,7 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     DitRoundVerification,
     FamilyTreeBundle,
     HybridProposalBundle,
+    IntermediateRoundState,
     PivotExpandedTreePlan,
     PivotExpansionFamily,
     PivotExpansionPlan,
@@ -663,6 +665,119 @@ class PivotProposer:
         self._is_waiting_for_target_collapse = False
         self._pending_pivot_bundle_metadata = None
 
+    def supports_staged_eagle_fastpath(self) -> bool:
+        if not self._pivot_spechive:
+            return False
+        if self._pivot_mode.proposal_engine != "eagle3_head":
+            return False
+        sd = self._staged_delegates
+        return sd is not None and sd.hidden_state_provider is not None
+
+    def bootstrap_intermediate_round_state(
+        self,
+        *,
+        base_target_token_ids: torch.Tensor,
+        base_target_positions: torch.Tensor,
+        base_target_hidden_states: torch.Tensor,
+        base_next_token_ids: torch.Tensor,
+        base_common_attn_metadata: CommonAttentionMetadata,
+        base_num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+    ) -> IntermediateRoundState:
+        provider = self._staged_delegates.hidden_state_provider
+        assert provider is not None
+        return provider.bootstrap_from_current_prefix(
+            base_target_token_ids=base_target_token_ids,
+            base_target_positions=base_target_positions,
+            base_target_hidden_states=base_target_hidden_states,
+            base_next_token_ids=base_next_token_ids,
+            base_common_attn_metadata=base_common_attn_metadata,
+            base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+            prefix_rows=prefix_rows,
+        )
+
+    def refresh_intermediate_round_state(
+        self,
+        *,
+        base_target_token_ids: torch.Tensor,
+        base_target_positions: torch.Tensor,
+        base_target_hidden_states: torch.Tensor,
+        base_next_token_ids: torch.Tensor,
+        base_common_attn_metadata: CommonAttentionMetadata,
+        base_num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+        old_state: IntermediateRoundState | None,
+    ) -> IntermediateRoundState:
+        del old_state
+        return self.bootstrap_intermediate_round_state(
+            base_target_token_ids=base_target_token_ids,
+            base_target_positions=base_target_positions,
+            base_target_hidden_states=base_target_hidden_states,
+            base_next_token_ids=base_next_token_ids,
+            base_common_attn_metadata=base_common_attn_metadata,
+            base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+            prefix_rows=prefix_rows,
+        )
+
+    def propose_chunk_from_intermediate_state(
+        self,
+        *,
+        inter_state: IntermediateRoundState,
+        base_target_token_ids: torch.Tensor,
+        base_target_positions: torch.Tensor,
+        base_target_hidden_states: torch.Tensor,
+        base_next_token_ids: torch.Tensor,
+        base_common_attn_metadata: CommonAttentionMetadata,
+        base_num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+        chunk_len: int,
+        sampling_metadata: SamplingMetadata,
+        use_draft_probs: bool,
+    ) -> DitRoundProposal:
+        from vllm.v1.spec_decode.staged_eagle import EagleHeadProposalEngine
+
+        assert inter_state.hidden_bundle is not None
+        eng = self._staged_delegates.proposal_engine
+        assert isinstance(eng, EagleHeadProposalEngine)
+        rows, probs = eng.propose_from_hidden_states(
+            base_target_token_ids=base_target_token_ids,
+            base_target_positions=base_target_positions,
+            hidden_bundle=inter_state.hidden_bundle,
+            base_next_token_ids=base_next_token_ids,
+            base_common_attn_metadata=base_common_attn_metadata,
+            base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+            prefix_rows=prefix_rows,
+            chunk_len=chunk_len,
+            sampling_metadata=sampling_metadata,
+            use_draft_probs=use_draft_probs,
+        )
+        return DitRoundProposal(tokens=rows, probs=probs)
+
+    def verify_chunk_with_intermediate_state(
+        self,
+        *,
+        inter_state: IntermediateRoundState,
+        base_target_token_ids: torch.Tensor,
+        base_target_positions: torch.Tensor,
+        base_target_hidden_states: torch.Tensor,
+        base_next_token_ids: torch.Tensor,
+        base_common_attn_metadata: CommonAttentionMetadata,
+        base_num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+        candidate_tokens: torch.Tensor,
+    ) -> DitRoundVerification:
+        return self.verify_chunk_with_inter_verifier(
+            base_target_token_ids=base_target_token_ids,
+            base_target_positions=base_target_positions,
+            base_target_hidden_states=base_target_hidden_states,
+            base_next_token_ids=base_next_token_ids,
+            base_common_attn_metadata=base_common_attn_metadata,
+            base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+            prefix_rows=prefix_rows,
+            candidate_tokens=candidate_tokens,
+            reuse_intermediate_state=inter_state,
+        )
+
     def _select_low_confidence_indices(self, pivot_probs: torch.Tensor) -> list[int]:
         batch_size = int(pivot_probs.shape[0])
         if batch_size <= 0:
@@ -1200,6 +1315,7 @@ class PivotProposer:
         base_common_attn_metadata: CommonAttentionMetadata,
         base_num_rejected_tokens_gpu: torch.Tensor | None,
         prefix_rows: list[list[int]],
+        reuse_intermediate_state: IntermediateRoundState | None = None,
     ) -> tuple[
         torch.Tensor,
         tuple[
@@ -1211,6 +1327,12 @@ class PivotProposer:
             return base_target_hidden_states, None
         if self._pivot_mode.hidden_state_source == "target":
             return base_target_hidden_states, None
+        if (
+            reuse_intermediate_state is not None
+            and reuse_intermediate_state.hidden_bundle is not None
+        ):
+            hb = reuse_intermediate_state.hidden_bundle
+            return hb.hidden_states, hb.prefix_prefab
         provider = self._staged_delegates.hidden_state_provider
         assert provider is not None, (
             "pivot eagle3_head + intermediate pipeline requires "
@@ -1612,6 +1734,7 @@ class PivotProposer:
         chunk_len: int,
         use_draft_probs: bool,
         enable_topk_expansion: bool,
+        reuse_intermediate_state: IntermediateRoundState | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, PivotExpansionPlan | None]:
         proposal_hidden_states, pivot_prefix_prefab = (
             self._resolve_hidden_states_for_proposal(
@@ -1622,6 +1745,7 @@ class PivotProposer:
                 base_common_attn_metadata=base_common_attn_metadata,
                 base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
                 prefix_rows=base_prefix_rows,
+                reuse_intermediate_state=reuse_intermediate_state,
             )
         )
         pivots, pivot_probs = _propose_chunk_from_prefix(
@@ -1900,6 +2024,7 @@ class PivotProposer:
         chunk_len: int,
         sampling_metadata: SamplingMetadata,
         use_draft_probs: bool,
+        reuse_intermediate_state: IntermediateRoundState | None = None,
     ) -> DitRoundProposal:
         origin_bs = int(base_common_attn_metadata.batch_size())
         enable_topk = (
@@ -1923,6 +2048,7 @@ class PivotProposer:
             chunk_len=chunk_len,
             use_draft_probs=use_draft_probs,
             enable_topk_expansion=enable_topk,
+            reuse_intermediate_state=reuse_intermediate_state,
         )
         if (
             expansion_plan is None
@@ -1965,6 +2091,7 @@ class PivotProposer:
         base_num_rejected_tokens_gpu: torch.Tensor | None,
         prefix_rows: list[list[int]],
         candidate_tokens: torch.Tensor,
+        reuse_intermediate_state: IntermediateRoundState | None = None,
     ) -> DitRoundVerification:
         # When topk expansion is active, prefix_rows is expanded (length P)
         # while the base tensors / CAD still reflect the origin batch (B).
@@ -1996,20 +2123,25 @@ class PivotProposer:
             "intermediate_then_target",
             "intermediate_tree_then_target_tree",
         ):
-            provider = self._staged_delegates.hidden_state_provider
-            assert provider is not None
-            round_state = provider.bootstrap_from_current_prefix(
-                base_target_token_ids=base_target_token_ids,
-                base_target_positions=base_target_positions,
-                base_target_hidden_states=base_target_hidden_states,
-                base_next_token_ids=base_next_token_ids,
-                base_common_attn_metadata=base_common_attn_metadata,
-                base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-                prefix_rows=prefix_rows,
-            )
-            assert round_state.hidden_bundle is not None
-            verifier_round_state = round_state
-            verifier_hidden_states = round_state.hidden_bundle.hidden_states
+            if reuse_intermediate_state is not None:
+                verifier_round_state = reuse_intermediate_state
+                assert verifier_round_state.hidden_bundle is not None
+                verifier_hidden_states = verifier_round_state.hidden_bundle.hidden_states
+            else:
+                provider = self._staged_delegates.hidden_state_provider
+                assert provider is not None
+                round_state = provider.bootstrap_from_current_prefix(
+                    base_target_token_ids=base_target_token_ids,
+                    base_target_positions=base_target_positions,
+                    base_target_hidden_states=base_target_hidden_states,
+                    base_next_token_ids=base_next_token_ids,
+                    base_common_attn_metadata=base_common_attn_metadata,
+                    base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                    prefix_rows=prefix_rows,
+                )
+                assert round_state.hidden_bundle is not None
+                verifier_round_state = round_state
+                verifier_hidden_states = round_state.hidden_bundle.hidden_states
         if (
             self._pivot_mode.proposal_engine == "eagle3_head"
             and self._pivot_mode.verification_pipeline
@@ -2028,19 +2160,11 @@ class PivotProposer:
         if verifier_round_state is not None and verifier_round_state.hidden_bundle is not None:
             verify_prefab = verifier_round_state.hidden_bundle.prefix_prefab
         if verify_prefab is not None:
-            pt, pp, ph, pn, pcad = verify_prefab
-            pcad = _hv_clone_cad(pcad)
-            empty_prefix = [[] for _ in range(int(pcad.batch_size()))]
-            logits_flat, bonus_logits = _verify_chunk_with_prefix(
+            logits_flat, bonus_logits = verify_intermediate_chunk_with_prefix_prefab(
                 self._intermediate,
-                cad=pcad,
-                target_token_ids=pt,
-                target_positions=pp,
-                target_hidden_states=ph,
-                next_token_ids=pn,
-                num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
-                prefix_rows=empty_prefix,
-                draft_tokens=candidate_tokens.to(torch.int32),
+                prefix_prefab=verify_prefab,
+                base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                draft_tokens=candidate_tokens,
             )
         else:
             logits_flat, bonus_logits = _verify_chunk_with_prefix(

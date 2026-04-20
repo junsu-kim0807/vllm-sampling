@@ -35,7 +35,7 @@ from vllm.v1.spec_decode.draft_model import (
     DraftModelProposer,
     PinnedDraftNamespaceDraftModelProposer,
 )
-from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
+from vllm.v1.spec_decode.eagle import EagleProposer, SpecDecodeBaseProposer
 from vllm.v1.spec_decode.spec_stage_ops import (
     run_verify_stage,
 )
@@ -44,6 +44,8 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     DitRoundProposal,
     DitRoundVerification,
     HybridProposalBundle,
+    IntermediateRoundState,
+    StagedHiddenStateBundle,
 )
 from vllm.v1.spec_decode.spec_stage_utils import clone_common_attn_metadata
 from vllm.v1.spec_decode.utils import (
@@ -118,6 +120,38 @@ def _vllm_hierarchical_verification_chunk(
             method="draft_model",
             num_speculative_tokens=length,
             speculative_token_tree=tree,
+        )
+    return replace(base, speculative_config=new_spec)
+
+
+def _vllm_hierarchical_eagle_chunk(
+    base: VllmConfig, *, length: int, intermediate: bool
+) -> VllmConfig:
+    """VllmConfig slice for hierarchical spechive with Eagle3 draft (D) or I draft."""
+    spec = base.speculative_config
+    assert spec is not None
+    tree = _chain_spec_token_tree(length)
+    if intermediate:
+        assert spec.intermediate_model_config is not None
+        assert spec.intermediate_parallel_config is not None
+        assert spec.intermediate_tensor_parallel_size is not None
+        new_spec = replace(
+            spec,
+            method="draft_model",
+            draft_model_config=spec.intermediate_model_config,
+            draft_parallel_config=spec.intermediate_parallel_config,
+            draft_tensor_parallel_size=spec.intermediate_tensor_parallel_size,
+            num_speculative_tokens=length,
+            speculative_token_tree=tree,
+        )
+    else:
+        new_spec = replace(
+            spec,
+            method="eagle3",
+            num_speculative_tokens=length,
+            speculative_token_tree=tree,
+            prompt_lookup_min=1,
+            prompt_lookup_max=1,
         )
     return replace(base, speculative_config=new_spec)
 
@@ -788,6 +822,35 @@ def _verify_chunk_with_prefix(
     return per_req.reshape(-1, per_req.shape[-1]), bonus_logits
 
 
+def verify_intermediate_chunk_with_prefix_prefab(
+    inter: SpecDecodeBaseProposer,
+    *,
+    prefix_prefab: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, CommonAttentionMetadata
+    ],
+    base_num_rejected_tokens_gpu: torch.Tensor | None,
+    draft_tokens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Intermediate chunk verification using a reused prefix frontier (no prefix rebuild).
+
+    Shared by adaptive spechive and pivot staged verification paths.
+    """
+    pt, pp, ph, pn, pcad = prefix_prefab
+    pcad = _hv_clone_cad(pcad)
+    empty_prefix = [[] for _ in range(int(pcad.batch_size()))]
+    return _verify_chunk_with_prefix(
+        inter,
+        cad=pcad,
+        target_token_ids=pt,
+        target_positions=pp,
+        target_hidden_states=ph,
+        next_token_ids=pn,
+        num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+        prefix_rows=empty_prefix,
+        draft_tokens=draft_tokens.to(torch.int32),
+    )
+
+
 def _build_hybrid_bundle_from_rows(
     rows_2d: torch.Tensor,
     *,
@@ -915,9 +978,11 @@ class AdaptiveSpechiveProposer:
         self._mode = spec.adaptive_spechive_mode
         self._L = spec.num_speculative_tokens
 
-        self._delegate: DraftModelProposer
+        self._delegate: DraftModelProposer | EagleProposer
         self._inter_dit: IntermediateDraftModelProposer | None = None
         self._pending_hybrid_bundle: HybridProposalBundle | None = None
+        self._use_staged_eagle = False
+        self._staged_delegates: object | None = None
 
         if self._mode == "draft_target":
             self._delegate = PinnedDraftNamespaceDraftModelProposer(
@@ -929,13 +994,6 @@ class AdaptiveSpechiveProposer:
             )
         else:
             assert self._mode == "hierarchical_verification"
-            self._delegate = PinnedDraftNamespaceDraftModelProposer(
-                _vllm_hierarchical_verification_chunk(
-                    vllm_config, length=self._L, intermediate=False
-                ),
-                device,
-                runner,
-            )
             self._inter_dit = IntermediateDraftModelProposer(
                 _vllm_hierarchical_verification_chunk(
                     vllm_config, length=self._L, intermediate=True
@@ -943,6 +1001,34 @@ class AdaptiveSpechiveProposer:
                 device,
                 runner,
             )
+            if spec.adaptive_spechive_draft_uses_eagle3_head():
+                from vllm.v1.spec_decode.staged_delegate_factory import (
+                    build_pivot_staged_delegates,
+                )
+
+                self._delegate = EagleProposer(
+                    _vllm_hierarchical_eagle_chunk(
+                        vllm_config, length=self._L, intermediate=False
+                    ),
+                    device,
+                    runner,
+                )
+                self._staged_delegates = build_pivot_staged_delegates(
+                    proposal_engine_kind="eagle3_head",
+                    draft_delegate=None,
+                    eagle_delegate=self._delegate,
+                    intermediate_delegate=self._inter_dit,
+                    needs_intermediate_provider=True,
+                )
+                self._use_staged_eagle = True
+            else:
+                self._delegate = PinnedDraftNamespaceDraftModelProposer(
+                    _vllm_hierarchical_verification_chunk(
+                        vllm_config, length=self._L, intermediate=False
+                    ),
+                    device,
+                    runner,
+                )
 
     def __getattr__(self, name: str):
         if name.startswith("_") or name in (
@@ -999,6 +1085,152 @@ class AdaptiveSpechiveProposer:
         if hasattr(self._delegate, "clear_draft_probs"):
             self._delegate.clear_draft_probs()
 
+    def supports_staged_eagle_fastpath(self) -> bool:
+        return self._use_staged_eagle and self._staged_delegates is not None
+
+    def bootstrap_intermediate_round_state(
+        self,
+        *,
+        base_target_token_ids: torch.Tensor,
+        base_target_positions: torch.Tensor,
+        base_target_hidden_states: torch.Tensor,
+        base_next_token_ids: torch.Tensor,
+        base_common_attn_metadata: CommonAttentionMetadata,
+        base_num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+    ) -> IntermediateRoundState:
+        assert self._staged_delegates is not None
+        provider = self._staged_delegates.hidden_state_provider
+        assert provider is not None
+        return provider.bootstrap_from_current_prefix(
+            base_target_token_ids=base_target_token_ids,
+            base_target_positions=base_target_positions,
+            base_target_hidden_states=base_target_hidden_states,
+            base_next_token_ids=base_next_token_ids,
+            base_common_attn_metadata=base_common_attn_metadata,
+            base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+            prefix_rows=prefix_rows,
+        )
+
+    def refresh_intermediate_round_state(
+        self,
+        *,
+        base_target_token_ids: torch.Tensor,
+        base_target_positions: torch.Tensor,
+        base_target_hidden_states: torch.Tensor,
+        base_next_token_ids: torch.Tensor,
+        base_common_attn_metadata: CommonAttentionMetadata,
+        base_num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+        old_state: IntermediateRoundState | None,
+    ) -> IntermediateRoundState:
+        del old_state
+        return self.bootstrap_intermediate_round_state(
+            base_target_token_ids=base_target_token_ids,
+            base_target_positions=base_target_positions,
+            base_target_hidden_states=base_target_hidden_states,
+            base_next_token_ids=base_next_token_ids,
+            base_common_attn_metadata=base_common_attn_metadata,
+            base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+            prefix_rows=prefix_rows,
+        )
+
+    def _resolve_staged_hidden_bundle_for_adaptive(
+        self,
+        *,
+        base_target_token_ids: torch.Tensor,
+        base_target_positions: torch.Tensor,
+        base_target_hidden_states: torch.Tensor,
+        base_next_token_ids: torch.Tensor,
+        base_common_attn_metadata: CommonAttentionMetadata,
+        base_num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+        reuse_intermediate_state: IntermediateRoundState | None = None,
+    ) -> StagedHiddenStateBundle | None:
+        if not self._use_staged_eagle or self._staged_delegates is None:
+            return None
+        spec = self.vllm_config.speculative_config
+        assert spec is not None
+        src = spec.adaptive_spechive_hidden_state_source or "intermediate"
+        if src == "target":
+            return None
+        if (
+            reuse_intermediate_state is not None
+            and reuse_intermediate_state.hidden_bundle is not None
+        ):
+            return reuse_intermediate_state.hidden_bundle
+        rs = self.bootstrap_intermediate_round_state(
+            base_target_token_ids=base_target_token_ids,
+            base_target_positions=base_target_positions,
+            base_target_hidden_states=base_target_hidden_states,
+            base_next_token_ids=base_next_token_ids,
+            base_common_attn_metadata=base_common_attn_metadata,
+            base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+            prefix_rows=prefix_rows,
+        )
+        assert rs.hidden_bundle is not None
+        return rs.hidden_bundle
+
+    def propose_chunk_from_intermediate_state(
+        self,
+        *,
+        inter_state: IntermediateRoundState,
+        base_target_token_ids: torch.Tensor,
+        base_target_positions: torch.Tensor,
+        base_target_hidden_states: torch.Tensor,
+        base_next_token_ids: torch.Tensor,
+        base_common_attn_metadata: CommonAttentionMetadata,
+        base_num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+        chunk_len: int,
+        sampling_metadata: SamplingMetadata,
+        use_draft_probs: bool,
+    ) -> DitRoundProposal:
+        assert self._staged_delegates is not None
+        assert inter_state.hidden_bundle is not None
+        from vllm.v1.spec_decode.staged_eagle import EagleHeadProposalEngine
+
+        eng = self._staged_delegates.proposal_engine
+        assert isinstance(eng, EagleHeadProposalEngine)
+        rows, probs = eng.propose_from_hidden_states(
+            base_target_token_ids=base_target_token_ids,
+            base_target_positions=base_target_positions,
+            hidden_bundle=inter_state.hidden_bundle,
+            base_next_token_ids=base_next_token_ids,
+            base_common_attn_metadata=base_common_attn_metadata,
+            base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+            prefix_rows=prefix_rows,
+            chunk_len=chunk_len,
+            sampling_metadata=sampling_metadata,
+            use_draft_probs=use_draft_probs,
+        )
+        return DitRoundProposal(tokens=rows, probs=probs)
+
+    def verify_chunk_with_intermediate_state(
+        self,
+        *,
+        inter_state: IntermediateRoundState,
+        base_target_token_ids: torch.Tensor,
+        base_target_positions: torch.Tensor,
+        base_target_hidden_states: torch.Tensor,
+        base_next_token_ids: torch.Tensor,
+        base_common_attn_metadata: CommonAttentionMetadata,
+        base_num_rejected_tokens_gpu: torch.Tensor | None,
+        prefix_rows: list[list[int]],
+        candidate_tokens: torch.Tensor,
+    ) -> DitRoundVerification:
+        return self.verify_chunk_with_inter_verifier(
+            base_target_token_ids=base_target_token_ids,
+            base_target_positions=base_target_positions,
+            base_target_hidden_states=base_target_hidden_states,
+            base_next_token_ids=base_next_token_ids,
+            base_common_attn_metadata=base_common_attn_metadata,
+            base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+            prefix_rows=prefix_rows,
+            candidate_tokens=candidate_tokens,
+            reuse_intermediate_state=inter_state,
+        )
+
     def propose_chunk_from_prefix(
         self,
         *,
@@ -1012,8 +1244,37 @@ class AdaptiveSpechiveProposer:
         chunk_len: int,
         sampling_metadata: SamplingMetadata,
         use_draft_probs: bool,
+        reuse_intermediate_state: IntermediateRoundState | None = None,
     ) -> DitRoundProposal:
         """Chunk proposal conditioned on base sampled token + logical prefix."""
+        bundle = self._resolve_staged_hidden_bundle_for_adaptive(
+            base_target_token_ids=base_target_token_ids,
+            base_target_positions=base_target_positions,
+            base_target_hidden_states=base_target_hidden_states,
+            base_next_token_ids=base_next_token_ids,
+            base_common_attn_metadata=base_common_attn_metadata,
+            base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+            prefix_rows=prefix_rows,
+            reuse_intermediate_state=reuse_intermediate_state,
+        )
+        if bundle is not None and self._staged_delegates is not None:
+            from vllm.v1.spec_decode.staged_eagle import EagleHeadProposalEngine
+
+            eng = self._staged_delegates.proposal_engine
+            assert isinstance(eng, EagleHeadProposalEngine)
+            tokens, probs = eng.propose_from_hidden_states(
+                base_target_token_ids=base_target_token_ids,
+                base_target_positions=base_target_positions,
+                hidden_bundle=bundle,
+                base_next_token_ids=base_next_token_ids,
+                base_common_attn_metadata=base_common_attn_metadata,
+                base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                prefix_rows=prefix_rows,
+                chunk_len=chunk_len,
+                sampling_metadata=sampling_metadata,
+                use_draft_probs=use_draft_probs,
+            )
+            return DitRoundProposal(tokens=tokens, probs=probs)
         tokens, probs = _propose_chunk_from_prefix(
             self._delegate,
             cad=base_common_attn_metadata,
@@ -1040,9 +1301,38 @@ class AdaptiveSpechiveProposer:
         base_num_rejected_tokens_gpu: torch.Tensor | None,
         prefix_rows: list[list[int]],
         candidate_tokens: torch.Tensor,
+        reuse_intermediate_state: IntermediateRoundState | None = None,
     ) -> DitRoundVerification:
         """Intermediate verification logits conditioned on logical prefix."""
         assert self._inter_dit is not None
+        spec = self.vllm_config.speculative_config
+        assert spec is not None
+        src = spec.adaptive_spechive_hidden_state_source or "intermediate"
+        hb = None
+        if reuse_intermediate_state is not None:
+            hb = reuse_intermediate_state.hidden_bundle
+        elif self._use_staged_eagle and src != "target":
+            rs = self.bootstrap_intermediate_round_state(
+                base_target_token_ids=base_target_token_ids,
+                base_target_positions=base_target_positions,
+                base_target_hidden_states=base_target_hidden_states,
+                base_next_token_ids=base_next_token_ids,
+                base_common_attn_metadata=base_common_attn_metadata,
+                base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                prefix_rows=prefix_rows,
+            )
+            hb = rs.hidden_bundle
+        if hb is not None and hb.prefix_prefab is not None and src != "target":
+            logits_flat, bonus_logits = verify_intermediate_chunk_with_prefix_prefab(
+                self._inter_dit,
+                prefix_prefab=hb.prefix_prefab,
+                base_num_rejected_tokens_gpu=base_num_rejected_tokens_gpu,
+                draft_tokens=candidate_tokens,
+            )
+            return DitRoundVerification(
+                logits_flat=logits_flat,
+                bonus_logits=bonus_logits,
+            )
         logits_flat, bonus_logits = _verify_chunk_with_prefix(
             self._inter_dit,
             cad=base_common_attn_metadata,

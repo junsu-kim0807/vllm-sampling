@@ -12,4 +12,5 @@ from vllm.v1.spec_decode.adaptive_cascade import (  # noqa: F401
     _build_hybrid_bundle_from_rows,
     _flatten_prob_rows_for_output,
     _hv_clone_cad,
+    verify_intermediate_chunk_with_prefix_prefab,
 )
