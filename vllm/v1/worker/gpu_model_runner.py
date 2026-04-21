@@ -5914,7 +5914,7 @@ class GPUModelRunner(
                 vocab_size=vocab_size,
                 use_draft_probs=use_draft_probs,
             )
-            before_lens = prefix_lens.detach().cpu().numpy().astype(
+            before_round_lens = prefix_lens.detach().cpu().numpy().astype(
                 np.int64, copy=False
             )
             emitted_rows_host = dit_decision_emitted_rows_host(decision)
@@ -5923,7 +5923,7 @@ class GPUModelRunner(
                 batch_size=batch_size,
                 eff_bs=batch_size,
                 pivot_expansion_plan=None,
-                before_prefix_lens_np=before_lens,
+                before_prefix_lens_np=before_round_lens,
                 emitted_rows_host=emitted_rows_host,
             )
             self._advance_draft_frontier_after_round(
@@ -5931,7 +5931,7 @@ class GPUModelRunner(
                 batch_size=batch_size,
                 eff_bs=batch_size,
                 pivot_expansion_plan=None,
-                before_prefix_lens_np=before_lens,
+                before_prefix_lens_np=before_round_lens,
                 emitted_rows_host=emitted_rows_host,
             )
             inter_verified_gpu += int(L)
