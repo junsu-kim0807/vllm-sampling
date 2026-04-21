@@ -5652,38 +5652,19 @@ class GPUModelRunner(
                 for b in range(num_reqs_hv)
             }
 
+        # Always rebuild frontier prep for the current proposal. A prior optimization
+        # reused ``inter_prep_base`` and only ``spec_decode_metadata.draft_token_ids``.
+        # The intermediate forward copies ``intermediate_step_input_ids`` /
+        # ``intermediate_step_positions`` (filled by ``_prepare_inputs``), not
+        # ``draft_token_ids`` alone — so draft-only updates left stale per-round inputs.
         with self._hv_suspend_cached_prev_sampled_tokens():
-            if hv_ctx is not None and hv_ctx.get("inter_prep_base") is not None:
-                prep = hv_ctx["inter_prep_base"]
-                spec_md = prep.spec_decode_metadata
-                if spec_md is not None:
-                    flat = proposal_tokens[:num_reqs_hv].reshape(-1).to(
-                        spec_md.draft_token_ids.dtype
-                    )
-                    if flat.numel() == spec_md.draft_token_ids.numel():
-                        spec_md.draft_token_ids.copy_(flat, non_blocking=True)
-                    else:
-                        prep = self._prepare_intermediate_metadata(
-                            so,
-                            nst,
-                            scheduled_spec_decode_tokens_override=_scheduled_spec_decode_tokens_override(),
-                        )
-                        hv_ctx["inter_prep_base"] = prep
-                else:
-                    prep = self._prepare_intermediate_metadata(
-                        so,
-                        nst,
-                        scheduled_spec_decode_tokens_override=_scheduled_spec_decode_tokens_override(),
-                    )
-                    hv_ctx["inter_prep_base"] = prep
-            else:
-                prep = self._prepare_intermediate_metadata(
-                    so,
-                    nst,
-                    scheduled_spec_decode_tokens_override=_scheduled_spec_decode_tokens_override(),
-                )
-                if hv_ctx is not None:
-                    hv_ctx["inter_prep_base"] = prep
+            prep = self._prepare_intermediate_metadata(
+                so,
+                nst,
+                scheduled_spec_decode_tokens_override=_scheduled_spec_decode_tokens_override(),
+            )
+            if hv_ctx is not None:
+                hv_ctx["inter_prep_base"] = prep
         if prep is None or prep.spec_decode_metadata is None:
             detail = self._describe_frontier_prepare_blockers(
                 frontier="intermediate",
