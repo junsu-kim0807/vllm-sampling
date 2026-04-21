@@ -41,6 +41,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tp_group,
     graph_capture,
     is_global_first_rank,
@@ -5907,8 +5908,9 @@ class GPUModelRunner(
         return os.environ.get("VLLM_SPEC_STEP_DEBUG_STRICT", "0") == "1"
 
     def _spec_step_debug_tp0(self) -> bool:
+        """Emit noisy SPEC_STEP_DEBUG / HV geom logs on tensor-parallel rank 0 only."""
         try:
-            return bool(get_tp_group().is_first_rank())
+            return int(get_tensor_model_parallel_rank()) == 0
         except Exception:
             return True
 
