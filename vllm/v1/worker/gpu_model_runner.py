@@ -2413,14 +2413,12 @@ class GPUModelRunner(
         skip_intermediate_refresh: bool = False,
         skip_draft_refresh: bool = False,
     ) -> None:
-        """Standalone HV: update mirror ``num_computed_tokens`` without per-round token lists.
+        """Bump mirror ``num_computed_tokens`` only (no per-row ``output_token_ids``).
 
-        ``skip_intermediate_refresh`` / ``skip_draft_refresh`` omit ``refresh_metadata`` on
-        the corresponding mirror batch. Inside ``run_hv_rounds`` we skip intermediate
-        refresh between rounds (metadata cache path) but keep draft refresh so draft
-        ``InputBatch`` sampling metadata stays consistent across HV rounds. The step
-        ends with ``_hv_sync_standalone_hv_mirror_output_tokens_from_prefix`` which
-        refreshes both batches.
+        Legacy helper; standalone ``run_hv_rounds`` advances mirrors via
+        ``_advance_intermediate_frontier_after_round`` / ``_advance_draft_frontier_after_round``
+        each round so ``_prepare_*`` sees consistent token history. Retained for any
+        narrow call sites that still need count-only bumps.
         """
         for b in range(batch_size):
             if b >= len(self.input_batch.req_ids):
@@ -2463,7 +2461,11 @@ class GPUModelRunner(
         *,
         batch_size: int,
     ) -> None:
-        """Append full accumulated HV prefix to mirror ``output_token_ids`` (one D2H)."""
+        """Append full accumulated HV prefix to mirror ``output_token_ids`` (one D2H).
+
+        Not used by ``run_hv_rounds`` when per-round frontier advances already extended
+        ``output_token_ids``; calling both would duplicate tokens.
+        """
         pl = prefix_lens[:batch_size].detach().cpu().numpy().astype(
             np.int64, copy=False
         )
@@ -5912,14 +5914,25 @@ class GPUModelRunner(
                 vocab_size=vocab_size,
                 use_draft_probs=use_draft_probs,
             )
-            acc_np = decision.accepted_lens.detach().cpu().numpy().astype(
+            before_lens = prefix_lens.detach().cpu().numpy().astype(
                 np.int64, copy=False
             )
-            self._hv_advance_standalone_hv_mirror_counts(
-                acc_np,
+            emitted_rows_host = dit_decision_emitted_rows_host(decision)
+            self._advance_intermediate_frontier_after_round(
+                decision,
                 batch_size=batch_size,
-                skip_intermediate_refresh=True,
-                skip_draft_refresh=False,
+                eff_bs=batch_size,
+                pivot_expansion_plan=None,
+                before_prefix_lens_np=before_lens,
+                emitted_rows_host=emitted_rows_host,
+            )
+            self._advance_draft_frontier_after_round(
+                decision,
+                batch_size=batch_size,
+                eff_bs=batch_size,
+                pivot_expansion_plan=None,
+                before_prefix_lens_np=before_lens,
+                emitted_rows_host=emitted_rows_host,
             )
             inter_verified_gpu += int(L)
             inter_accepted_gpu.add_(
@@ -6004,6 +6017,30 @@ class GPUModelRunner(
         tail_accept = torch.full(
             (batch_size,), tail_len, dtype=torch.int32, device=dev
         )
+        before_tail_lens = prefix_lens.detach().cpu().numpy().astype(
+            np.int64, copy=False
+        )
+        tail_decision = DitRoundDecision(
+            emitted_tokens=tail.tokens.to(torch.int32),
+            accepted_lens=tail_accept,
+        )
+        tail_emitted_rows_host = dit_decision_emitted_rows_host(tail_decision)
+        self._advance_intermediate_frontier_after_round(
+            tail_decision,
+            batch_size=batch_size,
+            eff_bs=batch_size,
+            pivot_expansion_plan=None,
+            before_prefix_lens_np=before_tail_lens,
+            emitted_rows_host=tail_emitted_rows_host,
+        )
+        self._advance_draft_frontier_after_round(
+            tail_decision,
+            batch_size=batch_size,
+            eff_bs=batch_size,
+            pivot_expansion_plan=None,
+            before_prefix_lens_np=before_tail_lens,
+            emitted_rows_host=tail_emitted_rows_host,
+        )
         if hv_probs_prefix is not None and tail.probs is not None:
             _hv_scatter_tail_probs_into_prefix(
                 hv_probs_prefix,
@@ -6023,22 +6060,12 @@ class GPUModelRunner(
         prefix_lens.add_(
             torch.full((batch_size,), tail_len, dtype=prefix_lens.dtype, device=dev)
         )
-        tail_acc_np = np.full((batch_size,), tail_len, dtype=np.int64)
-        self._hv_advance_standalone_hv_mirror_counts(
-            tail_acc_np,
-            batch_size=batch_size,
-            skip_intermediate_refresh=True,
-            skip_draft_refresh=False,
-        )
         if self._is_dit_debug_enabled():
             self._dit_debug_assert(
                 bool((prefix_lens <= cap).all().item()),
                 "hv_standalone_prefix_lens_within_cap_after_tail",
                 detail=f"cap={cap}, max_prefix={int(prefix_lens.max().item())}",
             )
-        self._hv_sync_standalone_hv_mirror_output_tokens_from_prefix(
-            prefix_tokens, prefix_lens, batch_size=batch_size
-        )
 
         out_exp = prefix_tokens
         draft_probs_flat = (
