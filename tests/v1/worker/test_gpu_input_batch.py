@@ -378,3 +378,95 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
     ref_input_batch.refresh_metadata()
 
     _compare_objs(input_batch, ref_input_batch)
+
+
+def test_bulk_update_spec_token_ids_from_tensor_matches_row_updates_cpu():
+    """Batched tensor sync should match per-request ``update_req_spec_token_ids``."""
+    ib = InputBatch(
+        max_num_reqs=4,
+        max_model_len=128,
+        max_num_batched_tokens=256,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[1],
+        kernel_block_sizes=[1],
+        is_spec_decode=True,
+    )
+    ref = InputBatch(
+        max_num_reqs=4,
+        max_model_len=128,
+        max_num_batched_tokens=256,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[1],
+        kernel_block_sizes=[1],
+        is_spec_decode=True,
+    )
+    r0 = CachedRequestState(
+        req_id="req_bulk_0",
+        prompt_token_ids=[1, 2],
+        mm_features=[],
+        sampling_params=_create_sampling_params(),
+        block_ids=([],),
+        generator=None,
+        num_computed_tokens=0,
+        output_token_ids=[10],
+    )
+    r1 = CachedRequestState(
+        req_id="req_bulk_1",
+        prompt_token_ids=[3],
+        mm_features=[],
+        sampling_params=_create_sampling_params(),
+        block_ids=([],),
+        generator=None,
+        num_computed_tokens=0,
+        output_token_ids=[20, 21],
+    )
+    r0b = CachedRequestState(
+        req_id="req_bulk_0",
+        prompt_token_ids=[1, 2],
+        mm_features=[],
+        sampling_params=_create_sampling_params(),
+        block_ids=([],),
+        generator=None,
+        num_computed_tokens=0,
+        output_token_ids=[10],
+    )
+    r1b = CachedRequestState(
+        req_id="req_bulk_1",
+        prompt_token_ids=[3],
+        mm_features=[],
+        sampling_params=_create_sampling_params(),
+        block_ids=([],),
+        generator=None,
+        num_computed_tokens=0,
+        output_token_ids=[20, 21],
+    )
+    assert ib.add_request(r0) == 0
+    assert ib.add_request(r1) == 1
+    assert ref.add_request(r0b) == 0
+    assert ref.add_request(r1b) == 1
+
+    tok = torch.tensor(
+        [[100, 101, 102, 0], [200, 201, 0, 0]],
+        dtype=torch.int32,
+    )
+    lens = torch.tensor([3, 2], dtype=torch.int32)
+    ib.bulk_update_spec_token_ids_from_tensor([r0, r1], tok, lens)
+    ref.update_req_spec_token_ids(r0b, {"req_bulk_0": [100, 101, 102]})
+    ref.update_req_spec_token_ids(r1b, {"req_bulk_1": [200, 201]})
+
+    for batch, r, rid in (
+        (ib, r0, "req_bulk_0"),
+        (ib, r1, "req_bulk_1"),
+        (ref, r0b, "req_bulk_0"),
+        (ref, r1b, "req_bulk_1"),
+    ):
+        idx = batch.req_id_to_index[rid]
+        start = int(batch.num_tokens_no_spec[idx])
+        n = r.prev_num_draft_len
+        exp = [100, 101, 102] if rid.endswith("0") else [200, 201]
+        assert list(batch.token_ids_cpu[idx, start : start + n]) == exp
+        assert batch.spec_token_ids[idx] == exp

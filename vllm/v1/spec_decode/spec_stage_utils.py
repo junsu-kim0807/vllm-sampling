@@ -6,10 +6,28 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import numpy as np
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
+
+
+def materialize_spec_token_ids_from_prefix_tensors(
+    spec_prefix_tokens: torch.Tensor,
+    spec_prefix_lens: torch.Tensor,
+) -> list[list[int]]:
+    """CPU list rows from ``[B, cap]`` + ``[B]`` prefix tensors (for penalty / bad-words)."""
+    pt = spec_prefix_tokens.detach().cpu().numpy()
+    pl = spec_prefix_lens.detach().cpu().numpy().astype(np.int64, copy=False)
+    out: list[list[int]] = []
+    for i in range(pt.shape[0]):
+        n = int(pl[i])
+        if n <= 0:
+            out.append([])
+        else:
+            out.append([int(x) for x in pt[i, :n].tolist()])
+    return out
 
 
 def group_indices_by_prefix_len(rows: list[list[int]]) -> list[tuple[int, list[int]]]:
@@ -46,6 +64,8 @@ def slice_sampling_metadata_for_subbatch(
     idxs: list[int],
     *,
     provisional_prefix_rows: list[list[int]] | None = None,
+    provisional_prefix_tokens: torch.Tensor | None = None,
+    provisional_prefix_lens: torch.Tensor | None = None,
     sampled_ids_only: bool = False,
 ) -> SamplingMetadata:
     """Slice request-major SamplingMetadata for sub-batch stage execution."""
@@ -63,16 +83,6 @@ def slice_sampling_metadata_for_subbatch(
     else:
         output_token_ids = [[] for _ in idxs]
 
-    if provisional_prefix_rows is not None:
-        spec_token_ids = provisional_prefix_rows
-    elif sm.spec_token_ids is not None:
-        if sm.spec_token_ids:
-            spec_token_ids = [sm.spec_token_ids[i] for i in idxs]
-        else:
-            spec_token_ids = [[] for _ in idxs]
-    else:
-        spec_token_ids = None
-
     bad_words = {
         new_i: sm.bad_words_token_ids[old_i]
         for new_i, old_i in enumerate(idxs)
@@ -83,6 +93,39 @@ def slice_sampling_metadata_for_subbatch(
         for new_i, old_i in enumerate(idxs)
         if old_i in sm.generators
     }
+    spec_token_ids: list[list[int]] | None = None
+    spec_prefix_tokens: torch.Tensor | None = None
+    spec_prefix_lens: torch.Tensor | None = None
+
+    if provisional_prefix_tokens is not None and provisional_prefix_lens is not None:
+        idx_dev = idx.to(
+            device=provisional_prefix_tokens.device, dtype=idx.dtype
+        )
+        # Keep prefix on device; RS / sampler materialize once when penalties/bad-words
+        # need list form (avoids duplicate GPU→CPU in this helper).
+        spec_prefix_tokens = provisional_prefix_tokens.index_select(0, idx_dev)
+        spec_prefix_lens = provisional_prefix_lens.index_select(0, idx_dev)
+        spec_token_ids = None
+    elif provisional_prefix_rows is not None:
+        spec_prefix_tokens = None
+        spec_prefix_lens = None
+        spec_token_ids = provisional_prefix_rows
+    elif sm.spec_token_ids is not None:
+        spec_prefix_tokens = None
+        spec_prefix_lens = None
+        if sm.spec_token_ids:
+            spec_token_ids = [sm.spec_token_ids[i] for i in idxs]
+        else:
+            spec_token_ids = [[] for _ in idxs]
+    else:
+        spec_token_ids = None
+        if sm.spec_prefix_tokens is not None and sm.spec_prefix_lens is not None:
+            idx_dev = idx.to(device=sm.spec_prefix_tokens.device, dtype=idx.dtype)
+            spec_prefix_tokens = sm.spec_prefix_tokens.index_select(0, idx_dev)
+            spec_prefix_lens = sm.spec_prefix_lens.index_select(0, idx_dev)
+        else:
+            spec_prefix_tokens = None
+            spec_prefix_lens = None
 
     return replace(
         sm,
@@ -98,5 +141,7 @@ def slice_sampling_metadata_for_subbatch(
         bad_words_token_ids=bad_words,
         generators=generators,
         spec_token_ids=spec_token_ids,
+        spec_prefix_tokens=spec_prefix_tokens,
+        spec_prefix_lens=spec_prefix_lens,
         max_num_logprobs=None if sampled_ids_only else sm.max_num_logprobs,
     )

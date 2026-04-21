@@ -42,3 +42,7 @@ class SamplingMetadata:
 
     # Speculative token ids
     spec_token_ids: list[list[int]] | None = None
+    # Optional GPU provisional prefix (request-major). Used by staged paths when
+    # ``spec_token_ids`` is None and penalties/bad-words do not require list form.
+    spec_prefix_tokens: torch.Tensor | None = None
+    spec_prefix_lens: torch.Tensor | None = None

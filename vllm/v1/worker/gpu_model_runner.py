@@ -215,6 +215,8 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     RootTopKInfo,
     _split_flat_tokens_by_lengths,
     _split_probs_by_lengths,
+    dit_decision_emitted_prob_rows_host,
+    dit_decision_emitted_rows_host,
     expand_hybrid_bundle_for_pivot_expansion,
     pivot_expansion_indices_fit_prepare_batch,
 )
@@ -287,7 +289,7 @@ def _pivot_origin_row_num_draft_tokens(
                 for idx, org in enumerate(expansion_plan.expanded_to_origin)
                 if org == o
             )
-        out.append(int(meta_nd[j]))
+        out.append(int(meta_nd[j].item()))
     return out
 
 
@@ -311,9 +313,9 @@ def _post_collapse_num_draft_per_origin(
                 for idx, org in enumerate(tree_plan.expanded_to_origin)
                 if org == o
             )
-            if j >= len(meta_nd):
+            if j >= int(meta_nd.shape[0]):
                 return None
-            out.append(int(meta_nd[j]))
+            out.append(int(meta_nd[j].item()))
         return out
     return None
 
@@ -326,7 +328,15 @@ def _pivot_mean_accepted_prefix_len(
     nrows = int(sampled_token_ids.shape[0])
     if nrows == 0:
         return 0.0, 0
-    if num_draft_tokens is not None and len(num_draft_tokens) == nrows:
+    if num_draft_tokens is not None:
+        n_nd = (
+            len(num_draft_tokens)
+            if isinstance(num_draft_tokens, list)
+            else int(num_draft_tokens.shape[0])
+        )
+    else:
+        n_nd = 0
+    if num_draft_tokens is not None and n_nd == nrows:
         lens = get_target_verification_accepted_draft_prefix_lens(
             sampled_token_ids,
             num_draft_tokens,
@@ -338,6 +348,113 @@ def _pivot_mean_accepted_prefix_len(
             placeholder_token_id=PLACEHOLDER_TOKEN_ID,
         )
     return (sum(lens) / len(lens), nrows)
+
+
+def _hv_scatter_emitted_into_prefix(
+    *,
+    prefix_tokens: torch.Tensor,
+    source_stage_2d: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    emitted: torch.Tensor,
+    accepted_lens: torch.Tensor,
+    stage_id: int,
+) -> None:
+    """Write emitted rows into ``prefix_*`` at current ``prefix_lens`` (GPU)."""
+    _, cap = prefix_tokens.shape
+    w = emitted.shape[1]
+    device = prefix_tokens.device
+    ar = torch.arange(w, device=device, dtype=torch.int64).unsqueeze(0)
+    al = accepted_lens.to(torch.int64).unsqueeze(1)
+    valid = ar < al
+    dst = prefix_lens.to(torch.int64).unsqueeze(1) + ar
+    valid = valid & (dst < cap)
+    dst = dst.clamp(max=cap - 1)
+    cur_tok = prefix_tokens.gather(1, dst)
+    prefix_tokens.scatter_(
+        1,
+        dst,
+        torch.where(valid, emitted.to(prefix_tokens.dtype), cur_tok),
+    )
+    stage_val = torch.full_like(dst, stage_id, dtype=source_stage_2d.dtype)
+    cur_s = source_stage_2d.gather(1, dst)
+    source_stage_2d.scatter_(1, dst, torch.where(valid, stage_val, cur_s))
+
+
+def _hv_scatter_emitted_probs_into_prefix(
+    *,
+    probs_prefix: torch.Tensor,
+    emitted_probs_flat: torch.Tensor,
+    emitted_probs_cu: torch.Tensor,
+    prefix_lens_before: torch.Tensor,
+    accepted_lens: torch.Tensor,
+    max_w: int,
+) -> None:
+    """Scatter accepted draft probs for this round into ``[B, cap, V]`` (GPU, no D2H)."""
+    B, cap, _V = probs_prefix.shape
+    device = probs_prefix.device
+    if emitted_probs_flat.numel() == 0:
+        return
+    if int(emitted_probs_cu.numel()) != B + 1:
+        logger.warning(
+            "_hv_scatter_emitted_probs_into_prefix: emitted_probs_cu size mismatch "
+            "(expected %s, got %s); skipping probs scatter",
+            B + 1,
+            int(emitted_probs_cu.numel()),
+        )
+        return
+    al = accepted_lens.to(torch.int64)
+    ar = torch.arange(max_w, device=device, dtype=torch.int64).unsqueeze(0)
+    valid = ar < al.unsqueeze(1)
+    dst_col = prefix_lens_before.to(torch.int64).unsqueeze(1) + ar
+    valid = valid & (dst_col >= 0) & (dst_col < cap)
+    cu64 = emitted_probs_cu.to(device=device, dtype=torch.int64)
+    src_idx = cu64[:B].unsqueeze(1) + ar
+    rb = torch.arange(B, device=device, dtype=torch.int64).unsqueeze(1).expand(B, max_w)
+    flat_f = emitted_probs_flat.to(torch.float32)
+    probs_prefix[rb[valid], dst_col[valid], :] = flat_f[src_idx[valid]]
+
+
+def _hv_scatter_tail_probs_into_prefix(
+    probs_prefix: torch.Tensor,
+    tail_probs: torch.Tensor,
+    prefix_lens_before: torch.Tensor,
+    *,
+    tail_len: int,
+    cap: int,
+) -> None:
+    """Write tail chunk probs at current prefix offsets (GPU)."""
+    if tail_len <= 0 or tail_probs.numel() == 0:
+        return
+    B = int(prefix_lens_before.shape[0])
+    device = prefix_lens_before.device
+    ar = torch.arange(tail_len, device=device, dtype=torch.int64).unsqueeze(0)
+    dst_col = prefix_lens_before.to(torch.int64).unsqueeze(1) + ar
+    valid = (dst_col >= 0) & (dst_col < cap)
+    rb = torch.arange(B, device=device, dtype=torch.int64).unsqueeze(1).expand(B, tail_len)
+    tp = tail_probs.to(torch.float32)
+    probs_prefix[rb[valid], dst_col[valid], :] = tp[valid]
+
+
+def _hv_extract_prefix_probs_flat(
+    probs_prefix: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    *,
+    batch_size: int,
+) -> torch.Tensor | None:
+    """Row-major ``[sum_b n_b, V]`` from dense prefix prob buffer (GPU)."""
+    if batch_size <= 0:
+        return None
+    cap = int(probs_prefix.shape[1])
+    device = probs_prefix.device
+    pl = prefix_lens[:batch_size].to(torch.int64)
+    ar = torch.arange(cap, device=device, dtype=torch.int64)
+    mask = ar.unsqueeze(0) < pl.unsqueeze(1)
+    flat = probs_prefix[:batch_size].reshape(-1, probs_prefix.shape[-1])[
+        mask.reshape(-1)
+    ]
+    if flat.numel() == 0:
+        return None
+    return flat.contiguous()
 
 
 def _pivot_plan_sm_indices(plan: PivotExpansionPlan) -> list[int]:
@@ -1130,6 +1247,8 @@ class GPUModelRunner(
         # frontier is enabled so HV paths can call ``_prepare_intermediate_metadata``
         # with the current scheduler output.
         self._hv_scheduler_output: Any = None
+        # Reused in ``run_hv_rounds`` when ``use_draft_probs`` (shape keyed by B, cap, V).
+        self._hv_probs_prefix_buf: torch.Tensor | None = None
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
         # GPU to CPU when async scheduling is enabled.
@@ -1787,19 +1906,58 @@ class GPUModelRunner(
         batch_size: int,
         eff_bs: int,
         pivot_expansion_plan: PivotExpansionPlan | None,
-        before_prefix_lens: list[int],
+        before_prefix_lens: list[int] | None = None,
+        before_prefix_lens_gpu: torch.Tensor | None = None,
+        before_prefix_lens_np: np.ndarray | None = None,
+        emitted_rows_host: list[list[int]] | None = None,
     ) -> None:
         """Advance intermediate working frontier after inner-round acceptance (no new blocks).
 
         When pivot expands the effective batch (``eff_bs != batch_size``), the mirror
         only tracks origin requests, so we skip advancing here; post-target reconcile
         realigns ``intermediate_requests`` to the authoritative target state.
+
+        Pass exactly one of ``before_prefix_lens`` (CPU list), ``before_prefix_lens_gpu``
+        (``[B]`` lengths; converted to NumPy inside), or ``before_prefix_lens_np``
+        (``int64`` vector, already on host — avoids duplicate GPU sync when shared across
+        intermediate + draft advances).
+
+        Optional ``emitted_rows_host`` avoids a second ``dit_decision_emitted_rows_host``
+        when the caller already materialized rows for draft + intermediate advances.
         """
         if not self._intermediate_kv_frontier_enabled():
             return
         if pivot_expansion_plan is not None and eff_bs != batch_size:
             return
-        for b, emitted in enumerate(decision.emitted_rows):
+        if before_prefix_lens_np is not None:
+
+            def prefix_len_at(row: int) -> int:
+                return int(before_prefix_lens_np[row])
+
+        elif before_prefix_lens_gpu is not None:
+            before_np = before_prefix_lens_gpu.detach().cpu().numpy().astype(
+                np.int64, copy=False
+            )
+
+            def prefix_len_at(row: int) -> int:
+                return int(before_np[row])
+
+        elif before_prefix_lens is not None:
+
+            def prefix_len_at(row: int) -> int:
+                return int(before_prefix_lens[row])
+
+        else:
+            raise ValueError(
+                "pass before_prefix_lens, before_prefix_lens_gpu, or "
+                "before_prefix_lens_np to _advance_intermediate_frontier_after_round"
+            )
+        emitted_rows = (
+            emitted_rows_host
+            if emitted_rows_host is not None
+            else dit_decision_emitted_rows_host(decision)
+        )
+        for b, emitted in enumerate(emitted_rows):
             if not emitted:
                 continue
             origin_b = (
@@ -1811,7 +1969,7 @@ class GPUModelRunner(
                 continue
             req_id = self.input_batch.req_ids[origin_b]
             self._intermediate_assert_round_prefix_budget(
-                prefix_len=before_prefix_lens[b],
+                prefix_len=prefix_len_at(b),
                 extra_accepted=len(emitted),
                 row_detail=f"round_row={b}, req_id={req_id}",
             )
@@ -1898,10 +2056,10 @@ class GPUModelRunner(
         ):
             nd = spec_decode_metadata.num_draft_tokens
             nrows = int(sampled_token_ids.shape[0])
-            if nd is not None and len(nd) == nrows:
+            if nd is not None and int(nd.shape[0]) == nrows:
                 lens = get_target_verification_accepted_draft_prefix_lens(
                     sampled_token_ids,
-                    list(nd),
+                    nd,
                     placeholder_token_id=PLACEHOLDER_TOKEN_ID,
                 )
                 for i, rid in enumerate(self.input_batch.req_ids[: len(lens)]):
@@ -2138,14 +2296,49 @@ class GPUModelRunner(
         batch_size: int,
         eff_bs: int,
         pivot_expansion_plan: PivotExpansionPlan | None,
-        before_prefix_lens: list[int],
+        before_prefix_lens: list[int] | None = None,
+        before_prefix_lens_gpu: torch.Tensor | None = None,
+        before_prefix_lens_np: np.ndarray | None = None,
+        emitted_rows_host: list[list[int]] | None = None,
     ) -> None:
-        """Advance draft working frontier after inner-round acceptance."""
+        """Advance draft working frontier after inner-round acceptance.
+
+        Pass exactly one of ``before_prefix_lens``, ``before_prefix_lens_gpu``, or
+        ``before_prefix_lens_np`` (see ``_advance_intermediate_frontier_after_round``).
+        """
         if not self._draft_kv_frontier_enabled():
             return
         if pivot_expansion_plan is not None and eff_bs != batch_size:
             return
-        for b, emitted in enumerate(decision.emitted_rows):
+        if before_prefix_lens_np is not None:
+
+            def prefix_len_at(row: int) -> int:
+                return int(before_prefix_lens_np[row])
+
+        elif before_prefix_lens_gpu is not None:
+            before_np = before_prefix_lens_gpu.detach().cpu().numpy().astype(
+                np.int64, copy=False
+            )
+
+            def prefix_len_at(row: int) -> int:
+                return int(before_np[row])
+
+        elif before_prefix_lens is not None:
+
+            def prefix_len_at(row: int) -> int:
+                return int(before_prefix_lens[row])
+
+        else:
+            raise ValueError(
+                "pass before_prefix_lens, before_prefix_lens_gpu, or "
+                "before_prefix_lens_np to _advance_draft_frontier_after_round"
+            )
+        emitted_rows = (
+            emitted_rows_host
+            if emitted_rows_host is not None
+            else dit_decision_emitted_rows_host(decision)
+        )
+        for b, emitted in enumerate(emitted_rows):
             if not emitted:
                 continue
             origin_b = (
@@ -2157,7 +2350,7 @@ class GPUModelRunner(
                 continue
             req_id = self.input_batch.req_ids[origin_b]
             self._intermediate_assert_round_prefix_budget(
-                prefix_len=before_prefix_lens[b],
+                prefix_len=prefix_len_at(b),
                 extra_accepted=len(emitted),
                 row_detail=f"draft_round_row={b}, req_id={req_id}",
             )
@@ -2172,6 +2365,148 @@ class GPUModelRunner(
             ib = self.draft_input_batch
             ib.num_computed_tokens_cpu[mir_idx] = mir.num_computed_tokens
         self.draft_input_batch.refresh_metadata()
+
+    def _hv_bump_standalone_mirror_num_computed(
+        self,
+        req_id: str,
+        n: int,
+        *,
+        requests_map: dict[str, CachedRequestState],
+        ib: InputBatch,
+    ) -> None:
+        mir = requests_map.get(req_id)
+        if mir is None:
+            return
+        mir.num_computed_tokens += n
+        mir_idx = ib.req_id_to_index.get(req_id)
+        if mir_idx is not None:
+            ib.num_computed_tokens_cpu[mir_idx] = mir.num_computed_tokens
+
+    def _hv_probs_prefix_workspace(
+        self,
+        batch_size: int,
+        cap: int,
+        vocab_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Dense ``[B, cap, V]`` prob buffer for standalone HV (realloc on shape change)."""
+        buf = self._hv_probs_prefix_buf
+        if (
+            buf is None
+            or buf.shape != (batch_size, cap, vocab_size)
+            or buf.device != device
+        ):
+            self._hv_probs_prefix_buf = torch.zeros(
+                (batch_size, cap, vocab_size),
+                dtype=torch.float32,
+                device=device,
+            )
+            return self._hv_probs_prefix_buf
+        buf.zero_()
+        return buf
+
+    def _hv_advance_standalone_hv_mirror_counts(
+        self,
+        accepted_lens_np: np.ndarray,
+        *,
+        batch_size: int,
+        skip_intermediate_refresh: bool = False,
+        skip_draft_refresh: bool = False,
+    ) -> None:
+        """Standalone HV: update mirror ``num_computed_tokens`` without per-round token lists.
+
+        ``skip_intermediate_refresh`` / ``skip_draft_refresh`` omit ``refresh_metadata`` on
+        the corresponding mirror batch. Inside ``run_hv_rounds`` we skip intermediate
+        refresh between rounds (metadata cache path) but keep draft refresh so draft
+        ``InputBatch`` sampling metadata stays consistent across HV rounds. The step
+        ends with ``_hv_sync_standalone_hv_mirror_output_tokens_from_prefix`` which
+        refreshes both batches.
+        """
+        for b in range(batch_size):
+            if b >= len(self.input_batch.req_ids):
+                break
+            n = int(accepted_lens_np[b])
+            if n <= 0:
+                continue
+            req_id = self.input_batch.req_ids[b]
+            if self._intermediate_kv_frontier_enabled():
+                ib_i = self.intermediate_input_batch
+                assert ib_i is not None
+                self._hv_bump_standalone_mirror_num_computed(
+                    req_id,
+                    n,
+                    requests_map=self.intermediate_requests,
+                    ib=ib_i,
+                )
+            if self._draft_kv_frontier_enabled():
+                ib_d = self.draft_input_batch
+                assert ib_d is not None
+                self._hv_bump_standalone_mirror_num_computed(
+                    req_id,
+                    n,
+                    requests_map=self.draft_requests,
+                    ib=ib_d,
+                )
+        if not skip_intermediate_refresh and self._intermediate_kv_frontier_enabled():
+            ib_i = self.intermediate_input_batch
+            assert ib_i is not None
+            ib_i.refresh_metadata()
+        if not skip_draft_refresh and self._draft_kv_frontier_enabled():
+            ib_d = self.draft_input_batch
+            assert ib_d is not None
+            ib_d.refresh_metadata()
+
+    def _hv_sync_standalone_hv_mirror_output_tokens_from_prefix(
+        self,
+        prefix_tokens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        *,
+        batch_size: int,
+    ) -> None:
+        """Append full accumulated HV prefix to mirror ``output_token_ids`` (one D2H)."""
+        pl = prefix_lens[:batch_size].detach().cpu().numpy().astype(
+            np.int64, copy=False
+        )
+        max_len = int(pl.max()) if pl.size else 0
+        if max_len <= 0:
+            if self._intermediate_kv_frontier_enabled():
+                ib_i = self.intermediate_input_batch
+                if ib_i is not None:
+                    ib_i.refresh_metadata()
+            if self._draft_kv_frontier_enabled():
+                ib_d = self.draft_input_batch
+                if ib_d is not None:
+                    ib_d.refresh_metadata()
+            return
+        tok_np = (
+            prefix_tokens[:batch_size, :max_len]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int32, copy=False)
+        )
+        for b in range(batch_size):
+            n = int(pl[b])
+            if n <= 0 or b >= len(self.input_batch.req_ids):
+                continue
+            req_id = self.input_batch.req_ids[b]
+            new_toks = [int(x) for x in tok_np[b, :n].tolist()]
+            if self._intermediate_kv_frontier_enabled():
+                mir = self.intermediate_requests.get(req_id)
+                if mir is not None:
+                    mir.output_token_ids.extend(new_toks)
+            if self._draft_kv_frontier_enabled():
+                mir = self.draft_requests.get(req_id)
+                if mir is not None:
+                    mir.output_token_ids.extend(new_toks)
+        if self._intermediate_kv_frontier_enabled():
+            ib_i = self.intermediate_input_batch
+            assert ib_i is not None
+            ib_i.refresh_metadata()
+        if self._draft_kv_frontier_enabled():
+            ib_d = self.draft_input_batch
+            assert ib_d is not None
+            ib_d.refresh_metadata()
 
     def _sync_draft_num_accepted_from_target(self) -> None:
         """Mirror hybrid ``num_accepted_tokens`` rows onto the draft batch."""
@@ -2229,10 +2564,10 @@ class GPUModelRunner(
         ):
             nd = spec_decode_metadata.num_draft_tokens
             nrows = int(sampled_token_ids.shape[0])
-            if nd is not None and len(nd) == nrows:
+            if nd is not None and int(nd.shape[0]) == nrows:
                 lens = get_target_verification_accepted_draft_prefix_lens(
                     sampled_token_ids,
-                    list(nd),
+                    nd,
                     placeholder_token_id=PLACEHOLDER_TOKEN_ID,
                 )
                 for i, rid in enumerate(self.input_batch.req_ids[: len(lens)]):
@@ -3872,7 +4207,9 @@ class GPUModelRunner(
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
-            num_draft_tokens=num_draft_tokens.tolist(),
+            num_draft_tokens=torch.from_numpy(
+                num_draft_tokens.astype(np.int32, copy=False)
+            ).to(self.device, non_blocking=True),
             cu_num_draft_tokens=cu_num_draft_tokens,
             cu_num_sampled_tokens=cu_num_sampled_tokens,
             target_logits_indices=target_logits_indices,
@@ -4571,7 +4908,7 @@ class GPUModelRunner(
             logger.info(
                 "PIVOT_DEBUG publish_bundle: bundle_rows=%d metadata_rows=%d",
                 len(bundle.num_draft_tokens),
-                len(spec_decode_metadata.num_draft_tokens),
+                int(spec_decode_metadata.num_draft_tokens.shape[0]),
             )
 
     def _clear_pending_pivot_hybrid_at_prepare_boundary(
@@ -4960,13 +5297,20 @@ class GPUModelRunner(
         assert ib is not None
         assert self._hv_scheduler_output is not None
         batch_size = int(proposal_tokens.shape[0])
+        row_mirrors: list[CachedRequestState | None] = []
         for b in range(batch_size):
             rid = str(self.input_batch.req_ids[b])
-            mir = self.intermediate_requests.get(rid)
-            if mir is None:
-                continue
-            toks = [int(x) for x in proposal_tokens[b].tolist()]
-            ib.update_req_spec_token_ids(mir, {rid: toks})
+            row_mirrors.append(self.intermediate_requests.get(rid))
+        draft_w = int(proposal_tokens.shape[1])
+        lens = torch.full(
+            (batch_size,),
+            draft_w,
+            dtype=torch.int32,
+            device=proposal_tokens.device,
+        )
+        ib.bulk_update_spec_token_ids_from_tensor(
+            row_mirrors, proposal_tokens, lens
+        )
         ib.refresh_metadata()
 
     @contextmanager
@@ -5060,11 +5404,15 @@ class GPUModelRunner(
                 "hierarchical_verification: missing scheduler_output snapshot "
                 "(_hv_scheduler_output); propose_draft_token_ids must wrap propose()."
             )
-        nsched = [
-            int(so.num_scheduled_tokens[str(rid)])
-            for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]
-        ]
-        nst = np.array(nsched, dtype=np.int32)
+        hv_ctx = getattr(self, "_hv_round_ctx", None)
+        if hv_ctx is not None and "nst" in hv_ctx:
+            nst = hv_ctx["nst"]
+        else:
+            nsched = [
+                int(so.num_scheduled_tokens[str(rid)])
+                for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]
+            ]
+            nst = np.array(nsched, dtype=np.int32)
         ib_draft = self.draft_input_batch
         assert ib_draft is not None
         with self._hv_suspend_cached_prev_sampled_tokens():
@@ -5094,20 +5442,49 @@ class GPUModelRunner(
                 "hierarchical_verification: prefix_rows length mismatch "
                 f"(prefix_rows={len(prefix_rows)}, batch_size={batch_size})"
             )
-        next_list = [
-            int(prefix_rows[b][-1]) if prefix_rows[b] else int(base_next_token_ids[b].item())
-            for b in range(batch_size)
-        ]
-        next_tok_tensor = torch.tensor(
-            next_list, dtype=torch.int32, device=base_next_token_ids.device
-        )
+        pt = hv_ctx.get("prefix_tokens") if isinstance(hv_ctx, dict) else None
+        pl = hv_ctx.get("prefix_lens") if isinstance(hv_ctx, dict) else None
+        if pt is not None and pl is not None and pt.shape[0] == batch_size:
+            dev = base_next_token_ids.device
+            ar = torch.arange(batch_size, device=dev, dtype=torch.int64)
+            last_idx = (pl.to(torch.int64) - 1).clamp(min=0)
+            gathered = pt[ar, last_idx].to(torch.int32)
+            empty = pl == 0
+            next_tok_tensor = torch.where(
+                empty,
+                base_next_token_ids.to(torch.int32),
+                gathered,
+            )
+        else:
+            next_list = [
+                int(prefix_rows[b][-1])
+                if prefix_rows[b]
+                else int(base_next_token_ids[b].item())
+                for b in range(batch_size)
+            ]
+            next_tok_tensor = torch.tensor(
+                next_list, dtype=torch.int32, device=base_next_token_ids.device
+            )
         target_token_ids = self.draft_step_input_ids.gpu[:total_tok].contiguous()
         target_positions = self.draft_step_positions.gpu[:total_tok].contiguous()
-        target_hidden_states = torch.zeros(
-            (total_tok, int(draft.hidden_size)),
-            dtype=draft.hidden_states.dtype,
-            device=draft.hidden_states.device,
-        )
+        hs = int(draft.hidden_size)
+        zbuf = getattr(self, "_hv_draft_zero_hidden", None)
+        need_rows = int(total_tok)
+        if (
+            zbuf is None
+            or zbuf.shape[0] < need_rows
+            or zbuf.shape[1] != hs
+            or zbuf.dtype != draft.hidden_states.dtype
+            or zbuf.device != draft.hidden_states.device
+        ):
+            grow = max(need_rows, 1024)
+            self._hv_draft_zero_hidden = torch.zeros(
+                (grow, hs),
+                dtype=draft.hidden_states.dtype,
+                device=draft.hidden_states.device,
+            )
+            zbuf = self._hv_draft_zero_hidden
+        target_hidden_states = zbuf[:need_rows]
         cad = clone_common_attn_metadata(frontier_cad)
         (
             cad,
@@ -5248,11 +5625,15 @@ class GPUModelRunner(
                 "(_hv_scheduler_output); propose_draft_token_ids must wrap propose()."
             )
         self._hv_sync_intermediate_batch_spec_tokens(proposal_tokens)
-        nsched = [
-            int(so.num_scheduled_tokens[str(rid)])
-            for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]
-        ]
-        nst = np.array(nsched, dtype=np.int32)
+        hv_ctx = getattr(self, "_hv_round_ctx", None)
+        if hv_ctx is not None and "nst" in hv_ctx:
+            nst = hv_ctx["nst"]
+        else:
+            nsched = [
+                int(so.num_scheduled_tokens[str(rid)])
+                for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]
+            ]
+            nst = np.array(nsched, dtype=np.int32)
         ib_inter = self.intermediate_input_batch
         assert ib_inter is not None
         num_reqs_hv = int(self.input_batch.num_reqs)
@@ -5262,18 +5643,47 @@ class GPUModelRunner(
                 "hierarchical_verification: proposal_tokens row count "
                 f"({prop_rows}) < batch num_reqs ({num_reqs_hv})"
             )
-        scheduled_spec_override: dict[str, list[int]] = {
-            str(self.input_batch.req_ids[b]): [
-                int(x) for x in proposal_tokens[b].tolist()
-            ]
-            for b in range(num_reqs_hv)
-        }
+
+        def _scheduled_spec_decode_tokens_override() -> dict[str, list[int]]:
+            return {
+                str(self.input_batch.req_ids[b]): [
+                    int(x) for x in proposal_tokens[b].tolist()
+                ]
+                for b in range(num_reqs_hv)
+            }
+
         with self._hv_suspend_cached_prev_sampled_tokens():
-            prep = self._prepare_intermediate_metadata(
-                so,
-                nst,
-                scheduled_spec_decode_tokens_override=scheduled_spec_override,
-            )
+            if hv_ctx is not None and hv_ctx.get("inter_prep_base") is not None:
+                prep = hv_ctx["inter_prep_base"]
+                spec_md = prep.spec_decode_metadata
+                if spec_md is not None:
+                    flat = proposal_tokens[:num_reqs_hv].reshape(-1).to(
+                        spec_md.draft_token_ids.dtype
+                    )
+                    if flat.numel() == spec_md.draft_token_ids.numel():
+                        spec_md.draft_token_ids.copy_(flat, non_blocking=True)
+                    else:
+                        prep = self._prepare_intermediate_metadata(
+                            so,
+                            nst,
+                            scheduled_spec_decode_tokens_override=_scheduled_spec_decode_tokens_override(),
+                        )
+                        hv_ctx["inter_prep_base"] = prep
+                else:
+                    prep = self._prepare_intermediate_metadata(
+                        so,
+                        nst,
+                        scheduled_spec_decode_tokens_override=_scheduled_spec_decode_tokens_override(),
+                    )
+                    hv_ctx["inter_prep_base"] = prep
+            else:
+                prep = self._prepare_intermediate_metadata(
+                    so,
+                    nst,
+                    scheduled_spec_decode_tokens_override=_scheduled_spec_decode_tokens_override(),
+                )
+                if hv_ctx is not None:
+                    hv_ctx["inter_prep_base"] = prep
         if prep is None or prep.spec_decode_metadata is None:
             detail = self._describe_frontier_prepare_blockers(
                 frontier="intermediate",
@@ -5302,20 +5712,33 @@ class GPUModelRunner(
             self.intermediate_step_input_ids.gpu[:total_tok], non_blocking=True
         )
         if num_input_tokens > total_tok:
-            pad_id = int(inter.input_ids[total_tok - 1].item())
-            inter.input_ids[total_tok:num_input_tokens].fill_(pad_id)
+            n_pad = num_input_tokens - total_tok
+            inter.input_ids[total_tok:num_input_tokens].copy_(
+                inter.input_ids[total_tok - 1 : total_tok].expand(n_pad),
+                non_blocking=True,
+            )
         inter._set_positions(
             total_tok, self.intermediate_step_positions.gpu[:total_tok]
         )
         if num_input_tokens > total_tok:
             last_pos = inter.positions[total_tok - 1]
-            inc = torch.arange(
-                1,
-                num_input_tokens - total_tok + 1,
-                device=last_pos.device,
-                dtype=last_pos.dtype,
-            )
-            inter.positions[total_tok:num_input_tokens] = last_pos + inc
+            need = num_input_tokens - total_tok
+            buf = getattr(self, "_hv_pos_inc_workspace", None)
+            if (
+                buf is None
+                or buf.device != last_pos.device
+                or buf.dtype != last_pos.dtype
+                or buf.shape[0] < need
+            ):
+                cap = max(need, 1024)
+                self._hv_pos_inc_workspace = torch.arange(
+                    1,
+                    cap + 1,
+                    device=last_pos.device,
+                    dtype=last_pos.dtype,
+                )
+                buf = self._hv_pos_inc_workspace
+            inter.positions[total_tok:num_input_tokens] = last_pos + buf[:need]
 
         per_layer_attn_metadata: dict[str, object] = {}
         attn_metadata = None
@@ -5381,6 +5804,13 @@ class GPUModelRunner(
             logits_flat=logits_flat, bonus_logits=bonus_logits
         )
 
+    def _hv_cudagraph_try_replay(self) -> bool:
+        """Placeholder for HV CUDA graph replay (per-round / full-step)."""
+        return False
+
+    def _hv_cudagraph_note_capture(self, **_kwargs) -> None:
+        """Placeholder for HV CUDA graph capture registration."""
+
     def run_hv_rounds(
         self,
         *,
@@ -5405,6 +5835,11 @@ class GPUModelRunner(
                 "pipeline-parallel rank."
             )
         self._dit_debug_step_id += 1
+        self._hv_cudagraph_note_capture(
+            phase="run_hv_rounds_enter",
+            drafter=drafter,
+            common_attn_metadata=common_attn_metadata,
+        )
         spec = self.speculative_config
         cap = int(spec.hv_max_spec_len())
         L = int(spec.num_speculative_tokens)
@@ -5421,19 +5856,51 @@ class GPUModelRunner(
             else common_attn_metadata
         )
 
-        prefix_rows: list[list[int]] = [[] for _ in range(batch_size)]
-        prefix_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
-        source_stage_rows: list[list[int]] = [[] for _ in range(batch_size)]
-        inter_verified_rows: list[int] = [0 for _ in range(batch_size)]
-        inter_accepted_rows: list[int] = [0 for _ in range(batch_size)]
+        so_hv = self._hv_scheduler_output
+        if so_hv is None:
+            raise RuntimeError(
+                "hierarchical_verification: missing scheduler_output snapshot "
+                "(_hv_scheduler_output); propose_draft_token_ids must wrap propose()."
+            )
+        nsched_list = [
+            int(so_hv.num_scheduled_tokens[str(rid)])
+            for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]
+        ]
+        self._hv_round_ctx = {
+            "nst": np.array(nsched_list, dtype=np.int32),
+            "inter_prep_base": None,
+        }
+        _hv_t0 = time.perf_counter() if os.environ.get("VLLM_HV_PROFILE", "0") == "1" else None
+
+        dev = target_token_ids.device
+        prefix_tokens = torch.full(
+            (batch_size, cap),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=dev,
+        )
+        prefix_lens = torch.zeros(batch_size, dtype=torch.int32, device=dev)
+        source_stage_2d = torch.zeros(
+            (batch_size, cap), dtype=torch.int32, device=dev
+        )
+        inter_verified_gpu = torch.zeros(batch_size, dtype=torch.int32, device=dev)
+        inter_accepted_gpu = torch.zeros(batch_size, dtype=torch.int32, device=dev)
+        hv_probs_prefix: torch.Tensor | None = (
+            self._hv_probs_prefix_workspace(batch_size, cap, vocab_size, dev)
+            if use_draft_probs
+            else None
+        )
+        dummy_prefix_rows = [[] for _ in range(batch_size)]
+        self._hv_round_ctx["prefix_tokens"] = prefix_tokens
+        self._hv_round_ctx["prefix_lens"] = prefix_lens
 
         for _ in range(n_inner):
-            before_lens = [len(r) for r in prefix_rows]
             sm_idxs = list(range(batch_size))
             round_sm = slice_sampling_metadata_for_subbatch(
                 sampling_metadata,
                 sm_idxs,
-                provisional_prefix_rows=prefix_rows,
+                provisional_prefix_tokens=prefix_tokens,
+                provisional_prefix_lens=prefix_lens,
                 sampled_ids_only=True,
             )
             proposal = drafter.propose_chunk_from_prefix(
@@ -5443,7 +5910,7 @@ class GPUModelRunner(
                 base_next_token_ids=next_token_ids,
                 base_common_attn_metadata=draft_cad,
                 base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                prefix_rows=prefix_rows,
+                prefix_rows=dummy_prefix_rows,
                 chunk_len=L,
                 sampling_metadata=round_sm,
                 use_draft_probs=use_draft_probs,
@@ -5467,34 +5934,61 @@ class GPUModelRunner(
                 vocab_size=vocab_size,
                 use_draft_probs=use_draft_probs,
             )
-            self._advance_intermediate_frontier_after_round(
-                decision,
-                batch_size=batch_size,
-                eff_bs=batch_size,
-                pivot_expansion_plan=None,
-                before_prefix_lens=before_lens,
+            acc_np = decision.accepted_lens.detach().cpu().numpy().astype(
+                np.int64, copy=False
             )
-            self._advance_draft_frontier_after_round(
-                decision,
+            self._hv_advance_standalone_hv_mirror_counts(
+                acc_np,
                 batch_size=batch_size,
-                eff_bs=batch_size,
-                pivot_expansion_plan=None,
-                before_prefix_lens=before_lens,
+                skip_intermediate_refresh=True,
+                skip_draft_refresh=False,
             )
-            for b in range(batch_size):
-                inter_verified_rows[b] += L
-                inter_accepted_rows[b] += len(decision.emitted_rows[b])
-            for b, emitted in enumerate(decision.emitted_rows):
-                prefix_rows[b].extend(emitted)
-                source_stage_rows[b].extend([0] * len(emitted))
-                if use_draft_probs:
-                    prefix_prob_rows[b].extend(decision.emitted_prob_rows[b])
+            inter_verified_gpu += int(L)
+            inter_accepted_gpu.add_(
+                decision.accepted_lens.to(inter_accepted_gpu.dtype)
+            )
+            if (
+                hv_probs_prefix is not None
+                and decision.emitted_probs_flat is not None
+                and decision.emitted_probs_cu is not None
+                and decision.emitted_probs_flat.numel() > 0
+            ):
+                _hv_scatter_emitted_probs_into_prefix(
+                    probs_prefix=hv_probs_prefix,
+                    emitted_probs_flat=decision.emitted_probs_flat,
+                    emitted_probs_cu=decision.emitted_probs_cu,
+                    prefix_lens_before=prefix_lens,
+                    accepted_lens=decision.accepted_lens,
+                    max_w=int(decision.emitted_tokens.shape[1]),
+                )
+            _hv_scatter_emitted_into_prefix(
+                prefix_tokens=prefix_tokens,
+                source_stage_2d=source_stage_2d,
+                prefix_lens=prefix_lens,
+                emitted=decision.emitted_tokens,
+                accepted_lens=decision.accepted_lens.to(torch.int32),
+                stage_id=0,
+            )
+            prefix_lens.add_(decision.accepted_lens.to(prefix_lens.dtype))
+            if self._is_dit_debug_enabled():
+                self._dit_debug_assert(
+                    bool((prefix_lens <= cap).all().item()),
+                    "hv_standalone_prefix_lens_within_cap",
+                    detail=(
+                        f"cap={cap}, max_prefix={int(prefix_lens.max().item())}, "
+                        f"device={prefix_lens.device}"
+                    ),
+                )
+
+        probs_prefix_lens: torch.Tensor | None = (
+            prefix_lens.clone() if hv_probs_prefix is not None else None
+        )
 
         tail_len = L
-        remaining_cap_per_row = [
-            max(0, cap - len(prefix_rows[b])) for b in range(batch_size)
-        ]
         if self._is_dit_debug_enabled():
+            remaining_cap_per_row = (
+                torch.full_like(prefix_lens, cap) - prefix_lens
+            ).clamp(min=0).cpu().tolist()
             _tail_chk = validate_hierarchical_verification_tail_len_rowwise(
                 tail_len=tail_len,
                 interval_tokens=L,
@@ -5508,7 +6002,8 @@ class GPUModelRunner(
         tail_sm = slice_sampling_metadata_for_subbatch(
             sampling_metadata,
             list(range(batch_size)),
-            provisional_prefix_rows=prefix_rows,
+            provisional_prefix_tokens=prefix_tokens,
+            provisional_prefix_lens=prefix_lens,
             sampled_ids_only=True,
         )
         tail = drafter.propose_chunk_from_prefix(
@@ -5518,7 +6013,7 @@ class GPUModelRunner(
             base_next_token_ids=next_token_ids,
             base_common_attn_metadata=draft_cad,
             base_num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-            prefix_rows=prefix_rows,
+            prefix_rows=dummy_prefix_rows,
             chunk_len=tail_len,
             sampling_metadata=tail_sm,
             use_draft_probs=use_draft_probs,
@@ -5528,47 +6023,57 @@ class GPUModelRunner(
                 "hierarchical_verification tail expects full batch "
                 f"{batch_size}, got {int(tail.tokens.shape[0])}"
             )
-        tail_rows = [
-            [int(tok) for tok in tail.tokens[b].tolist()] for b in range(batch_size)
-        ]
-        tail_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
-        if use_draft_probs and tail.probs is not None:
-            for b in range(batch_size):
-                tail_prob_rows[b] = [tail.probs[b, j] for j in range(tail_len)]
-        for b in range(batch_size):
-            prefix_rows[b].extend(tail_rows[b])
-            source_stage_rows[b].extend([1] * len(tail_rows[b]))
-            if use_draft_probs:
-                prefix_prob_rows[b].extend(tail_prob_rows[b])
+        tail_accept = torch.full(
+            (batch_size,), tail_len, dtype=torch.int32, device=dev
+        )
+        if hv_probs_prefix is not None and tail.probs is not None:
+            _hv_scatter_tail_probs_into_prefix(
+                hv_probs_prefix,
+                tail.probs,
+                prefix_lens,
+                tail_len=tail_len,
+                cap=cap,
+            )
+        _hv_scatter_emitted_into_prefix(
+            prefix_tokens=prefix_tokens,
+            source_stage_2d=source_stage_2d,
+            prefix_lens=prefix_lens,
+            emitted=tail.tokens.to(torch.int32),
+            accepted_lens=tail_accept,
+            stage_id=1,
+        )
+        prefix_lens.add_(
+            torch.full((batch_size,), tail_len, dtype=prefix_lens.dtype, device=dev)
+        )
+        tail_acc_np = np.full((batch_size,), tail_len, dtype=np.int64)
+        self._hv_advance_standalone_hv_mirror_counts(
+            tail_acc_np,
+            batch_size=batch_size,
+            skip_intermediate_refresh=True,
+            skip_draft_refresh=False,
+        )
+        if self._is_dit_debug_enabled():
+            self._dit_debug_assert(
+                bool((prefix_lens <= cap).all().item()),
+                "hv_standalone_prefix_lens_within_cap_after_tail",
+                detail=f"cap={cap}, max_prefix={int(prefix_lens.max().item())}",
+            )
+        self._hv_sync_standalone_hv_mirror_output_tokens_from_prefix(
+            prefix_tokens, prefix_lens, batch_size=batch_size
+        )
 
-        dev = target_token_ids.device
-        out_exp = torch.full(
-            (batch_size, cap),
-            PLACEHOLDER_TOKEN_ID,
-            dtype=torch.int32,
-            device=dev,
-        )
-        source_stage_2d = torch.zeros(
-            (batch_size, cap), dtype=torch.int32, device=dev
-        )
-        for b in range(batch_size):
-            valid = min(cap, len(prefix_rows[b]))
-            if valid > 0:
-                out_exp[b, :valid] = torch.tensor(
-                    prefix_rows[b][:valid],
-                    dtype=torch.int32,
-                    device=dev,
-                )
-                source_stage_2d[b, :valid] = torch.tensor(
-                    source_stage_rows[b][:valid],
-                    dtype=torch.int32,
-                    device=dev,
-                )
+        out_exp = prefix_tokens
         draft_probs_flat = (
-            _flatten_prob_rows_for_output(prefix_prob_rows, out_exp)
-            if use_draft_probs
+            _hv_extract_prefix_probs_flat(
+                hv_probs_prefix,
+                probs_prefix_lens,
+                batch_size=batch_size,
+            )
+            if hv_probs_prefix is not None and probs_prefix_lens is not None
             else None
         )
+        inter_verified_rows = inter_verified_gpu.detach().cpu().tolist()
+        inter_accepted_rows = inter_accepted_gpu.detach().cpu().tolist()
         row_req_ids = _hybrid_bundle_row_req_ids_for_batch(
             self.input_batch,
             origin_batch_size=batch_size,
@@ -5591,6 +6096,15 @@ class GPUModelRunner(
         out = _collapse_draft_tensor_rows_for_scheduler(
             out_exp, None, batch_size
         )
+        self._hv_round_ctx = None
+        if _hv_t0 is not None:
+            logger.info(
+                "HV_PROFILE run_hv_rounds_ms=%.3f B=%d L=%d R=%d",
+                (time.perf_counter() - _hv_t0) * 1000.0,
+                batch_size,
+                L,
+                n_inner,
+            )
         return out, bundle
 
     def run_hierarchical_verification_rounds(
@@ -5977,21 +6491,28 @@ class GPUModelRunner(
             )
             _hv_prof.end_stage("reject_sample",
                                invocation_idx=round_idx)
+            emitted_host = dit_decision_emitted_rows_host(decision)
+            prob_host = (
+                dit_decision_emitted_prob_rows_host(decision)
+                if use_draft_probs
+                else None
+            )
+            acc_cpu = decision.accepted_lens.detach().cpu().tolist()
             for b in range(eff_bs):
                 if not self._pivot_profile_row_is_active(pivot_expansion_plan, b):
                     continue
                 inter_verified_rows[b] += int(L)
-                inter_accepted_rows[b] += len(decision.emitted_rows[b])
+                inter_accepted_rows[b] += int(acc_cpu[b])
             before_lens = [len(r) for r in prefix_rows]
-            for b, emitted in enumerate(decision.emitted_rows):
+            for b, emitted in enumerate(emitted_host):
                 prefix_rows[b].extend(emitted)
                 source_stage_rows[b].extend([0] * len(emitted))
-                if use_draft_probs:
-                    prefix_prob_rows[b].extend(decision.emitted_prob_rows[b])
+                if use_draft_probs and prob_host is not None:
+                    prefix_prob_rows[b].extend(prob_host[b])
             after_lens = [len(r) for r in prefix_rows]
             self._dit_debug_assert(
                 all(
-                    after_lens[b] - before_lens[b] == len(decision.emitted_rows[b])
+                    after_lens[b] - before_lens[b] == len(emitted_host[b])
                     for b in range(eff_bs)
                 ),
                 "check_hv_round_prefix_growth",
@@ -6008,7 +6529,7 @@ class GPUModelRunner(
                 self._dit_debug_assert(
                     all(
                         len(prefix_prob_rows[b]) == len(prefix_rows[b])
-                        and len(decision.emitted_prob_rows[b]) == len(decision.emitted_rows[b])
+                        and len(prob_host[b]) == len(emitted_host[b])
                         for b in range(eff_bs)
                     ),
                     "check_hv_probs_and_stage_alignment",
@@ -6027,12 +6548,14 @@ class GPUModelRunner(
                     old_state=inter_state,
                 )
             elif self._intermediate_kv_frontier_enabled():
+                before_lens_np = np.asarray(before_lens, dtype=np.int64)
                 self._advance_intermediate_frontier_after_round(
                     decision,
                     batch_size=batch_size,
                     eff_bs=eff_bs,
                     pivot_expansion_plan=pivot_expansion_plan,
-                    before_prefix_lens=before_lens,
+                    before_prefix_lens_np=before_lens_np,
+                    emitted_rows_host=emitted_host,
                 )
 
         expected_rounds = (
@@ -6327,7 +6850,7 @@ class GPUModelRunner(
         self, meta: SpecDecodeMetadata
     ) -> list[str]:
         """Request id per ``meta.num_draft_tokens`` row (matches prepare-time layout)."""
-        n = len(meta.num_draft_tokens)
+        n = int(meta.num_draft_tokens.shape[0])
         plan = meta.expansion_plan
         if plan is not None and plan.packed_sm_origin is not None:
             sm = plan.packed_sm_origin
@@ -6449,7 +6972,7 @@ class GPUModelRunner(
                     logger.info(
                         "PIVOT_DEBUG sample: metadata_rows=%d bundle_rows=%d "
                         "bundle_req_ids=%s detail=%s",
-                        len(spec_decode_metadata.num_draft_tokens),
+                        int(spec_decode_metadata.num_draft_tokens.shape[0]),
                         len(bundle.num_draft_tokens),
                         bundle.bundle_row_req_ids,
                         remap_info,
@@ -6479,7 +7002,7 @@ class GPUModelRunner(
                     logger.info(
                         "PIVOT_DEBUG sample: metadata_rows=%d bundle_rows=%d "
                         "bundle_req_ids=%s detail=%s",
-                        len(spec_decode_metadata.num_draft_tokens),
+                        int(spec_decode_metadata.num_draft_tokens.shape[0]),
                         len(bundle.num_draft_tokens),
                         bundle.bundle_row_req_ids,
                         "sanitize_validate_failed",
@@ -6501,7 +7024,7 @@ class GPUModelRunner(
                 plan is not None
                 and plan.expanded_batch_size > 0
                 and len(plan.expanded_to_origin) == plan.expanded_batch_size
-                and len(spec_decode_metadata.num_draft_tokens)
+                and int(spec_decode_metadata.num_draft_tokens.shape[0])
                 == plan.expanded_batch_size
             ):
                 verity_sm = slice_sampling_metadata_for_subbatch(
@@ -6542,7 +7065,7 @@ class GPUModelRunner(
             and spec_decode_metadata is not None
             and (tree_plan is not None or expansion_plan is not None)
             and num_draft_for_collapse is not None
-            and len(num_draft_for_collapse)
+            and int(num_draft_for_collapse.shape[0])
             == int(sampler_output.sampled_token_ids.shape[0])
         )
         pre_collapse_accept_mean: float | None = None
@@ -6559,7 +7082,7 @@ class GPUModelRunner(
         if expansion_plan is not None:
             if (
                 num_draft_for_collapse is not None
-                and len(num_draft_for_collapse)
+                and int(num_draft_for_collapse.shape[0])
                 == int(sampler_output.sampled_token_ids.shape[0])
             ):
                 pre_collapse_accept_lens = (
@@ -6803,7 +7326,7 @@ class GPUModelRunner(
             verity_sm,
         )
         cu_cpu = spec_decode_metadata.cu_num_draft_tokens.detach().cpu()
-        num_draft = spec_decode_metadata.num_draft_tokens
+        num_draft = spec_decode_metadata.num_draft_tokens.detach().cpu().tolist()
         row_req_ids = self._spec_decode_metadata_row_req_ids(spec_decode_metadata)
         first_rows: list[int] = []
         first_rids: list[str] = []
@@ -8375,7 +8898,8 @@ class GPUModelRunner(
                     "No spec decode metadata for medusa"
                 )
                 for num_draft, tokens in zip(
-                    spec_decode_metadata.num_draft_tokens, sampled_token_ids
+                    spec_decode_metadata.num_draft_tokens.detach().cpu().tolist(),
+                    sampled_token_ids,
                 ):
                     indices.append(offset + len(tokens) - 1)
                     offset += num_draft + 1
@@ -8494,7 +9018,7 @@ class GPUModelRunner(
                     common_attn_metadata, token_indices = self.drafter.prepare_inputs(
                         common_attn_metadata,
                         sampled_token_ids,
-                        spec_decode_metadata.num_draft_tokens,
+                        spec_decode_metadata.num_draft_tokens.detach().cpu().tolist(),
                     )
                     target_token_ids = self.input_ids.gpu[token_indices]
                     target_positions = self._get_positions(token_indices)

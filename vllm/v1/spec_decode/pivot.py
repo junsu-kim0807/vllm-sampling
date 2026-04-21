@@ -60,6 +60,7 @@ from vllm.v1.spec_decode.spec_stage_runtime import (
     PivotExpansionPlan,
     PivotTreeFamily,
     RootTopKInfo,
+    dit_round_decision_from_legacy_rows,
 )
 from vllm.v1.spec_decode.staged_delegate_factory import (
     PivotStagedDelegates,
@@ -2230,16 +2231,16 @@ class PivotProposer:
             )
         draft_flat = proposal.tokens.reshape(-1).to(torch.int32)
         if proposal.tree_plan is not None:
-            num_draft_tokens = [
+            num_draft_tokens_list = [
                 int(end - start) for (start, end) in proposal.tree_plan.family_flat_spans
             ]
-            batch_size = len(num_draft_tokens)
+            batch_size = len(num_draft_tokens_list)
         else:
-            num_draft_tokens = [chunk_len] * batch_size
-        cu_num_draft_tokens = torch.cumsum(
-            torch.tensor(num_draft_tokens, dtype=torch.int32, device=draft_flat.device),
-            dim=0,
-        ).to(torch.int32)
+            num_draft_tokens_list = [chunk_len] * batch_size
+        num_draft_tokens = torch.tensor(
+            num_draft_tokens_list, dtype=torch.int32, device=draft_flat.device
+        )
+        cu_num_draft_tokens = torch.cumsum(num_draft_tokens, dim=0).to(torch.int32)
         draft_probs_flat = (
             proposal.probs.reshape(-1, vocab_size) if proposal.probs is not None else None
         )
@@ -2249,7 +2250,7 @@ class PivotProposer:
             draft_probs_flat=draft_probs_flat,
             num_draft_tokens=num_draft_tokens,
             cu_num_draft_tokens=cu_num_draft_tokens,
-            max_spec_len=max(num_draft_tokens) if num_draft_tokens else chunk_len,
+            max_spec_len=max(num_draft_tokens_list) if num_draft_tokens_list else chunk_len,
             verifier_logits_flat=verification.logits_flat,
             bonus_logits=verification.bonus_logits,
             sampling_metadata=sampling_metadata,
@@ -2267,7 +2268,7 @@ class PivotProposer:
                     emitted_prob_rows[b].append(bonus_probs[b].to(torch.float32))
         accepted_lens = get_target_verification_accepted_draft_prefix_lens(
             stage_out.sampled_token_ids,
-            num_draft_tokens,
+            num_draft_tokens_list,
             placeholder_token_id=PLACEHOLDER_TOKEN_ID,
         )
         if _spechive_debug_enabled() and batch_size > 0:
@@ -2288,16 +2289,17 @@ class PivotProposer:
             reduced = collapse_family_tree_sampled_to_family_paths(
                 stage_out.sampled_token_ids,
                 plan=proposal.tree_plan,
-                num_draft_tokens=num_draft_tokens,
+                num_draft_tokens=num_draft_tokens_list,
             )
             emitted_rows = reduced.accepted_rows
             accepted_lens = reduced.accepted_lens
             # Tree-mode stochastic per-node proposal probs are not lossless yet.
             emitted_prob_rows = [[] for _ in range(len(emitted_rows))]
-        return DitRoundDecision(
-            emitted_rows=emitted_rows,
+        return dit_round_decision_from_legacy_rows(
+            emitted_rows,
+            accepted_lens,
+            device=draft_flat.device,
             emitted_prob_rows=emitted_prob_rows,
-            accepted_lens=accepted_lens,
         )
 
     def propose(

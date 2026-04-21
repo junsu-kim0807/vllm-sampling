@@ -26,13 +26,13 @@ def test_hv_max_spec_len_and_runner_widths() -> None:
     assert s.hv_chunk_len() == 4
     assert s.hv_max_spec_len() == 2 * (4 + 1) + 4
     assert s.runner_num_speculative_tokens() == s.hv_max_spec_len()
-    assert s.runner_num_partial_speculative_tokens() == 2 * 4
+    assert s.runner_num_partial_speculative_tokens() == s.hv_max_spec_len()
 
 
 def test_hv_r1_l4() -> None:
     s = _hv_spec(L=4, R=1)
     assert s.hv_max_spec_len() == 1 * (4 + 1) + 4
-    assert s.runner_num_partial_speculative_tokens() == 4
+    assert s.runner_num_partial_speculative_tokens() == s.hv_max_spec_len()
 
 
 def test_uses_draft_model_and_model_based() -> None:

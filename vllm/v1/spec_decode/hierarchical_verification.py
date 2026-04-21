@@ -13,7 +13,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.adaptive_cascade import (
     IntermediateDraftModelProposer,
-    _collect_emitted_probs_from_sampled,
+    _collect_emitted_probs_from_sampled_gpu,
     _vllm_as_plain_draft,
     _vllm_hierarchical_verification_chunk,
 )
@@ -38,17 +38,16 @@ def hv_run_inter_verification_acceptance(
     batch_size = int(proposal.tokens.shape[0])
     chunk_len = int(proposal.tokens.shape[1])
     draft_flat = proposal.tokens.reshape(-1).to(torch.int32)
-    num_draft_tokens = [chunk_len] * batch_size
-    cu_num_draft_tokens = torch.cumsum(
-        torch.tensor(num_draft_tokens, dtype=torch.int32, device=draft_flat.device),
-        dim=0,
-    ).to(torch.int32)
+    num_draft_tokens = torch.full(
+        (batch_size,), chunk_len, dtype=torch.int32, device=draft_flat.device
+    )
+    cu_num_draft_tokens = torch.cumsum(num_draft_tokens, dim=0).to(torch.int32)
     draft_probs_flat = (
         proposal.probs.reshape(-1, vocab_size)
         if proposal.probs is not None
         else None
     )
-    emitted_rows, stage_out, target_probs_flat, bonus_probs = run_verify_stage(
+    _, stage_out, target_probs_flat, bonus_probs = run_verify_stage(
         rejection_sampler,
         draft_token_ids_flat=draft_flat,
         draft_probs_flat=draft_probs_flat,
@@ -61,19 +60,27 @@ def hv_run_inter_verification_acceptance(
         vocab_size=vocab_size,
         include_processed_probs=use_draft_probs,
     )
-    emitted_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+    sampled = stage_out.sampled_token_ids
+    valid = sampled.ne(PLACEHOLDER_TOKEN_ID).to(torch.int32)
+    prefix_valid = torch.cumprod(valid, dim=1)
+    accepted_lens = prefix_valid.sum(dim=1).to(torch.int32)
+    emitted_tokens = sampled.to(torch.int32).contiguous()
+    probs_flat: torch.Tensor | None = None
+    probs_cu: torch.Tensor | None = None
     if use_draft_probs and target_probs_flat.numel() > 0:
         per_req_probs = target_probs_flat.view(batch_size, chunk_len, vocab_size)
-        emitted_prob_rows = _collect_emitted_probs_from_sampled(
-            stage_out.sampled_token_ids,
+        probs_flat, probs_cu = _collect_emitted_probs_from_sampled_gpu(
+            sampled,
             per_req_probs,
             bonus_probs,
-            vocab_size=vocab_size,
+            accepted_lens,
+            pad_id=PLACEHOLDER_TOKEN_ID,
         )
     return DitRoundDecision(
-        emitted_rows=emitted_rows,
-        emitted_prob_rows=emitted_prob_rows,
-        accepted_lens=[len(r) for r in emitted_rows],
+        emitted_tokens=emitted_tokens,
+        accepted_lens=accepted_lens,
+        emitted_probs_flat=probs_flat,
+        emitted_probs_cu=probs_cu,
     )
 
 

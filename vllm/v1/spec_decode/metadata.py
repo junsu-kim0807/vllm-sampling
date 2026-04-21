@@ -12,8 +12,8 @@ from vllm.v1.spec_decode.spec_stage_runtime import PivotExpansionPlan
 class SpecDecodeMetadata:
     # [num_tokens]
     draft_token_ids: torch.Tensor
-    # [batch_size]
-    num_draft_tokens: list[int]
+    # [batch_size] int32 on draft_token_ids.device — counts per row.
+    num_draft_tokens: torch.Tensor
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor
     # [batch_size]
@@ -31,7 +31,9 @@ class SpecDecodeMetadata:
     expansion_plan: PivotExpansionPlan | None = None
 
     def __post_init__(self):
-        self.max_spec_len = max(self.num_draft_tokens)
+        assert isinstance(self.num_draft_tokens, torch.Tensor)
+        assert self.num_draft_tokens.ndim == 1
+        self.max_spec_len = int(self.num_draft_tokens.max().detach().cpu())
 
     @classmethod
     def make_dummy(
@@ -64,7 +66,9 @@ class SpecDecodeMetadata:
         )
         return cls(
             draft_token_ids=draft_token_ids_tensor,
-            num_draft_tokens=num_draft_tokens,
+            num_draft_tokens=torch.tensor(
+                num_draft_tokens, dtype=torch.int32, device=device
+            ),
             cu_num_draft_tokens=cu_num_draft_tokens_tensor,
             cu_num_sampled_tokens=cu_num_sampled_tokens_tensor,
             target_logits_indices=target_logits_indices,

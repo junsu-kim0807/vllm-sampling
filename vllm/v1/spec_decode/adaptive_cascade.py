@@ -716,6 +716,44 @@ def _collect_emitted_probs_from_sampled(
     return out
 
 
+def _collect_emitted_probs_from_sampled_gpu(
+    sampled_token_ids: torch.Tensor,
+    per_req_probs: torch.Tensor,
+    bonus_probs: torch.Tensor,
+    accepted_lens: torch.Tensor,
+    *,
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GPU-only emitted probs: flat [sum_lens, V] and cu [B+1] (int64 cumsum, cast cu)."""
+    bsz, _, _lp1 = sampled_token_ids.shape
+    _b, L, v = per_req_probs.shape
+    device = per_req_probs.device
+    a = accepted_lens.to(torch.int64)
+    a_cap_l = torch.minimum(a, torch.full_like(a, L))
+    has_bonus = a == (L + 1)
+    ar = torch.arange(L, device=device).unsqueeze(0)
+    draft_mask = ar < a_cap_l.unsqueeze(1)
+    cu = torch.zeros(bsz + 1, dtype=torch.int64, device=device)
+    cu[1:] = torch.cumsum(a, dim=0)
+    total = int(cu[-1].item())
+    if total == 0:
+        z = per_req_probs.new_empty((0, v))
+        return z, torch.zeros(bsz + 1, dtype=torch.int32, device=device)
+    out = torch.empty((total, v), dtype=per_req_probs.dtype, device=device)
+    draft_sel = per_req_probs[draft_mask]
+    row_ids = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, L)
+    pos_in_row = ar.expand(bsz, L)
+    flat_row = row_ids[draft_mask]
+    flat_pos = pos_in_row[draft_mask]
+    dst_idx = cu[flat_row] + flat_pos.to(torch.int64)
+    out.index_copy_(0, dst_idx, draft_sel)
+    bonus_rows = torch.nonzero(has_bonus, as_tuple=False).view(-1)
+    if bonus_rows.numel() > 0:
+        bonus_dst = cu[bonus_rows] + L
+        out.index_copy_(0, bonus_dst, bonus_probs[bonus_rows])
+    return out, cu.to(torch.int32)
+
+
 class AdaptiveSpechiveProposer:
     """Routes to draft-model proposers for spechive stages."""
 
@@ -1150,19 +1188,16 @@ class AdaptiveSpechiveProposer:
         batch_size = int(proposal.tokens.shape[0])
         chunk_len = int(proposal.tokens.shape[1])
         draft_flat = proposal.tokens.reshape(-1).to(torch.int32)
-        num_draft_tokens = [chunk_len] * batch_size
-        cu_num_draft_tokens = torch.cumsum(
-            torch.tensor(
-                num_draft_tokens, dtype=torch.int32, device=draft_flat.device
-            ),
-            dim=0,
-        ).to(torch.int32)
+        num_draft_tokens = torch.full(
+            (batch_size,), chunk_len, dtype=torch.int32, device=draft_flat.device
+        )
+        cu_num_draft_tokens = torch.cumsum(num_draft_tokens, dim=0).to(torch.int32)
         draft_probs_flat = (
             proposal.probs.reshape(-1, vocab_size)
             if proposal.probs is not None
             else None
         )
-        emitted_rows, stage_out, target_probs_flat, bonus_probs = run_verify_stage(
+        _rows, stage_out, target_probs_flat, bonus_probs = run_verify_stage(
             rejection_sampler,
             draft_token_ids_flat=draft_flat,
             draft_probs_flat=draft_probs_flat,
@@ -1175,21 +1210,27 @@ class AdaptiveSpechiveProposer:
             vocab_size=vocab_size,
             include_processed_probs=use_draft_probs,
         )
-
-        emitted_prob_rows: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+        sampled = stage_out.sampled_token_ids
+        valid = sampled.ne(PLACEHOLDER_TOKEN_ID).to(torch.int32)
+        prefix_valid = torch.cumprod(valid, dim=1)
+        accepted_lens = prefix_valid.sum(dim=1).to(torch.int32)
+        emitted_tokens = sampled.to(torch.int32).contiguous()
+        probs_flat: torch.Tensor | None = None
+        probs_cu: torch.Tensor | None = None
         if use_draft_probs and target_probs_flat.numel() > 0:
             per_req_probs = target_probs_flat.view(batch_size, chunk_len, vocab_size)
-            emitted_prob_rows = _collect_emitted_probs_from_sampled(
-                stage_out.sampled_token_ids,
+            probs_flat, probs_cu = _collect_emitted_probs_from_sampled_gpu(
+                sampled,
                 per_req_probs,
                 bonus_probs,
-                vocab_size=vocab_size,
+                accepted_lens,
+                pad_id=PLACEHOLDER_TOKEN_ID,
             )
-
         return DitRoundDecision(
-            emitted_rows=emitted_rows,
-            emitted_prob_rows=emitted_prob_rows,
-            accepted_lens=[len(r) for r in emitted_rows],
+            emitted_tokens=emitted_tokens,
+            accepted_lens=accepted_lens,
+            emitted_probs_flat=probs_flat,
+            emitted_probs_cu=probs_cu,
         )
 
     def take_pending_spechive_bundle(self) -> HybridProposalBundle | None:

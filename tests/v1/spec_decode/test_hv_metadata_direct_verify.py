@@ -158,7 +158,9 @@ def test_legacy_hv_slice_matches_spec_decode_gather_indices() -> None:
         bonus_rows.append(start + prefix_lens[b] + chunk_len)
     meta = SpecDecodeMetadata(
         draft_token_ids=torch.zeros(bsz * chunk_len, dtype=torch.int32, device=device),
-        num_draft_tokens=[chunk_len] * bsz,
+        num_draft_tokens=torch.full(
+            (bsz,), chunk_len, dtype=torch.int32, device=device
+        ),
         cu_num_draft_tokens=torch.tensor(
             [chunk_len, chunk_len * 2], dtype=torch.int32, device=device
         ),

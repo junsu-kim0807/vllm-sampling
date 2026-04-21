@@ -12,6 +12,9 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
+from vllm.v1.spec_decode.spec_stage_utils import (
+    materialize_spec_token_ids_from_prefix_tensors,
+)
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
 _SAMPLING_EPS = 1e-5
@@ -276,11 +279,21 @@ class Sampler(nn.Module):
 
         output_token_ids = sampling_metadata.output_token_ids
         if predict_bonus_token and any_penalties_or_bad_words:
+            spec_for_combine = sampling_metadata.spec_token_ids
+            if (
+                spec_for_combine is None
+                and sampling_metadata.spec_prefix_tokens is not None
+                and sampling_metadata.spec_prefix_lens is not None
+            ):
+                spec_for_combine = materialize_spec_token_ids_from_prefix_tensors(
+                    sampling_metadata.spec_prefix_tokens,
+                    sampling_metadata.spec_prefix_lens,
+                )
             # Combine base outputs with spec tokens when speculative decoding
             # is enabled.
             output_token_ids = self._combine_outputs_with_spec_tokens(
                 output_token_ids,
-                sampling_metadata.spec_token_ids,
+                spec_for_combine,
             )
 
         # Apply allowed token ids.

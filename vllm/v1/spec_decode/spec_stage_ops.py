@@ -55,11 +55,15 @@ def get_accepted_draft_lens_from_sampled_tokens(
 
 def get_target_verification_accepted_draft_prefix_lens(
     sampled_token_ids: torch.Tensor,
-    num_draft_tokens: list[int],
+    num_draft_tokens: list[int] | torch.Tensor,
     *,
     placeholder_token_id: int,
 ) -> list[int]:
     """Accepted draft-prefix length per row, ignoring bonus/recovery past num_draft."""
+    if isinstance(num_draft_tokens, torch.Tensor):
+        num_draft_tokens = [
+            int(x) for x in num_draft_tokens.detach().cpu().tolist()
+        ]
     out: list[int] = []
     for r, n_draft in enumerate(num_draft_tokens):
         row = sampled_token_ids[r]
@@ -201,7 +205,7 @@ def collapse_family_tree_sampled_to_family_paths(
     sampled_token_ids: torch.Tensor,
     *,
     plan: PivotExpandedTreePlan,
-    num_draft_tokens: list[int] | None = None,
+    num_draft_tokens: list[int] | torch.Tensor | None = None,
 ) -> FamilyTreeReduceResult:
     """Interpret flat verifier outputs back into per-family tree-path semantics."""
     num_families = len(plan.families)
@@ -219,7 +223,14 @@ def collapse_family_tree_sampled_to_family_paths(
             chosen_leaf_ids=[],
             recovery_token_ids=[],
         )
-    if num_draft_tokens is None or len(num_draft_tokens) != num_families:
+    nd_len = (
+        len(num_draft_tokens)
+        if isinstance(num_draft_tokens, list)
+        else int(num_draft_tokens.shape[0])
+        if num_draft_tokens is not None
+        else 0
+    )
+    if num_draft_tokens is None or nd_len != num_families:
         num_draft_tokens = [int(plan.template.num_nodes)] * num_families
     accepted_lens = get_target_verification_accepted_draft_prefix_lens(
         sampled_token_ids[:num_families],
@@ -327,7 +338,7 @@ def select_pivot_expanded_rows_to_origin(
     sampled_token_ids: torch.Tensor,
     expansion_plan: PivotExpansionPlan,
     *,
-    num_draft_tokens: list[int] | None = None,
+    num_draft_tokens: list[int] | torch.Tensor | None = None,
 ) -> list[int]:
     """Select one expanded row per origin using collapse tie-break rules.
 
@@ -340,10 +351,14 @@ def select_pivot_expanded_rows_to_origin(
         return list(range(int(sampled_token_ids.shape[0])))
     if not expansion_plan.expanded_to_origin:
         return list(range(int(sampled_token_ids.shape[0])))
-    if (
-        num_draft_tokens is not None
-        and len(num_draft_tokens) == expansion_plan.expanded_batch_size
-    ):
+    nd_sz = (
+        len(num_draft_tokens)
+        if isinstance(num_draft_tokens, list)
+        else int(num_draft_tokens.shape[0])
+        if num_draft_tokens is not None
+        else 0
+    )
+    if num_draft_tokens is not None and nd_sz == expansion_plan.expanded_batch_size:
         accepted_lens = get_target_verification_accepted_draft_prefix_lens(
             sampled_token_ids,
             num_draft_tokens,
@@ -498,7 +513,7 @@ def collapse_pivot_expanded_sampled_to_origin(
     sampled_token_ids: torch.Tensor,
     expansion_plan: PivotExpansionPlan,
     *,
-    num_draft_tokens: list[int] | None = None,
+    num_draft_tokens: list[int] | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Map expanded verification rows (P) back to one row per origin request (B).
 
@@ -887,7 +902,7 @@ def run_verify_stage(
     *,
     draft_token_ids_flat: torch.Tensor,
     draft_probs_flat: torch.Tensor | None,
-    num_draft_tokens: list[int],
+    num_draft_tokens: torch.Tensor,
     cu_num_draft_tokens: torch.Tensor,
     max_spec_len: int,
     verifier_logits_flat: torch.Tensor,
@@ -897,9 +912,10 @@ def run_verify_stage(
     include_processed_probs: bool = False,
 ) -> tuple[list[list[int]], SamplerOutput, torch.Tensor, torch.Tensor]:
     """Run local verification via processed RejectionSampler.forward path."""
-    batch_size = len(num_draft_tokens)
+    batch_size = int(num_draft_tokens.shape[0])
     num_tokens = int(draft_token_ids_flat.shape[0])
     device = draft_token_ids_flat.device
+    num_draft_tokens_i32 = num_draft_tokens.to(device=device, dtype=torch.int32)
 
     logits = torch.cat([verifier_logits_flat, bonus_logits], dim=0)
     target_logits_indices = torch.arange(num_tokens, dtype=torch.int32, device=device)
@@ -910,14 +926,11 @@ def run_verify_stage(
         num_tokens + batch_size, dtype=torch.int32, device=device
     )
     cu_num_sampled_tokens = torch.cumsum(
-        torch.tensor(
-            [n + 1 for n in num_draft_tokens], dtype=torch.int32, device=device
-        ),
-        dim=0,
+        num_draft_tokens_i32.to(torch.int32) + 1, dim=0
     ).to(torch.int32)
     metadata = SpecDecodeMetadata(
         draft_token_ids=draft_token_ids_flat,
-        num_draft_tokens=num_draft_tokens,
+        num_draft_tokens=num_draft_tokens_i32,
         cu_num_draft_tokens=cu_num_draft_tokens,
         cu_num_sampled_tokens=cu_num_sampled_tokens,
         target_logits_indices=target_logits_indices,
@@ -1154,7 +1167,7 @@ def remap_hybrid_bundle_rows_for_metadata(
     if subset:
         out = replace(out, tree_plan=None)
         meta = spec_decode_metadata
-        if meta is not None and len(meta.num_draft_tokens) == n:
+        if meta is not None and int(meta.num_draft_tokens.shape[0]) == n:
             mep = meta.expansion_plan
             if mep is not None and len(mep.expanded_to_origin) == n:
                 out = replace(out, expansion_plan=mep)
@@ -1170,7 +1183,7 @@ def sanitize_hybrid_bundle_for_metadata(
     runner_num_spec_tokens: int,
 ) -> tuple[HybridProposalBundle | None, str | None]:
     """Validate/sanitize proposer bundle for current target verification metadata."""
-    batch_size = len(spec_decode_metadata.num_draft_tokens)
+    batch_size = int(spec_decode_metadata.num_draft_tokens.shape[0])
     if len(bundle.num_draft_tokens) != batch_size:
         return None, (
             "num_draft_tokens batch mismatch "

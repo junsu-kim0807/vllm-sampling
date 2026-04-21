@@ -234,12 +234,108 @@ class DitRoundVerification:
 
 @dataclass
 class DitRoundDecision:
-    """Intermediate accept/reject output for one chunk."""
+    """Intermediate accept/reject output for one chunk (GPU canonical)."""
 
-    # variable-length emitted rows per request
-    emitted_rows: list[list[int]]
-    emitted_prob_rows: list[list[torch.Tensor]]
-    accepted_lens: list[int]
+    # [B, W] int32 — padded emitted ids per row (e.g. RS width L+1).
+    emitted_tokens: torch.Tensor
+    # [B] int32 — valid prefix length per row into emitted_tokens.
+    accepted_lens: torch.Tensor
+    # Optional row-major flattened proposal probs for emitted positions.
+    emitted_probs_flat: torch.Tensor | None = None
+    emitted_probs_cu: torch.Tensor | None = None
+
+
+def dit_decision_emitted_prob_rows_host(
+    decision: DitRoundDecision,
+) -> list[list[torch.Tensor]]:
+    """Per-row list of [V] prob rows from flat+cu (for legacy prefix_prob_rows)."""
+    bsz = int(decision.accepted_lens.shape[0])
+    if (
+        decision.emitted_probs_flat is None
+        or decision.emitted_probs_cu is None
+        or decision.emitted_probs_flat.numel() == 0
+    ):
+        return [[] for _ in range(bsz)]
+    flat = decision.emitted_probs_flat
+    cu_cpu = decision.emitted_probs_cu.detach().cpu().view(-1)
+    flat_cpu = flat.detach().cpu()
+    rows: list[list[torch.Tensor]] = []
+    for b in range(bsz):
+        s, e = int(cu_cpu[b]), int(cu_cpu[b + 1])
+        if e <= s:
+            rows.append([])
+        else:
+            rows.append(list(flat_cpu[s:e].unbind(0)))
+    return rows
+
+
+def dit_decision_emitted_rows_host(decision: DitRoundDecision) -> list[list[int]]:
+    """Materialize per-row emitted token ids for Python mirror frontier APIs."""
+    toks = decision.emitted_tokens
+    if toks.numel() == 0:
+        return []
+    lens_cpu = decision.accepted_lens.detach().cpu().view(-1)
+    lens_list = [int(x) for x in lens_cpu.tolist()]
+    bsz = len(lens_list)
+    max_n = max(lens_list, default=0)
+    if max_n <= 0:
+        return [[] for _ in range(bsz)]
+    # One GPU→CPU block for token rows (avoids per-row ``toks[b, :n].cpu()`` syncs).
+    block = toks[:, :max_n].detach().cpu()
+    rows: list[list[int]] = []
+    for b in range(bsz):
+        n = lens_list[b]
+        if n <= 0:
+            rows.append([])
+        else:
+            rows.append([int(x) for x in block[b, :n].tolist()])
+    return rows
+
+
+def dit_round_decision_from_legacy_rows(
+    emitted_rows: list[list[int]],
+    accepted_lens: list[int],
+    *,
+    device: torch.device,
+    emitted_prob_rows: list[list[torch.Tensor]] | None = None,
+    pad_id: int = -1,
+) -> DitRoundDecision:
+    """Build GPU canonical decision from legacy list rows (pivot / tests)."""
+    bsz = len(emitted_rows)
+    if bsz == 0:
+        z = torch.zeros((0, 1), dtype=torch.int32, device=device)
+        return DitRoundDecision(
+            emitted_tokens=z,
+            accepted_lens=torch.zeros(0, dtype=torch.int32, device=device),
+        )
+    w = max((len(r) for r in emitted_rows), default=0)
+    w = max(w, max(accepted_lens, default=0), 1)
+    toks = torch.full((bsz, w), pad_id, dtype=torch.int32, device=device)
+    for b, row in enumerate(emitted_rows):
+        for j, tid in enumerate(row):
+            if j < w:
+                toks[b, j] = int(tid)
+    al = torch.tensor(accepted_lens, dtype=torch.int32, device=device)
+    flat: torch.Tensor | None = None
+    cu: torch.Tensor | None = None
+    if emitted_prob_rows is not None and any(emitted_prob_rows):
+        parts: list[torch.Tensor] = []
+        for b in range(bsz):
+            for t in emitted_prob_rows[b]:
+                parts.append(t.reshape(1, -1).to(device=device, dtype=torch.float32))
+        if parts:
+            flat = torch.cat(parts, dim=0)
+            cu = torch.zeros(bsz + 1, dtype=torch.int32, device=device)
+            off = 0
+            for b in range(bsz):
+                off += len(emitted_prob_rows[b])
+                cu[b + 1] = off
+    return DitRoundDecision(
+        emitted_tokens=toks,
+        accepted_lens=al,
+        emitted_probs_flat=flat,
+        emitted_probs_cu=cu,
+    )
 
 
 @dataclass

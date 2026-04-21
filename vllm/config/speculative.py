@@ -1552,16 +1552,23 @@ class SpeculativeConfig:
         return self.num_speculative_tokens
 
     def runner_num_partial_speculative_tokens(self) -> int:
-        """Budget axis for **inner-round draft proposals**, not final target width.
+        """Budget axis for **staged partial-accept** histograms (scheduler / metrics).
 
         For hierarchical D→I rounds this is ``R * L`` (number of inner rounds times
-        chunk length): the cumulative draft-proposal token count across intermediate
-        verification rounds **before** the tail and **before** the single authoritative
-        target pass. This differs from ``runner_num_speculative_tokens()`` which is
-        ``K_final`` for the same configs—do not mix the two in scheduler or metrics code.
+        chunk length) on adaptive/pivot pipelines: the cumulative draft-proposal token
+        count across intermediate verification rounds **before** the tail and **before**
+        the single authoritative target pass.
+
+        For standalone ``hierarchical_verification``, the cost profiler records
+        ``inter_accepted_counts`` as the sum of per-round ``len(emitted_rows[b])``, which
+        can reach the per-round verify window (up to ``L+1`` per round) and must not be
+        capped at ``R * L`` or ``observe_draft_with_cost_breakdown`` will assert against
+        too-small ``num_partial_spec_tokens``. We therefore align the partial histogram
+        width with ``hv_max_spec_len()`` (same as ``runner_num_speculative_tokens()`` for
+        this method).
         """
         if self.method == "hierarchical_verification":
-            return int(self.num_hv_rounds) * int(self.num_speculative_tokens)
+            return self.hv_max_spec_len()
         if (
             self.method == "adaptive_spechive"
             and self.adaptive_spechive_mode == "hierarchical_verification"

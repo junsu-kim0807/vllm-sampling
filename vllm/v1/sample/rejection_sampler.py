@@ -19,6 +19,9 @@ from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.spec_stage_utils import (
+    materialize_spec_token_ids_from_prefix_tensors,
+)
 
 logger = init_logger(__name__)
 
@@ -355,16 +358,32 @@ class RejectionSampler(nn.Module):
         )
 
         output_token_ids = sampling_metadata.output_token_ids
+        spec_ids_for_combine = sampling_metadata.spec_token_ids
+        if (
+            spec_ids_for_combine is None
+            and sampling_metadata.spec_prefix_tokens is not None
+            and sampling_metadata.spec_prefix_lens is not None
+            and any_penalties_or_bad_words
+        ):
+            spec_ids_for_combine = materialize_spec_token_ids_from_prefix_tensors(
+                sampling_metadata.spec_prefix_tokens,
+                sampling_metadata.spec_prefix_lens,
+            )
         if any_penalties_or_bad_words:
             output_token_ids = self._combine_outputs_with_spec_tokens(
                 output_token_ids,
-                sampling_metadata.spec_token_ids,
+                spec_ids_for_combine,
             )
 
         # Calculate indices of target logits.
         if sampling_metadata.allowed_token_ids_mask is not None or has_penalties:
-            num_requests = len(sampling_metadata.output_token_ids)
-            num_draft_tokens = torch.tensor(metadata.num_draft_tokens, device="cpu")
+            # After ``_combine_outputs_with_spec_tokens``, row count may exceed the
+            # original ``sampling_metadata.output_token_ids`` length.
+            num_requests = len(output_token_ids)
+            nd = metadata.num_draft_tokens
+            num_draft_tokens = nd.cpu() if isinstance(nd, torch.Tensor) else torch.tensor(
+                nd, device="cpu"
+            )
             original_indices = torch.arange(num_requests, device="cpu")
             repeat_indices_cpu = original_indices.repeat_interleave(num_draft_tokens)
             repeat_indices = repeat_indices_cpu.to(
@@ -381,15 +400,25 @@ class RejectionSampler(nn.Module):
 
         # Apply bad words exclusion.
         if bad_words_token_ids := sampling_metadata.bad_words_token_ids:
+            nd_bw = metadata.num_draft_tokens
+            nd_bw_list = (
+                nd_bw.detach().cpu().tolist()
+                if isinstance(nd_bw, torch.Tensor)
+                else list(nd_bw)
+            )
             apply_bad_words_with_drafts(
-                logits, bad_words_token_ids, output_token_ids, metadata.num_draft_tokens
+                logits, bad_words_token_ids, output_token_ids, nd_bw_list
             )
 
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
             if isinstance(processor, MinTokensLogitsProcessor):
-                logits = processor.apply_with_spec_decode(
-                    logits, metadata.num_draft_tokens
+                nd_mt = metadata.num_draft_tokens
+                nd_mt_list = (
+                    nd_mt.detach().cpu().tolist()
+                    if isinstance(nd_mt, torch.Tensor)
+                    else list(nd_mt)
                 )
+                logits = processor.apply_with_spec_decode(logits, nd_mt_list)
 
         return logits
 
@@ -444,16 +473,23 @@ def _should_verify_draft_match() -> bool:
     return os.environ.get("VLLM_SPEC_VERIFY_DRAFT_MATCH", "0") == "1"
 
 
+def _as_int_draft_count_list(num_draft_tokens: list[int] | torch.Tensor) -> list[int]:
+    if isinstance(num_draft_tokens, torch.Tensor):
+        return [int(x) for x in num_draft_tokens.detach().cpu().tolist()]
+    return [int(x) for x in num_draft_tokens]
+
+
 def _verify_draft_match_sampled(
     output_token_ids: torch.Tensor,
     draft_token_ids: torch.Tensor,
-    num_draft_tokens: list[int],
+    num_draft_tokens: list[int] | torch.Tensor,
     cu_num_draft_tokens: torch.Tensor,
 ) -> tuple[int, int]:
     """Verify draft/verification output: no PLACEHOLDER in verified range; accepted
     prefix of output must equal draft. Returns (checks, mismatches).
     """
-    batch_size = len(num_draft_tokens)
+    nd_list = _as_int_draft_count_list(num_draft_tokens)
+    batch_size = len(nd_list)
     cu = cu_num_draft_tokens.cpu().numpy()
     out_cpu = output_token_ids.cpu().numpy()
     draft_cpu = draft_token_ids.cpu().numpy()
@@ -462,7 +498,7 @@ def _verify_draft_match_sampled(
     mismatches = 0
     for r in range(batch_size):
         start = int(cu[r - 1]) if r > 0 else 0
-        n = num_draft_tokens[r]
+        n = nd_list[r]
         if n <= 0:
             continue
         checks += 1
@@ -488,8 +524,8 @@ def get_spec_verify_draft_match_time_sec_and_reset() -> float:
 def rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
-    # [batch_size]
-    num_draft_tokens: list[int],
+    # [batch_size] int32 tensor or legacy list of counts per row.
+    num_draft_tokens: list[int] | torch.Tensor,
     max_spec_len: int,
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
@@ -506,7 +542,8 @@ def rejection_sample(
     assert cu_num_draft_tokens.ndim == 1
     assert target_logits.ndim == 2
 
-    batch_size = len(num_draft_tokens)
+    nd_list = _as_int_draft_count_list(num_draft_tokens)
+    batch_size = len(nd_list)
     num_tokens = draft_token_ids.shape[0]
     vocab_size = target_logits.shape[-1]
     device = target_logits.device
@@ -550,7 +587,7 @@ def rejection_sample(
     # [num_tokens]
     uniform_probs = generate_uniform_probs(
         num_tokens,
-        num_draft_tokens,
+        nd_list,
         sampling_metadata.generators,
         device,
     )
@@ -559,7 +596,7 @@ def rejection_sample(
     # [num_tokens]
     recovered_token_ids = sample_recovered_tokens(
         max_spec_len,
-        num_draft_tokens,
+        nd_list,
         cu_num_draft_tokens,
         draft_token_ids,
         draft_probs,

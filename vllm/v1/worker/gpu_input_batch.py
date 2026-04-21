@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
 
@@ -465,6 +466,56 @@ class InputBatch:
         end_token_index = start_index + num_spec_tokens
         self.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
         cur_spec_token_ids.extend(spec_token_ids)
+
+    def bulk_update_spec_token_ids_from_tensor(
+        self,
+        row_requests: Sequence[CachedRequestState | None],
+        spec_tokens_gpu: torch.Tensor,
+        spec_lens_gpu: torch.Tensor,
+    ) -> None:
+        """Mirror ``update_req_spec_token_ids`` using one batched GPU→CPU copy.
+
+        ``row_requests[b]`` aligns with ``spec_tokens_gpu[b]`` / ``spec_lens_gpu[b]``.
+        Skips ``None`` entries (e.g. missing frontier mirror rows).
+        """
+        bsz = len(row_requests)
+        if bsz == 0:
+            return
+        if spec_tokens_gpu.shape[0] < bsz or spec_lens_gpu.shape[0] < bsz:
+            raise ValueError(
+                "bulk_update_spec_token_ids_from_tensor: leading dimension must "
+                f"cover all rows (got tokens {spec_tokens_gpu.shape[0]}, "
+                f"lens {spec_lens_gpu.shape[0]}, rows {bsz})"
+            )
+        lens_np = spec_lens_gpu[:bsz].detach().cpu().numpy()
+        max_len = int(lens_np.max()) if lens_np.size else 0
+        if max_len <= 0:
+            for b in range(bsz):
+                request = row_requests[b]
+                if request is None:
+                    continue
+                req_index = self.req_id_to_index[request.req_id]
+                self.spec_token_ids[req_index].clear()
+                request.prev_num_draft_len = 0
+            return
+        tok_np = (
+            spec_tokens_gpu[:bsz, :max_len].detach().cpu().numpy().astype(np.int32)
+        )
+        for b in range(bsz):
+            request = row_requests[b]
+            if request is None:
+                continue
+            n = int(lens_np[b])
+            req_index = self.req_id_to_index[request.req_id]
+            cur = self.spec_token_ids[req_index]
+            cur.clear()
+            request.prev_num_draft_len = n
+            if n <= 0:
+                continue
+            start_index = int(self.num_tokens_no_spec[req_index])
+            row = tok_np[b, :n]
+            self.token_ids_cpu[req_index, start_index : start_index + n] = row
+            cur.extend(row.tolist())
 
     def remove_request(self, req_id: str) -> int | None:
         """This method must always be followed by a call to condense().
