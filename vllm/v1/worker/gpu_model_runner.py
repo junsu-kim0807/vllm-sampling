@@ -180,7 +180,6 @@ from vllm.v1.spec_decode.adaptive_cascade import (
 from vllm.v1.spec_decode.hierarchical_verification import HierarchicalVerificationProposer
 from vllm.v1.spec_decode.hv_step_packing import (
     build_prefix_conditioned_inputs as hv_build_prefix_conditioned_inputs,
-    gather_hv_verification_logits_from_spec_decode_metadata,
     slice_hv_verification_logits,
 )
 from vllm.v1.spec_decode.hybrid_bundle_utils import (
@@ -1646,8 +1645,10 @@ class GPUModelRunner(
           use ``_verify_chunk_with_prefix`` (prefix + roll) with optional
           ``mirror_kv_common_attn_metadata`` (legacy name) replacing only the **base**
           ``CommonAttentionMetadata``. Standalone ``hierarchical_verification`` uses
-          intermediate frontier ``_prepare_intermediate_metadata`` + one direct
-          intermediate forward and ``gather_hv_verification_logits_from_spec_decode_metadata``.
+          intermediate frontier ``_prepare_intermediate_metadata`` for mirror CAD /
+          spec metadata, then ``_prepare_hv_step`` + ``_run_hv_verify_step`` (same
+          prefix-conditioned pack and ``slice_hv_verification_logits`` as legacy
+          ``_verify_chunk_with_prefix``).
         """
         return CachedRequestState(
             req_id=src.req_id,
@@ -5662,7 +5663,14 @@ class GPUModelRunner(
         proposal_tokens: torch.Tensor,
         num_rejected_tokens_gpu: torch.Tensor | None,
     ) -> DitRoundVerification:
-        """Intermediate verify using intermediate frontier metadata + one direct forward."""
+        """Intermediate verify: mirror CAD from frontier prep + legacy-equivalent logits path.
+
+        ``_prepare_intermediate_metadata`` supplies ``inter_cad`` / spec metadata for the
+        intermediate mirror batch (debug checks, optional crosscheck). Verifier logits
+        use the same prefix-conditioned pack + ``slice_hv_verification_logits`` path as
+        ``_verify_chunk_with_prefix`` / ``_run_hv_verify_step``, not ``inter_cad`` +
+        scheduler-flat gather (which can disagree with that reference geometry).
+        """
         if not self._intermediate_kv_frontier_enabled():
             raise RuntimeError(
                 "_run_hv_intermediate_verify_from_frontier requires "
@@ -5702,11 +5710,7 @@ class GPUModelRunner(
                 for b in range(num_reqs_hv)
             }
 
-        # Standalone HV: no intermediate prep cache. ``_prepare_intermediate_metadata``
-        # fills scratch step buffers (``intermediate_step_input_ids``, positions, etc.)
-        # that are copied into ``inter`` for forward; they must match the current
-        # ``proposal_tokens`` every round — unlike ``spec_decode_metadata.draft_token_ids``
-        # alone, which is insufficient to refresh those buffers.
+        # Mirror frontier prep: scratch step buffers + spec metadata (geom checks).
         with self._hv_suspend_cached_prev_sampled_tokens():
             prep = self._prepare_intermediate_metadata(
                 so,
@@ -5733,117 +5737,54 @@ class GPUModelRunner(
                 "hierarchical_verification: missing speculative CommonAttentionMetadata "
                 f"for intermediate kv_cache_gid={gid}"
             )
+        if not isinstance(hv_ctx, dict):
+            raise RuntimeError(
+                "hierarchical_verification: missing _hv_round_ctx; "
+                "intermediate verify requires run_hv_rounds() context."
+            )
+        lc = hv_ctx.get("legacy_crosscheck")
+        if not isinstance(lc, dict):
+            raise RuntimeError(
+                "hierarchical_verification: missing legacy_crosscheck snapshot; "
+                "run_hv_rounds() must populate _hv_round_ctx['legacy_crosscheck'] before verify."
+            )
+        lc["cad"] = inter_cad
         if self._spec_step_debug_enabled() and self._spec_step_debug_tp0():
             self._hv_spec_step_debug_geom_check_a(proposal_tokens, prep)
-        total_tok = int(so.total_num_scheduled_tokens)
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
-            inter._determine_batch_execution_and_padding(total_tok)
+
+        batch_size = int(proposal_tokens.shape[0])
+        prefix_rows = self._hv_prefix_rows_from_prefix_tensors(
+            lc["prefix_tokens"],
+            lc["prefix_lens"],
+            batch_size,
         )
-        inter.input_ids[:total_tok].copy_(
-            self.intermediate_step_input_ids.gpu[:total_tok], non_blocking=True
+        pre = self._prepare_hv_step(
+            inter,
+            inter_cad,
+            target_token_ids=lc["target_token_ids"],
+            target_positions=lc["target_positions"],
+            target_hidden_states=lc["target_hidden_states"],
+            next_token_ids=lc["next_token_ids"],
+            num_rejected_tokens_gpu=lc["num_rejected_tokens_gpu"],
+            prefix_rows=prefix_rows,
+            candidate_tokens=proposal_tokens,
         )
-        if num_input_tokens > total_tok:
-            n_pad = num_input_tokens - total_tok
-            inter.input_ids[total_tok:num_input_tokens].copy_(
-                inter.input_ids[total_tok - 1 : total_tok].expand(n_pad),
-                non_blocking=True,
-            )
-        inter._set_positions(
-            total_tok, self.intermediate_step_positions.gpu[:total_tok]
-        )
-        if num_input_tokens > total_tok:
-            last_pos = inter.positions[total_tok - 1]
-            need = num_input_tokens - total_tok
-            buf = getattr(self, "_hv_pos_inc_workspace", None)
-            if (
-                buf is None
-                or buf.device != last_pos.device
-                or buf.dtype != last_pos.dtype
-                or buf.shape[0] < need
-            ):
-                cap = max(need, 1024)
-                self._hv_pos_inc_workspace = torch.arange(
-                    1,
-                    cap + 1,
-                    device=last_pos.device,
-                    dtype=last_pos.dtype,
-                )
-                buf = self._hv_pos_inc_workspace
-            inter.positions[total_tok:num_input_tokens] = last_pos + buf[:need]
-
-        per_layer_attn_metadata: dict[str, object] = {}
-        attn_metadata = None
-        for attn_group in inter.draft_attn_groups:
-            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                common_attn_metadata=inter_cad,
-                draft_index=0,
-            )
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
-
-        inter._check_per_layer_attn_metadata_contract(per_layer_attn_metadata)
-
-        if inter.allowed_attn_types is not None and not isinstance(
-            attn_metadata,
-            inter.allowed_attn_types,
-        ):
-            raise ValueError(
-                "hierarchical_verification: unsupported attention metadata type "
-                f"{type(attn_metadata)}; allowed: {inter.allowed_attn_types}"
-            )
-
-        if inter.supports_mm_inputs:
-            inter.inputs_embeds[:num_input_tokens] = inter.model.embed_input_ids(
-                inter.input_ids[:num_input_tokens],
-            )
-            input_ids = None
-            inputs_embeds = inter.inputs_embeds[:num_input_tokens]
-        else:
-            input_ids = inter.input_ids[:num_input_tokens]
-            inputs_embeds = None
-
-        model_kwargs = {
-            "input_ids": input_ids,
-            "positions": inter._get_positions(num_input_tokens),
-            "inputs_embeds": inputs_embeds,
-        }
-        if inter.pass_hidden_states_to_model:
-            model_kwargs["hidden_states"] = inter.hidden_states[:num_input_tokens]
-
-        with set_forward_context(
-            per_layer_attn_metadata,
-            inter.vllm_config,
-            num_tokens=num_input_tokens,
-            num_tokens_across_dp=num_tokens_across_dp,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
-            slot_mapping=inter._get_slot_mapping(
-                num_input_tokens, inter_cad.slot_mapping
-            ),
-        ):
-            ret_hidden_states = inter.model(**model_kwargs)
-            if inter.model_returns_tuple():
-                last_hidden_states, _ = ret_hidden_states
-            else:
-                last_hidden_states = ret_hidden_states
-        all_logits = inter.model.compute_logits(last_hidden_states).to(torch.float32)
-        logits_flat, bonus_logits = (
-            gather_hv_verification_logits_from_spec_decode_metadata(
-                all_logits, prep.spec_decode_metadata
-            )
+        ver = self._run_hv_verify_step(
+            inter,
+            pre,
+            num_rejected_tokens_gpu=lc["num_rejected_tokens_gpu"],
         )
         if self._spec_step_debug_enabled() and self._spec_step_debug_tp0():
             self._hv_spec_step_debug_geom_check_d(
-                proposal_tokens, logits_flat, bonus_logits, prep
+                proposal_tokens, ver.logits_flat, ver.bonus_logits, prep
             )
         self._hv_maybe_crosscheck_intermediate_verify_logits(
             inter=inter,
             proposal_tokens=proposal_tokens,
-            logits_flat=logits_flat,
-            bonus_logits=bonus_logits,
+            logits_flat=ver.logits_flat,
+            bonus_logits=ver.bonus_logits,
         )
-        return DitRoundVerification(
-            logits_flat=logits_flat, bonus_logits=bonus_logits
-        )
+        return ver
 
     def _hv_prefix_rows_from_prefix_tensors(
         self,
@@ -5871,11 +5812,12 @@ class GPUModelRunner(
         logits_flat: torch.Tensor,
         bonus_logits: torch.Tensor,
     ) -> None:
-        """Optional second forward: prefix-conditioned legacy logits vs frontier gather.
+        """Optional second forward: duplicate ``_verify_chunk_with_prefix`` vs main path.
 
         Set ``VLLM_HV_INTER_LOGITS_LEGACY_CROSSCHECK=1`` (TP rank 0 only) to run
-        ``_verify_chunk_with_prefix`` and ``torch.allclose`` against
-        ``gather_hv_verification_logits_from_spec_decode_metadata`` output.
+        ``_verify_chunk_with_prefix`` again and ``torch.allclose`` against the logits
+        from ``_run_hv_intermediate_verify_from_frontier`` (must agree when ``lc['cad']``
+        is the intermediate mirror CAD).
 
         Tuning: ``VLLM_HV_INTER_LOGITS_LEGACY_CROSSCHECK_ATOL`` /
         ``..._RTOL`` (defaults 5e-3). Mismatch raises if
@@ -5889,7 +5831,7 @@ class GPUModelRunner(
         if ctx is None:
             return
         lc = ctx.get("legacy_crosscheck")
-        if lc is None:
+        if not isinstance(lc, dict) or "cad" not in lc:
             return
         atol = float(
             os.environ.get("VLLM_HV_INTER_LOGITS_LEGACY_CROSSCHECK_ATOL", "5e-3")
@@ -6091,7 +6033,7 @@ class GPUModelRunner(
             tp_ri = -1
         logger.info(
             "SPEC_STEP_DEBUG [0] tp_rank=%s standalone_HV note="
-            "intermediate_verify_uses_mirror_frontier_metadata_direct_gather; "
+            "intermediate_verify_uses_mirror_frontier_CAD_plus_prefix_conditioned_slice; "
             "target_verify_uses_spec_decode_metadata_alignment; "
             "if_target_first_matches_inner_draft_but_not_bundle_prefix_investigate_row_geometry",
             tp_ri,
@@ -6280,13 +6222,13 @@ class GPUModelRunner(
                 sampling_metadata=round_sm,
                 use_draft_probs=use_draft_probs,
             )
-            # For optional ``_hv_maybe_crosscheck_intermediate_verify_logits`` (env-gated).
+            # For ``_run_hv_intermediate_verify_from_frontier`` + optional env-gated crosscheck.
+            # ``cad`` is filled there with ``inter_cad`` (intermediate mirror), not ``draft_cad``.
             self._hv_round_ctx["legacy_crosscheck"] = {
                 "target_token_ids": target_token_ids,
                 "target_positions": target_positions,
                 "target_hidden_states": target_hidden_states,
                 "next_token_ids": next_token_ids,
-                "cad": draft_cad,
                 "prefix_tokens": prefix_tokens,
                 "prefix_lens": prefix_lens,
                 "batch_size": batch_size,
