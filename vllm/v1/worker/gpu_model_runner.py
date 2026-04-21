@@ -5829,6 +5829,20 @@ class GPUModelRunner(
                 f"cad_batch={int(inter_cad_full.batch_size())} batch_size={batch_size}"
             )
 
+        if self._spec_step_debug_enabled():
+            _ngrp = (
+                len(self.kv_cache_config.kv_cache_groups)
+                if getattr(self, "kv_cache_config", None) is not None
+                else -1
+            )
+            logger.warning(
+                "SPEC_STEP_DEBUG HV_INTER_KVGID inter.kv_cache_gid=%s cad_map_keys=%s "
+                "num_kv_cache_groups=%s",
+                getattr(inter, "kv_cache_gid", None),
+                sorted(cad_map.keys()),
+                _ngrp,
+            )
+
         qsl_src = inter_cad_full.query_start_loc
         tgt_flat = lc["target_token_ids"]
         tgt_pos = lc["target_positions"]

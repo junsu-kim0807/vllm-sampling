@@ -1214,6 +1214,51 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
         )
 
 
+_INTERMEDIATE_MODEL_KV_PREFIX = "intermediate_model."
+
+
+def _split_intermediate_model_prefix_kv_groups(
+    groups: list[KVCacheGroupSpec],
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """Peel ``intermediate_model.*`` out of shared UniformType groups.
+
+    :func:`UniformTypeKVCacheSpecs.from_specs` groups every ``FullAttentionSpec``
+    layer together even when head shapes differ (e.g. target 70B + verifier 8B).
+    Those layers must not share one physical KV block table: the intermediate
+    verifier would write incompatible K/V layouts into slots the target just used.
+
+    Subgroups are rebuilt as separate :class:`UniformTypeKVCacheSpecs` via
+    :meth:`UniformTypeKVCacheSpecs.from_specs` (merge is not valid across
+    incompatible ``FullAttentionSpec``\ s).
+    """
+    if not any(k.startswith(_INTERMEDIATE_MODEL_KV_PREFIX) for k in kv_cache_spec):
+        return groups
+    out: list[KVCacheGroupSpec] = []
+    for g in groups:
+        inter = [n for n in g.layer_names if n.startswith(_INTERMEDIATE_MODEL_KV_PREFIX)]
+        rest = [n for n in g.layer_names if not n.startswith(_INTERMEDIATE_MODEL_KV_PREFIX)]
+        if not inter or not rest:
+            out.append(g)
+            continue
+        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs):
+            ut = g.kv_cache_spec
+            sub_rest = {n: ut.kv_cache_specs[n] for n in rest}
+            sub_inter = {n: ut.kv_cache_specs[n] for n in inter}
+            ur = UniformTypeKVCacheSpecs.from_specs(sub_rest)
+            ui = UniformTypeKVCacheSpecs.from_specs(sub_inter)
+            assert ur is not None and ui is not None, (
+                "split intermediate KV: expected uniform-type subgroups "
+                f"(rest_n={len(rest)}, inter_n={len(inter)})"
+            )
+            out.append(KVCacheGroupSpec(rest, ur))
+            out.append(KVCacheGroupSpec(inter, ui))
+        else:
+            out.append(create_kv_cache_group_specs(kv_cache_spec, [rest])[0])
+            out.append(create_kv_cache_group_specs(kv_cache_spec, [inter])[0])
+    return out
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
@@ -1244,7 +1289,8 @@ def get_kv_cache_groups(
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
-        return _get_kv_cache_groups_uniform_type(uniform_spec)
+        groups = _get_kv_cache_groups_uniform_type(uniform_spec)
+        return _split_intermediate_model_prefix_kv_groups(groups, kv_cache_spec)
 
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
