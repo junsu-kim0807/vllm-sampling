@@ -1091,6 +1091,9 @@ class GPUModelRunner(
         )
         self._dit_debug_last_commit_len: dict[str, int] = {}
         self._dit_debug_last_commit_token: dict[str, int] = {}
+        # ``VLLM_SPEC_STEP_DEBUG=1``: log up to 5 HV propose+target-verify traces.
+        self._spec_step_debug_remaining: int | None = None
+        self._spec_step_debug_hv_snapshot: dict[str, Any] | None = None
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -5792,6 +5795,57 @@ class GPUModelRunner(
     def _hv_cudagraph_note_capture(self, **_kwargs) -> None:
         """Placeholder for HV CUDA graph capture registration."""
 
+    def _spec_step_debug_enabled(self) -> bool:
+        return os.environ.get("VLLM_SPEC_STEP_DEBUG", "0") == "1"
+
+    def _spec_step_debug_try_emit(self) -> bool:
+        if not self._spec_step_debug_enabled():
+            return False
+        if self._spec_step_debug_remaining is None:
+            self._spec_step_debug_remaining = 5
+        if self._spec_step_debug_remaining <= 0:
+            return False
+        self._spec_step_debug_remaining -= 1
+        return True
+
+    def _emit_spec_step_debug_hv_bundle_target(
+        self,
+        hv_snapshot: dict[str, Any],
+        bundle: HybridProposalBundle | None,
+        spec_decode_metadata: SpecDecodeMetadata,
+        sampled_token_ids: torch.Tensor,
+    ) -> None:
+        """One trace: inner draft rounds, intermediate emitted rows, tail draft, bundle, target I/O."""
+        logger.info(
+            "SPEC_STEP_DEBUG [1] draft_round_token_ids=%s "
+            "intermediate_verified_emitted_token_ids=%s tail_draft_token_ids=%s req_ids=%s",
+            hv_snapshot.get("draft_rounds"),
+            hv_snapshot.get("inter_rounds"),
+            hv_snapshot.get("tail_draft"),
+            hv_snapshot.get("req_ids"),
+        )
+        if bundle is not None:
+            logger.info(
+                "SPEC_STEP_DEBUG [2] final_bundle draft_token_ids_flat=%s "
+                "num_draft_tokens=%s max_spec_len=%s mode=%s bundle_row_req_ids=%s "
+                "inter_verified_counts=%s inter_accepted_counts=%s",
+                bundle.draft_token_ids.detach().cpu().tolist(),
+                list(bundle.num_draft_tokens),
+                bundle.max_spec_len,
+                bundle.mode,
+                bundle.bundle_row_req_ids,
+                bundle.inter_verified_counts,
+                bundle.inter_accepted_counts,
+            )
+        else:
+            logger.info("SPEC_STEP_DEBUG [2] final_bundle=None")
+        logger.info(
+            "SPEC_STEP_DEBUG [3] target_verification_input_draft_token_ids=%s "
+            "target_verification_output_sampled_token_ids=%s",
+            spec_decode_metadata.draft_token_ids.detach().cpu().tolist(),
+            sampled_token_ids.detach().cpu().tolist(),
+        )
+
     def run_hv_rounds(
         self,
         *,
@@ -5873,6 +5927,8 @@ class GPUModelRunner(
         dummy_prefix_rows = [[] for _ in range(batch_size)]
         self._hv_round_ctx["prefix_tokens"] = prefix_tokens
         self._hv_round_ctx["prefix_lens"] = prefix_lens
+        draft_round_tokens: list[list[list[int]]] = []
+        inter_emit_rounds: list[list[list[int]]] = []
 
         for _ in range(n_inner):
             sm_idxs = list(range(batch_size))
@@ -5895,6 +5951,10 @@ class GPUModelRunner(
                 sampling_metadata=round_sm,
                 use_draft_probs=use_draft_probs,
             )
+            if self._spec_step_debug_enabled():
+                draft_round_tokens.append(
+                    proposal.tokens.detach().cpu().tolist()
+                )
             eff_bs = int(proposal.tokens.shape[0])
             if eff_bs != batch_size:
                 raise RuntimeError(
@@ -5918,6 +5978,8 @@ class GPUModelRunner(
                 np.int64, copy=False
             )
             emitted_rows_host = dit_decision_emitted_rows_host(decision)
+            if self._spec_step_debug_enabled():
+                inter_emit_rounds.append(emitted_rows_host)
             self._advance_intermediate_frontier_after_round(
                 decision,
                 batch_size=batch_size,
@@ -6109,6 +6171,16 @@ class GPUModelRunner(
             out_exp, None, batch_size
         )
         self._hv_round_ctx = None
+        if self._spec_step_debug_enabled():
+            self._spec_step_debug_hv_snapshot = {
+                "draft_rounds": draft_round_tokens,
+                "inter_rounds": inter_emit_rounds,
+                "tail_draft": tail.tokens.detach().cpu().tolist(),
+                "req_ids": [
+                    str(self.input_batch.req_ids[i])
+                    for i in range(min(batch_size, int(self.input_batch.num_reqs)))
+                ],
+            }
         if _hv_t0 is not None:
             logger.info(
                 "HV_PROFILE run_hv_rounds_ms=%.3f B=%d L=%d R=%d",
@@ -7056,6 +7128,16 @@ class GPUModelRunner(
             logits,
             verity_sm,
         )
+        hv_snap = self._spec_step_debug_hv_snapshot
+        if hv_snap is not None:
+            if self._spec_step_debug_try_emit():
+                self._emit_spec_step_debug_hv_bundle_target(
+                    hv_snap,
+                    bundle,
+                    spec_decode_metadata,
+                    sampler_output.sampled_token_ids,
+                )
+            self._spec_step_debug_hv_snapshot = None
         expansion_plan: PivotExpansionPlan | None = None
         tree_plan: PivotExpandedTreePlan | None = None
         if bundle is not None:
@@ -8879,6 +8961,7 @@ class GPUModelRunner(
         spec_config = self.speculative_config
         assert spec_config is not None
         self.set_pending_hybrid_spec_bundle(None)
+        self._spec_step_debug_hv_snapshot = None
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
