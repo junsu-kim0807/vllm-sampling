@@ -5878,6 +5878,41 @@ class GPUModelRunner(
         max_seq_pack = int(seq_lens_pack.max().item())
 
         if self._spec_step_debug_enabled():
+            # Mirror CAD must reference real blocks/slots for the intermediate KV group;
+            # mis-populated tables yield garbage logits and can later hang collectives.
+            bt = inter_cad_full.block_table_tensor
+            sm = inter_cad_full.slot_mapping
+            bs_k = int(self.cache_config.block_size)
+            n_bt_cols = min(8, int(bt.shape[1])) if bt.ndim >= 2 and bt.shape[1] > 0 else 0
+            row0_prefix = (
+                bt[0, :n_bt_cols].detach().cpu().tolist()
+                if bt.numel() > 0 and int(bt.shape[0]) > 0 and n_bt_cols > 0
+                else []
+            )
+            sm_n = min(8, int(sm.shape[0])) if sm.numel() > 0 else 0
+            sm_head = sm[:sm_n].detach().cpu().tolist() if sm_n > 0 else []
+            if sm.numel() > 0:
+                sm_min = int(sm.min().item())
+                sm_max = int(sm.max().item())
+            else:
+                sm_min = -1
+                sm_max = -1
+            s0 = int(sl_src[0].item()) if batch_size > 0 else 0
+            nb_need = (s0 + bs_k - 1) // bs_k if bs_k > 0 else -1
+            logger.warning(
+                "SPEC_STEP_DEBUG HV_INTER_BLOCKS pre_pack rank=%d kv_gid=%d "
+                "block_table_row0_prefix=%s slot_head=%s slot_min=%s slot_max=%s "
+                "num_blocks_needed_seq0=%d seq_lens[:B]=%s total_sched_tokens=%d",
+                int(self.parallel_config.rank),
+                gid,
+                row0_prefix,
+                sm_head,
+                sm_min,
+                sm_max,
+                nb_need,
+                sl_src.detach().cpu().tolist(),
+                int(q_flat),
+            )
             if tgt_pos.dim() == 1:
                 pos_at_first = tgt_pos.index_select(0, first_rows).detach().cpu().tolist()
             else:
@@ -5911,6 +5946,29 @@ class GPUModelRunner(
         )
         lc["cad"] = pack_cad
         if self._spec_step_debug_enabled():
+            ps = pack_cad.slot_mapping
+            if ps.numel() > 0:
+                ps_min = int(ps.min().item())
+                ps_max = int(ps.max().item())
+            else:
+                ps_min = -1
+                ps_max = -1
+            s0p = int(seq_lens_pack[0].item()) if batch_size > 0 else 0
+            _bs = int(self.cache_config.block_size)
+            nb_pack = (s0p + _bs - 1) // _bs if _bs > 0 else -1
+            logger.warning(
+                "SPEC_STEP_DEBUG HV_INTER_BLOCKS post_pack rank=%d kv_gid=%d "
+                "pack_slots=%s pack_slot_min=%s pack_slot_max=%s "
+                "num_blocks_needed_pack_seq0=%d seq_lens_pack=%s max_seq_pack=%d",
+                int(self.parallel_config.rank),
+                gid,
+                ps.detach().cpu().tolist(),
+                ps_min,
+                ps_max,
+                nb_pack,
+                seq_lens_pack.detach().cpu().tolist(),
+                max_seq_pack,
+            )
             self._hv_spec_step_debug_geom_check_a(proposal_tokens, prep)
 
         base_next = lc["next_token_ids"]
