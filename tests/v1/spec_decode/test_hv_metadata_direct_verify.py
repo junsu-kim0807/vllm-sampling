@@ -127,56 +127,36 @@ def test_slice_hv_verification_logits_matches_stacked_reference() -> None:
         assert torch.equal(chain[prefix_lens[b] + chunk_len], bonus[b])
 
 
-def test_legacy_hv_slice_matches_spec_decode_gather_indices() -> None:
-    """When target/bonus row indices match legacy slice geometry, gather must agree."""
+def test_gather_hv_verification_logits_compacts_via_logits_indices() -> None:
+    """``target_logits_indices`` / ``bonus`` index ``all_logits[logits_indices]``, not ``all_logits``."""
     device = "cpu"
-    cad = _tiny_cad(device=device)
-    draft_tokens = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32, device=device)
-    bsz, chunk_len = draft_tokens.shape
-    base_query_lens = [2, 2]
-    prefix_lens = [1, 1]
-    roll_lens = [2, 2]
-    vocab = 11
-    total_rows = int(cad.query_start_loc[-1].item()) + bsz * 3
-    all_logits = torch.randn(total_rows, vocab, dtype=torch.float32, device=device)
-    legacy_flat, legacy_bonus = slice_hv_verification_logits(
-        all_logits,
-        cad,
-        draft_tokens,
-        base_query_lens,
-        prefix_lens,
-        roll_lens,
-    )
-    qsl = cad.query_start_loc
-    target_rows: list[int] = []
-    bonus_rows: list[int] = []
-    for b in range(bsz):
-        chain_len = prefix_lens[b] + roll_lens[b] + 1
-        start = int(qsl[b].item()) + base_query_lens[b] - 1
-        for j in range(chunk_len):
-            target_rows.append(start + prefix_lens[b] + j)
-        bonus_rows.append(start + prefix_lens[b] + chunk_len)
+    vocab = 7
+    # Deterministic rows so "wrong" global indexing cannot match by chance.
+    all_logits = torch.zeros(20, vocab, dtype=torch.float32, device=device)
+    all_logits[:, 0] = torch.arange(20, dtype=torch.float32, device=device)
+    # Same layout as ``_calc_spec_decode_metadata`` for one req, 2 drafts, 3 flat rows:
+    # logits_indices = [0,1,2], compact target rows [0,1], bonus compact row [2].
+    lid = torch.tensor([5, 6, 7], dtype=torch.int32, device=device)
+    tid = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    bid = torch.tensor([2], dtype=torch.int32, device=device)
     meta = SpecDecodeMetadata(
-        draft_token_ids=torch.zeros(bsz * chunk_len, dtype=torch.int32, device=device),
-        num_draft_tokens=torch.full(
-            (bsz,), chunk_len, dtype=torch.int32, device=device
-        ),
-        cu_num_draft_tokens=torch.tensor(
-            [chunk_len, chunk_len * 2], dtype=torch.int32, device=device
-        ),
-        cu_num_sampled_tokens=torch.tensor(
-            [chunk_len + 1, (chunk_len + 1) * 2], dtype=torch.int32, device=device
-        ),
-        target_logits_indices=torch.tensor(target_rows, dtype=torch.int32, device=device),
-        bonus_logits_indices=torch.tensor(bonus_rows, dtype=torch.int32, device=device),
-        logits_indices=torch.zeros(bsz * (chunk_len + 1), dtype=torch.int32, device=device),
+        draft_token_ids=torch.zeros(2, dtype=torch.int32, device=device),
+        num_draft_tokens=torch.tensor([2], dtype=torch.int32, device=device),
+        cu_num_draft_tokens=torch.tensor([2], dtype=torch.int32, device=device),
+        cu_num_sampled_tokens=torch.tensor([3], dtype=torch.int32, device=device),
+        target_logits_indices=tid,
+        bonus_logits_indices=bid,
+        logits_indices=lid,
         expansion_plan=None,
     )
     g_flat, g_bonus = gather_hv_verification_logits_from_spec_decode_metadata(
         all_logits, meta
     )
-    assert torch.allclose(legacy_flat, g_flat)
-    assert torch.allclose(legacy_bonus, g_bonus)
+    compact = all_logits[lid.long()]
+    assert torch.allclose(g_flat, compact[tid.long()])
+    assert torch.allclose(g_bonus, compact[bid.long()])
+    wrong_flat = all_logits[tid.long()]
+    assert not torch.equal(g_flat, wrong_flat)
 
 
 def test_static_intermediate_kv_frontier_enabled_for_standalone_hv() -> None:

@@ -175,6 +175,7 @@ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesPropose
 from vllm.v1.spec_decode.adaptive_cascade import (
     IntermediateDraftModelProposer,
     _canonicalize_reused_prefix_frontier,
+    _verify_chunk_with_prefix,
 )
 from vllm.v1.spec_decode.hierarchical_verification import HierarchicalVerificationProposer
 from vllm.v1.spec_decode.hv_step_packing import (
@@ -5834,9 +5835,120 @@ class GPUModelRunner(
             self._hv_spec_step_debug_geom_check_d(
                 proposal_tokens, logits_flat, bonus_logits, prep
             )
+        self._hv_maybe_crosscheck_intermediate_verify_logits(
+            inter=inter,
+            proposal_tokens=proposal_tokens,
+            logits_flat=logits_flat,
+            bonus_logits=bonus_logits,
+        )
         return DitRoundVerification(
             logits_flat=logits_flat, bonus_logits=bonus_logits
         )
+
+    def _hv_prefix_rows_from_prefix_tensors(
+        self,
+        prefix_tokens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        batch_size: int,
+    ) -> list[list[int]]:
+        """Logical accepted-prefix rows for legacy ``_verify_chunk_with_prefix``."""
+        rows: list[list[int]] = []
+        for b in range(batch_size):
+            n = int(prefix_lens[b].item())
+            row: list[int] = []
+            for j in range(min(n, int(prefix_tokens.shape[1]))):
+                tid = int(prefix_tokens[b, j].item())
+                if tid != PLACEHOLDER_TOKEN_ID:
+                    row.append(tid)
+            rows.append(row)
+        return rows
+
+    def _hv_maybe_crosscheck_intermediate_verify_logits(
+        self,
+        *,
+        inter: IntermediateDraftModelProposer,
+        proposal_tokens: torch.Tensor,
+        logits_flat: torch.Tensor,
+        bonus_logits: torch.Tensor,
+    ) -> None:
+        """Optional second forward: prefix-conditioned legacy logits vs frontier gather.
+
+        Set ``VLLM_HV_INTER_LOGITS_LEGACY_CROSSCHECK=1`` (TP rank 0 only) to run
+        ``_verify_chunk_with_prefix`` and ``torch.allclose`` against
+        ``gather_hv_verification_logits_from_spec_decode_metadata`` output.
+
+        Tuning: ``VLLM_HV_INTER_LOGITS_LEGACY_CROSSCHECK_ATOL`` /
+        ``..._RTOL`` (defaults 5e-3). Mismatch raises if
+        ``VLLM_HV_INTER_LOGITS_LEGACY_CROSSCHECK_STRICT=1``.
+        """
+        if os.environ.get("VLLM_HV_INTER_LOGITS_LEGACY_CROSSCHECK", "0") != "1":
+            return
+        if not self._spec_step_debug_tp0():
+            return
+        ctx = getattr(self, "_hv_round_ctx", None)
+        if ctx is None:
+            return
+        lc = ctx.get("legacy_crosscheck")
+        if lc is None:
+            return
+        atol = float(
+            os.environ.get("VLLM_HV_INTER_LOGITS_LEGACY_CROSSCHECK_ATOL", "5e-3")
+        )
+        rtol = float(
+            os.environ.get("VLLM_HV_INTER_LOGITS_LEGACY_CROSSCHECK_RTOL", "5e-3")
+        )
+        strict = os.environ.get("VLLM_HV_INTER_LOGITS_LEGACY_CROSSCHECK_STRICT", "0") == "1"
+        bs = int(proposal_tokens.shape[0])
+        if int(lc["batch_size"]) != bs:
+            msg = (
+                "HV_INTER_LOGITS_LEGACY_CROSSCHECK batch_size mismatch "
+                f"ctx={lc['batch_size']} proposal_rows={bs}"
+            )
+            if strict:
+                raise AssertionError(msg)
+            logger.error(msg)
+            return
+        prefix_rows = self._hv_prefix_rows_from_prefix_tensors(
+            lc["prefix_tokens"],
+            lc["prefix_lens"],
+            bs,
+        )
+        ref_flat, ref_bonus = _verify_chunk_with_prefix(
+            inter,
+            cad=lc["cad"],
+            target_token_ids=lc["target_token_ids"],
+            target_positions=lc["target_positions"],
+            target_hidden_states=lc["target_hidden_states"],
+            next_token_ids=lc["next_token_ids"],
+            num_rejected_tokens_gpu=lc["num_rejected_tokens_gpu"],
+            prefix_rows=prefix_rows,
+            draft_tokens=proposal_tokens.to(torch.int32),
+        )
+        ref_flat = ref_flat.to(device=logits_flat.device, dtype=torch.float32)
+        ref_bonus = ref_bonus.to(device=bonus_logits.device, dtype=torch.float32)
+        flat_ok = logits_flat.shape == ref_flat.shape and torch.allclose(
+            logits_flat, ref_flat, atol=atol, rtol=rtol
+        )
+        bonus_ok = bonus_logits.shape == ref_bonus.shape and torch.allclose(
+            bonus_logits, ref_bonus, atol=atol, rtol=rtol
+        )
+        if flat_ok and bonus_ok:
+            return
+        def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
+            if a.shape != b.shape:
+                return float("nan")
+            return float((a - b).abs().max().item())
+
+        msg = (
+            "HV_INTER_LOGITS_LEGACY_CROSSCHECK mismatch "
+            f"flat_max_abs={_max_abs(logits_flat, ref_flat)} "
+            f"bonus_max_abs={_max_abs(bonus_logits, ref_bonus)} "
+            f"flat_shapes={tuple(logits_flat.shape)} vs {tuple(ref_flat.shape)} "
+            f"bonus_shapes={tuple(bonus_logits.shape)} vs {tuple(ref_bonus.shape)}"
+        )
+        if strict:
+            raise AssertionError(msg)
+        logger.error(msg)
 
     def _hv_cudagraph_try_replay(self) -> bool:
         """Placeholder for HV CUDA graph replay (per-round / full-step)."""
@@ -6168,6 +6280,18 @@ class GPUModelRunner(
                 sampling_metadata=round_sm,
                 use_draft_probs=use_draft_probs,
             )
+            # For optional ``_hv_maybe_crosscheck_intermediate_verify_logits`` (env-gated).
+            self._hv_round_ctx["legacy_crosscheck"] = {
+                "target_token_ids": target_token_ids,
+                "target_positions": target_positions,
+                "target_hidden_states": target_hidden_states,
+                "next_token_ids": next_token_ids,
+                "cad": draft_cad,
+                "prefix_tokens": prefix_tokens,
+                "prefix_lens": prefix_lens,
+                "batch_size": batch_size,
+                "num_rejected_tokens_gpu": num_rejected_tokens_gpu,
+            }
             if self._spec_step_debug_enabled():
                 draft_round_tokens.append(
                     proposal.tokens.detach().cpu().tolist()

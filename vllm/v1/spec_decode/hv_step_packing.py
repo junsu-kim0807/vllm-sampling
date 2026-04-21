@@ -288,11 +288,17 @@ def gather_hv_verification_logits_from_spec_decode_metadata(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pick (logits_flat, bonus_logits) for HV verify from one model forward.
 
-    ``all_logits`` is indexed the same way as standard spec-decode verification:
-    rows selected by ``target_logits_indices`` / ``bonus_logits_indices`` must
-    align with ``_calc_spec_decode_metadata`` when the intermediate frontier
-    batch matches the scheduler step geometry.
+    Target verify passes ``hidden_states[logits_indices]`` into ``compute_logits``,
+    so ``rejection_sampler`` sees a **compact** logits tensor whose rows match
+    ``_calc_spec_decode_metadata``'s ``target_logits_indices`` /
+    ``bonus_logits_indices`` (indices into that compact layout).
+
+    Intermediate frontier verify forwards the full sequence and gets **full**
+    ``all_logits``; this helper must first gather ``all_logits[logits_indices]``
+    before applying ``target_logits_indices`` / ``bonus_logits_indices``.
     """
+    lid = spec_decode_metadata.logits_indices.long()
     tid = spec_decode_metadata.target_logits_indices.long()
     bid = spec_decode_metadata.bonus_logits_indices.long()
-    return all_logits[tid].to(torch.float32), all_logits[bid].to(torch.float32)
+    compact = all_logits[lid]
+    return compact[tid].to(torch.float32), compact[bid].to(torch.float32)
