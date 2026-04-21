@@ -5971,7 +5971,10 @@ class GPUModelRunner(
                     ),
                 )
 
-        probs_prefix_lens: torch.Tensor | None = (
+        # Snapshot before tail token/prob scatter (offsets for tail chunk only).
+        # Draft-prob flatten must use ``prefix_lens`` after tail ``add_`` so tail
+        # columns included in ``hv_probs_prefix`` are not dropped.
+        tail_prefix_lens_before: torch.Tensor | None = (
             prefix_lens.clone() if hv_probs_prefix is not None else None
         )
 
@@ -6041,11 +6044,15 @@ class GPUModelRunner(
             before_prefix_lens_np=before_tail_lens,
             emitted_rows_host=tail_emitted_rows_host,
         )
-        if hv_probs_prefix is not None and tail.probs is not None:
+        if (
+            hv_probs_prefix is not None
+            and tail.probs is not None
+            and tail_prefix_lens_before is not None
+        ):
             _hv_scatter_tail_probs_into_prefix(
                 hv_probs_prefix,
                 tail.probs,
-                prefix_lens,
+                tail_prefix_lens_before,
                 tail_len=tail_len,
                 cap=cap,
             )
@@ -6071,10 +6078,10 @@ class GPUModelRunner(
         draft_probs_flat = (
             _hv_extract_prefix_probs_flat(
                 hv_probs_prefix,
-                probs_prefix_lens,
+                prefix_lens,
                 batch_size=batch_size,
             )
-            if hv_probs_prefix is not None and probs_prefix_lens is not None
+            if hv_probs_prefix is not None
             else None
         )
         inter_verified_rows = inter_verified_gpu.detach().cpu().tolist()
