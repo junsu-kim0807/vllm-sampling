@@ -5674,15 +5674,22 @@ class GPUModelRunner(
         proposal_tokens: torch.Tensor,
         num_rejected_tokens_gpu: torch.Tensor | None,
     ) -> DitRoundVerification:
-        """Intermediate verify: mirror CAD + prefix pack aligned to scratch step rows.
+        """Intermediate verify: spec mirror metadata + **base** CAD prefix pack.
 
-        ``_prepare_intermediate_metadata`` fills ``intermediate_step_input_ids`` /
-        ``intermediate_step_positions`` to match ``inter_cad``'s scheduled span; those
-        tensors (not the target 1-row frontier ``lc["target_*"]``) are fed into
-        ``_prepare_hv_step`` so ``build_prefix_conditioned_inputs`` indexes the same
-        flat layout as the draft frontier path. ``next_token_ids`` per round are taken
-        from ``prefix_tokens`` / ``prefix_lens`` when non-empty, else the round snapshot
-        base ``next_token_ids``.
+        ``_prepare_intermediate_metadata`` yields spec mirror ``prep`` (HV_GEOM_CHECK_A
+        / D vs proposal rows; includes spec-conditioned CAD for metadata only).
+        Prefix-conditioned verify
+        must use the **same per-request query width as draft propose** (typically one
+        scheduled decode row per request): ``hv_pack_cad`` from ``run_hv_rounds`` plus
+        ``lc["target_token_ids"]`` / positions of length ``B``. Feeding spec-shaped
+        ``intermediate_step_*`` rows together with spec-conditioned CAD would
+        double-append draft extensions inside ``hv_build_prefix_conditioned_inputs``.
+
+        ``next_token_ids`` per round follow ``prefix_tokens`` / ``prefix_lens`` when set.
+
+        Zero hidden states for the pack assume ``inter.pass_hidden_states_to_model`` is
+        false (``DraftModelProposer`` default); Eagle-style hidden passthrough is not
+        supported on this path.
         """
         if not self._intermediate_kv_frontier_enabled():
             raise RuntimeError(
@@ -5742,14 +5749,6 @@ class GPUModelRunner(
                 "hierarchical_verification: intermediate frontier metadata preparation "
                 f"returned None or missing spec_decode_metadata ({detail})."
             )
-        gid = int(getattr(inter, "kv_cache_gid", -1))
-        cad_map = prep.spec_decode_common_attn_metadata_by_gid or {}
-        inter_cad = cad_map.get(gid) or prep.spec_decode_common_attn_metadata
-        if inter_cad is None:
-            raise RuntimeError(
-                "hierarchical_verification: missing speculative CommonAttentionMetadata "
-                f"for intermediate kv_cache_gid={gid}"
-            )
         if not isinstance(hv_ctx, dict):
             raise RuntimeError(
                 "hierarchical_verification: missing _hv_round_ctx; "
@@ -5761,17 +5760,39 @@ class GPUModelRunner(
                 "hierarchical_verification: missing legacy_crosscheck snapshot; "
                 "run_hv_rounds() must populate _hv_round_ctx['legacy_crosscheck'] before verify."
             )
-        lc["cad"] = inter_cad
+        pack_cad = lc.get("hv_pack_cad")
+        if pack_cad is None:
+            raise RuntimeError(
+                "hierarchical_verification: legacy_crosscheck missing hv_pack_cad "
+                "(base-query CAD for HV prefix pack, same as draft propose). "
+                "run_hv_rounds must set legacy_crosscheck['hv_pack_cad']."
+            )
+        # Prefix pack + ``slice_hv_verification_logits`` use draft-style one query / req.
+        lc["cad"] = pack_cad
         if self._spec_step_debug_enabled() and self._spec_step_debug_tp0():
             self._hv_spec_step_debug_geom_check_a(proposal_tokens, prep)
 
+        if inter.pass_hidden_states_to_model:
+            raise NotImplementedError(
+                "standalone hierarchical_verification intermediate verify does not "
+                "support pass_hidden_states_to_model=True on the intermediate proposer; "
+                "the HV prefix pack uses zero hidden states like the draft frontier path."
+            )
+
         batch_size = int(proposal_tokens.shape[0])
-        total_tok = int(so.total_num_scheduled_tokens)
-        qsl_end = int(inter_cad.query_start_loc[-1].item())
-        if qsl_end != total_tok:
+        tt = lc["target_token_ids"]
+        tp = lc["target_positions"]
+        B_pack = int(tt.shape[0])
+        if B_pack != batch_size:
             raise RuntimeError(
-                "hierarchical_verification: intermediate CAD tail vs scheduled tokens "
-                f"query_start_loc[-1]={qsl_end} total_num_scheduled_tokens={total_tok}"
+                "hierarchical_verification: pack target rows != proposal batch "
+                f"target_token_ids.shape[0]={B_pack} batch_size={batch_size}"
+            )
+        q_pack = int(pack_cad.query_start_loc[-1].item())
+        if q_pack != B_pack:
+            raise RuntimeError(
+                "hierarchical_verification: hv_pack_cad query span != base target rows "
+                f"query_start_loc[-1]={q_pack} target_token_ids.shape[0]={B_pack}"
             )
 
         base_next = lc["next_token_ids"]
@@ -5791,29 +5812,16 @@ class GPUModelRunner(
         else:
             next_tok_tensor = base_next.to(torch.int32)
 
-        inter_tok_ids = self.intermediate_step_input_ids.gpu[:total_tok].contiguous()
-        inter_positions = self.intermediate_step_positions.gpu[:total_tok].contiguous()
         hs = int(inter.hidden_size)
-        zbuf = getattr(self, "_hv_inter_verify_zero_hidden", None)
-        if (
-            zbuf is None
-            or zbuf.shape[0] < total_tok
-            or zbuf.shape[1] != hs
-            or zbuf.dtype != inter.hidden_states.dtype
-            or zbuf.device != inter.hidden_states.device
-        ):
-            grow = max(total_tok, 1024)
-            self._hv_inter_verify_zero_hidden = torch.zeros(
-                (grow, hs),
-                dtype=inter.hidden_states.dtype,
-                device=inter.hidden_states.device,
-            )
-            zbuf = self._hv_inter_verify_zero_hidden
-        inter_hidden = zbuf[:total_tok]
+        th_use = torch.zeros(
+            (B_pack, hs),
+            dtype=inter.hidden_states.dtype,
+            device=inter.hidden_states.device,
+        )
 
-        lc["hv_step_target_token_ids"] = inter_tok_ids
-        lc["hv_step_target_positions"] = inter_positions
-        lc["hv_step_target_hidden_states"] = inter_hidden
+        lc["hv_step_target_token_ids"] = tt
+        lc["hv_step_target_positions"] = tp
+        lc["hv_step_target_hidden_states"] = th_use
         lc["hv_step_next_token_ids"] = next_tok_tensor
 
         prefix_rows = self._hv_prefix_rows_from_prefix_tensors(
@@ -5823,10 +5831,10 @@ class GPUModelRunner(
         )
         pre = self._prepare_hv_step(
             inter,
-            inter_cad,
-            target_token_ids=inter_tok_ids,
-            target_positions=inter_positions,
-            target_hidden_states=inter_hidden,
+            pack_cad,
+            target_token_ids=tt,
+            target_positions=tp,
+            target_hidden_states=th_use,
             next_token_ids=next_tok_tensor,
             num_rejected_tokens_gpu=lc["num_rejected_tokens_gpu"],
             prefix_rows=prefix_rows,
@@ -6292,13 +6300,15 @@ class GPUModelRunner(
                 sampling_metadata=round_sm,
                 use_draft_probs=use_draft_probs,
             )
-            # For ``_run_hv_intermediate_verify_from_frontier`` + optional env-gated crosscheck.
-            # ``cad`` is filled there with ``inter_cad`` (intermediate mirror), not ``draft_cad``.
+            # ``hv_pack_cad``: same base-query CAD as draft propose (one row / req).
+            # ``inter_cad`` from ``_prepare_intermediate_metadata`` is spec-conditioned;
+            # do not pass it to ``_prepare_hv_step`` or prefix packing double-extends drafts.
             self._hv_round_ctx["legacy_crosscheck"] = {
                 "target_token_ids": target_token_ids,
                 "target_positions": target_positions,
                 "target_hidden_states": target_hidden_states,
                 "next_token_ids": next_token_ids,
+                "hv_pack_cad": draft_cad,
                 "prefix_tokens": prefix_tokens,
                 "prefix_lens": prefix_lens,
                 "batch_size": batch_size,
