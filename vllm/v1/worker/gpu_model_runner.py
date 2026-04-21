@@ -1093,7 +1093,7 @@ class GPUModelRunner(
         self._dit_debug_last_commit_len: dict[str, int] = {}
         self._dit_debug_last_commit_token: dict[str, int] = {}
         # ``VLLM_SPEC_STEP_DEBUG=1``: log up to 5 HV propose+target-verify traces
-        # (tensor-parallel rank 0 only; avoids duplicate lines per TP worker).
+        # per tensor-parallel worker (each rank emits its own trace).
         self._spec_step_debug_remaining: int | None = None
         self._spec_step_debug_hv_snapshot: dict[str, Any] | None = None
 
@@ -5784,7 +5784,6 @@ class GPUModelRunner(
             )
 
         qsl_src = inter_cad_full.query_start_loc
-        last_rows = (qsl_src[1 : batch_size + 1] - 1).to(dtype=torch.long, device=qsl_src.device)
         tgt_flat = lc["target_token_ids"]
         tgt_pos = lc["target_positions"]
         flat_n = int(tgt_flat.shape[0])
@@ -5795,18 +5794,15 @@ class GPUModelRunner(
                 f"target_token_ids.shape[0]={flat_n} query_start_loc[-1]={q_flat}"
             )
 
-        # One row per request: target-sampled bonus ids (``run_hv_rounds`` snapshot).
-        nt_flat = lc["next_token_ids"].reshape(-1)
-        if int(nt_flat.shape[0]) != batch_size:
-            raise RuntimeError(
-                "hierarchical_verification: lc['next_token_ids'] must have one entry "
-                f"per batch row; got numel={int(nt_flat.shape[0])} batch_size={batch_size}"
-            )
-        tt_base = nt_flat.to(torch.int32)
+        # First scheduled row per request (canonical base frontier), not the last spec row.
+        first_rows = qsl_src[:batch_size].to(
+            dtype=torch.long, device=tgt_flat.device
+        )
+        tt_base = tgt_flat.index_select(0, first_rows).to(torch.int32)
         if tgt_pos.dim() == 1:
-            tp_base = tgt_pos.index_select(0, last_rows)
+            tp_base = tgt_pos.index_select(0, first_rows)
         else:
-            tp_base = tgt_pos[:, last_rows]
+            tp_base = tgt_pos[:, first_rows]
 
         hs = int(inter.hidden_size)
         th_base = torch.zeros(
@@ -5823,7 +5819,9 @@ class GPUModelRunner(
             dtype=inter_cad_full.query_start_loc_cpu.dtype,
             device=inter_cad_full.query_start_loc_cpu.device,
         )
-        slot_pack = inter_cad_full.slot_mapping.index_select(0, last_rows)
+        slot_pack = inter_cad_full.slot_mapping.index_select(
+            0, first_rows.to(device=inter_cad_full.slot_mapping.device)
+        )
         sl_src = inter_cad_full.seq_lens[:batch_size]
         seq_lens_pack = sl_src - Lspec
         if bool((seq_lens_pack < 1).any().item()):
@@ -5832,6 +5830,28 @@ class GPUModelRunner(
                 f"seq_lens[:{batch_size}]={sl_src.tolist()} Lspec={Lspec} -> {seq_lens_pack.tolist()}"
             )
         max_seq_pack = int(seq_lens_pack.max().item())
+
+        if self._spec_step_debug_enabled():
+            if tgt_pos.dim() == 1:
+                pos_at_first = tgt_pos.index_select(0, first_rows).detach().cpu().tolist()
+            else:
+                pos_at_first = "2D"
+            expect_pos = (seq_lens_pack - 1).detach().cpu().tolist()
+            tp_cpu = tp_base.detach().cpu().tolist() if tp_base.dim() == 1 else None
+            ok = (
+                tp_cpu is not None
+                and len(tp_cpu) == len(expect_pos)
+                and all(int(tp_cpu[i]) == int(expect_pos[i]) for i in range(len(tp_cpu)))
+            )
+            logger.warning(
+                "SPEC_STEP_DEBUG HV_PACK_POS_CHECK tp_base=%s seq_lens_pack-1=%s "
+                "qsl_src=%s pos_at_first_rows=%s align_tp_eq_seqm1=%s",
+                tp_cpu,
+                expect_pos,
+                qsl_src.detach().cpu().tolist(),
+                pos_at_first,
+                ok,
+            )
 
         pack_cad = inter_cad_full.replace(
             query_start_loc=qsl_pack,
@@ -5844,10 +5864,16 @@ class GPUModelRunner(
             max_seq_len=max_seq_pack,
         )
         lc["cad"] = pack_cad
-        if self._spec_step_debug_enabled() and self._spec_step_debug_tp0():
+        if self._spec_step_debug_enabled():
             self._hv_spec_step_debug_geom_check_a(proposal_tokens, prep)
 
         base_next = lc["next_token_ids"]
+        if int(base_next.reshape(-1).shape[0]) != batch_size:
+            raise RuntimeError(
+                "hierarchical_verification: lc['next_token_ids'] must have one entry "
+                f"per batch row; got numel={int(base_next.reshape(-1).shape[0])} "
+                f"batch_size={batch_size}"
+            )
         pt = hv_ctx.get("prefix_tokens")
         pl = hv_ctx.get("prefix_lens")
         if pt is not None and pl is not None and int(pt.shape[0]) == batch_size:
@@ -5890,7 +5916,7 @@ class GPUModelRunner(
             pre,
             num_rejected_tokens_gpu=lc["num_rejected_tokens_gpu"],
         )
-        if self._spec_step_debug_enabled() and self._spec_step_debug_tp0():
+        if self._spec_step_debug_enabled():
             self._hv_spec_step_debug_geom_check_d(
                 proposal_tokens, ver.logits_flat, ver.bonus_logits, prep
             )
@@ -6029,7 +6055,7 @@ class GPUModelRunner(
         return os.environ.get("VLLM_SPEC_STEP_DEBUG_STRICT", "0") == "1"
 
     def _spec_step_debug_tp0(self) -> bool:
-        """Emit noisy SPEC_STEP_DEBUG / HV geom logs on tensor-parallel rank 0 only."""
+        """True on tensor-parallel rank 0 (e.g. one-rank-only legacy crosschecks)."""
         try:
             return int(get_tensor_model_parallel_rank()) == 0
         except Exception:
@@ -6037,8 +6063,6 @@ class GPUModelRunner(
 
     def _spec_step_debug_try_emit(self) -> bool:
         if not self._spec_step_debug_enabled():
-            return False
-        if not self._spec_step_debug_tp0():
             return False
         if self._spec_step_debug_remaining is None:
             self._spec_step_debug_remaining = 5
@@ -6080,7 +6104,7 @@ class GPUModelRunner(
         proposal_tokens: torch.Tensor,
         prep: IntermediateFrontierPrepareResult,
     ) -> None:
-        """Debug-only: metadata draft rows must match ``proposal_tokens`` (TP rank 0)."""
+        """Debug-only: metadata draft rows must match ``proposal_tokens``."""
         meta = prep.spec_decode_metadata
         assert meta is not None
         Bp = int(proposal_tokens.shape[0])
@@ -6119,7 +6143,7 @@ class GPUModelRunner(
         bonus_logits: torch.Tensor,
         prep: IntermediateFrontierPrepareResult,
     ) -> None:
-        """Debug-only: log argmax token ids along inter-verify logits (TP rank 0)."""
+        """Debug-only: log argmax token ids along inter-verify logits."""
         meta = prep.spec_decode_metadata
         assert meta is not None
         Bp = int(proposal_tokens.shape[0])
@@ -7535,7 +7559,6 @@ class GPUModelRunner(
         )
         if (
             self._spec_step_debug_enabled()
-            and self._spec_step_debug_tp0()
             and bundle is not None
             and spec_decode_metadata is not None
         ):
