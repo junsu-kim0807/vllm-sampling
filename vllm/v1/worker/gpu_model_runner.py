@@ -5652,19 +5652,17 @@ class GPUModelRunner(
                 for b in range(num_reqs_hv)
             }
 
-        # Always rebuild frontier prep for the current proposal. A prior optimization
-        # reused ``inter_prep_base`` and only ``spec_decode_metadata.draft_token_ids``.
-        # The intermediate forward copies ``intermediate_step_input_ids`` /
-        # ``intermediate_step_positions`` (filled by ``_prepare_inputs``), not
-        # ``draft_token_ids`` alone — so draft-only updates left stale per-round inputs.
+        # Standalone HV: no intermediate prep cache. ``_prepare_intermediate_metadata``
+        # fills scratch step buffers (``intermediate_step_input_ids``, positions, etc.)
+        # that are copied into ``inter`` for forward; they must match the current
+        # ``proposal_tokens`` every round — unlike ``spec_decode_metadata.draft_token_ids``
+        # alone, which is insufficient to refresh those buffers.
         with self._hv_suspend_cached_prev_sampled_tokens():
             prep = self._prepare_intermediate_metadata(
                 so,
                 nst,
                 scheduled_spec_decode_tokens_override=_scheduled_spec_decode_tokens_override(),
             )
-            if hv_ctx is not None:
-                hv_ctx["inter_prep_base"] = prep
         if prep is None or prep.spec_decode_metadata is None:
             detail = self._describe_frontier_prepare_blockers(
                 frontier="intermediate",
@@ -5849,7 +5847,6 @@ class GPUModelRunner(
         ]
         self._hv_round_ctx = {
             "nst": np.array(nsched_list, dtype=np.int32),
-            "inter_prep_base": None,
         }
         _hv_t0 = time.perf_counter() if os.environ.get("VLLM_HV_PROFILE", "0") == "1" else None
 
