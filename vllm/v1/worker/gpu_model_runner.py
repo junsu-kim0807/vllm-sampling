@@ -5805,6 +5805,10 @@ class GPUModelRunner(
     def _spec_step_debug_enabled(self) -> bool:
         return os.environ.get("VLLM_SPEC_STEP_DEBUG", "0") == "1"
 
+    def _spec_step_debug_strict(self) -> bool:
+        """When set with ``VLLM_SPEC_STEP_DEBUG``, geom mismatches raise instead of log-only."""
+        return os.environ.get("VLLM_SPEC_STEP_DEBUG_STRICT", "0") == "1"
+
     def _spec_step_debug_tp0(self) -> bool:
         try:
             return bool(get_tp_group().is_first_rank())
@@ -5878,13 +5882,15 @@ class GPUModelRunner(
             ]
             logger.error(
                 "SPEC_STEP_DEBUG HV_GEOM_CHECK_A proposal_vs_meta_draft mismatch "
-                "proposal_rows=%s meta_rows=%s meta_num_draft_tokens=%s req_ids=%s",
+                "proposal_rows=%s meta_rows=%s meta_num_draft_tokens=%s req_ids=%s "
+                "(set VLLM_SPEC_STEP_DEBUG_STRICT=1 to abort on this check)",
                 prop_rows,
                 rows,
                 meta_nd[: Bp + 2],
                 req_ids,
             )
-            raise AssertionError("SPEC_STEP_DEBUG HV_GEOM_CHECK_A failed")
+            if self._spec_step_debug_strict():
+                raise AssertionError("SPEC_STEP_DEBUG HV_GEOM_CHECK_A failed")
 
     def _hv_spec_step_debug_geom_check_d(
         self,
@@ -7305,10 +7311,11 @@ class GPUModelRunner(
             ti = spec_decode_metadata.draft_token_ids.detach().cpu()
             shape_ok = bf.shape == ti.shape
             same = shape_ok and torch.equal(bf, ti)
-            logger.warning(
+            log_fn = logger.warning if same else logger.error
+            log_fn(
                 "SPEC_STEP_DEBUG HV_GEOM_CHECK_C bundle_vs_target_metadata_input "
                 "same=%s shape_ok=%s bundle_shape=%s meta_shape=%s bundle_num_draft=%s "
-                "meta_num_draft=%s",
+                "meta_num_draft=%s (set VLLM_SPEC_STEP_DEBUG_STRICT=1 to abort if same=False)",
                 same,
                 shape_ok,
                 tuple(bf.shape),
@@ -7316,7 +7323,7 @@ class GPUModelRunner(
                 list(bundle.num_draft_tokens),
                 spec_decode_metadata.num_draft_tokens.detach().cpu().tolist(),
             )
-            if not same:
+            if not same and self._spec_step_debug_strict():
                 raise AssertionError("SPEC_STEP_DEBUG HV_GEOM_CHECK_C failed")
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
