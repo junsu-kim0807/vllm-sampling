@@ -5689,6 +5689,8 @@ class GPUModelRunner(
                 "hierarchical_verification: missing speculative CommonAttentionMetadata "
                 f"for intermediate kv_cache_gid={gid}"
             )
+        if self._spec_step_debug_enabled() and self._spec_step_debug_tp0():
+            self._hv_spec_step_debug_geom_check_a(proposal_tokens, prep)
         total_tok = int(so.total_num_scheduled_tokens)
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             inter._determine_batch_execution_and_padding(total_tok)
@@ -5785,6 +5787,10 @@ class GPUModelRunner(
                 all_logits, prep.spec_decode_metadata
             )
         )
+        if self._spec_step_debug_enabled() and self._spec_step_debug_tp0():
+            self._hv_spec_step_debug_geom_check_d(
+                proposal_tokens, logits_flat, bonus_logits, prep
+            )
         return DitRoundVerification(
             logits_flat=logits_flat, bonus_logits=bonus_logits
         )
@@ -5817,6 +5823,99 @@ class GPUModelRunner(
         self._spec_step_debug_remaining -= 1
         return True
 
+    @staticmethod
+    def _hv_spec_debug_verified_top1_and_accepted_rows(
+        proposal_tokens: torch.Tensor,
+        verification: DitRoundVerification,
+        decision: DitRoundDecision,
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """Per-row L+1 argmax ids from inter verify logits, plus accepted id rows."""
+        B = int(proposal_tokens.shape[0])
+        L = int(proposal_tokens.shape[1])
+        lf = verification.logits_flat
+        bl = verification.bonus_logits
+        if lf.numel() == 0 or lf.shape[0] != B * L:
+            verified_rows = [[] for _ in range(B)]
+        else:
+            top_draft = lf.view(B, L, -1).argmax(dim=-1).detach().cpu().tolist()
+            top_bonus = bl.argmax(dim=-1).detach().cpu().tolist()
+            verified_rows = [
+                [int(top_draft[b][j]) for j in range(L)] + [int(top_bonus[b])]
+                for b in range(B)
+            ]
+        al = decision.accepted_lens.detach().cpu().tolist()
+        et = decision.emitted_tokens.detach().cpu().tolist()
+        accepted_rows: list[list[int]] = []
+        for b in range(B):
+            n = int(al[b])
+            accepted_rows.append([int(et[b][j]) for j in range(n)])
+        return verified_rows, accepted_rows
+
+    def _hv_spec_step_debug_geom_check_a(
+        self,
+        proposal_tokens: torch.Tensor,
+        prep: IntermediateFrontierPrepareResult,
+    ) -> None:
+        """Debug-only: metadata draft rows must match ``proposal_tokens`` (TP rank 0)."""
+        meta = prep.spec_decode_metadata
+        assert meta is not None
+        Bp = int(proposal_tokens.shape[0])
+        prop_rows = proposal_tokens.detach().cpu().tolist()
+        meta_nd = meta.num_draft_tokens.detach().cpu().tolist()
+        meta_flat = meta.draft_token_ids.detach().cpu().tolist()
+        rows: list[list[int]] = []
+        off = 0
+        for i in range(Bp):
+            if i >= len(meta_nd):
+                break
+            n_i = int(meta_nd[i])
+            rows.append([int(x) for x in meta_flat[off : off + n_i]])
+            off += n_i
+        if rows != prop_rows:
+            req_ids = [
+                str(self.input_batch.req_ids[j])
+                for j in range(min(Bp, int(self.input_batch.num_reqs)))
+            ]
+            logger.error(
+                "SPEC_STEP_DEBUG HV_GEOM_CHECK_A proposal_vs_meta_draft mismatch "
+                "proposal_rows=%s meta_rows=%s meta_num_draft_tokens=%s req_ids=%s",
+                prop_rows,
+                rows,
+                meta_nd[: Bp + 2],
+                req_ids,
+            )
+            raise AssertionError("SPEC_STEP_DEBUG HV_GEOM_CHECK_A failed")
+
+    def _hv_spec_step_debug_geom_check_d(
+        self,
+        proposal_tokens: torch.Tensor,
+        logits_flat: torch.Tensor,
+        bonus_logits: torch.Tensor,
+        prep: IntermediateFrontierPrepareResult,
+    ) -> None:
+        """Debug-only: log argmax token ids along inter-verify logits (TP rank 0)."""
+        meta = prep.spec_decode_metadata
+        assert meta is not None
+        Bp = int(proposal_tokens.shape[0])
+        Lp = int(proposal_tokens.shape[1])
+        if logits_flat.shape[0] != Bp * Lp:
+            logger.warning(
+                "SPEC_STEP_DEBUG HV_GEOM_CHECK_D skip logits_flat.shape=%s expected_rows=%s",
+                tuple(logits_flat.shape),
+                Bp * Lp,
+            )
+            return
+        top1_draft = logits_flat.view(Bp, Lp, -1).argmax(dim=-1).detach().cpu().tolist()
+        top1_bonus = bonus_logits.argmax(dim=-1).detach().cpu().tolist()
+        logger.warning(
+            "SPEC_STEP_DEBUG HV_GEOM_CHECK_D inter_verify_argmax_draft_positions=%s "
+            "bonus_top1=%s proposal_tokens=%s meta_draft_token_ids_flat=%s",
+            top1_draft,
+            top1_bonus,
+            proposal_tokens.detach().cpu().tolist(),
+            meta.draft_token_ids.detach().cpu().tolist(),
+        )
+
     def _emit_spec_step_debug_hv_bundle_target(
         self,
         hv_snapshot: dict[str, Any],
@@ -5838,9 +5937,12 @@ class GPUModelRunner(
         )
         logger.info(
             "SPEC_STEP_DEBUG [1] draft_round_token_ids=%s "
-            "intermediate_verified_emitted_token_ids=%s tail_draft_token_ids=%s req_ids=%s",
+            "intermediate_verified_token_ids(L+1_argmax_per_row)=%s "
+            "intermediate_accepted_token_ids(up_to_L+1_emitted)=%s "
+            "tail_draft_token_ids=%s req_ids=%s",
             hv_snapshot.get("draft_rounds"),
-            hv_snapshot.get("inter_rounds"),
+            hv_snapshot.get("intermediate_verified_token_ids"),
+            hv_snapshot.get("intermediate_accepted_token_ids"),
             hv_snapshot.get("tail_draft"),
             hv_snapshot.get("req_ids"),
         )
@@ -5866,16 +5968,18 @@ class GPUModelRunner(
             sampled_token_ids.detach().cpu().tolist(),
         )
         dr = hv_snapshot.get("draft_rounds")
-        ir = hv_snapshot.get("inter_rounds")
+        iacc = hv_snapshot.get("intermediate_accepted_token_ids")
+        ivrf = hv_snapshot.get("intermediate_verified_token_ids")
         td = hv_snapshot.get("tail_draft")
         first_inner_draft: int | None = None
         if dr and dr[0] and dr[0][0]:
             first_inner_draft = int(dr[0][0][0])
-        first_inter_emit: int | None = None
-        if ir and ir[0] and ir[0][0]:
-            row0 = ir[0][0]
-            if row0:
-                first_inter_emit = int(row0[0])
+        first_inter_accepted: int | None = None
+        if iacc and iacc[0] and iacc[0][0]:
+            first_inter_accepted = int(iacc[0][0][0])
+        first_inter_verify_top1: int | None = None
+        if ivrf and ivrf[0] and ivrf[0][0]:
+            first_inter_verify_top1 = int(ivrf[0][0][0])
         first_tail: int | None = None
         if td and td[0]:
             first_tail = int(td[0][0])
@@ -5890,17 +5994,19 @@ class GPUModelRunner(
         flags = {
             "target_eq_bundle_first": target_first == bundle_first,
             "target_eq_first_inner_draft": target_first == first_inner_draft,
-            "target_eq_first_inter_emitted": target_first == first_inter_emit,
+            "target_eq_first_inter_accepted": target_first == first_inter_accepted,
+            "target_eq_first_inter_verify_top1": target_first == first_inter_verify_top1,
             "target_eq_first_tail_draft": target_first == first_tail,
         }
         logger.info(
             "SPEC_STEP_DEBUG [4] first_token_ids inner_round0_draft_pos0=%s "
-            "intermediate_emitted_row0_pos0=%s tail_draft_pos0=%s bundle_flat_pos0=%s "
-            "target_sampled_pos0=%s alignment_flags=%s "
+            "intermediate_accepted_row0_pos0=%s inter_verify_argmax_row0_pos0=%s "
+            "tail_draft_pos0=%s bundle_flat_pos0=%s target_sampled_pos0=%s alignment_flags=%s "
             "(inter_counters_inter_verified_accepted_are_per_round_L_and_emitted_lens; "
             "mismatch_here_suggests_intermediate_frontier_vs_target_verify_geometry)",
             first_inner_draft,
-            first_inter_emit,
+            first_inter_accepted,
+            first_inter_verify_top1,
             first_tail,
             bundle_first,
             target_first,
@@ -5989,7 +6095,8 @@ class GPUModelRunner(
         self._hv_round_ctx["prefix_tokens"] = prefix_tokens
         self._hv_round_ctx["prefix_lens"] = prefix_lens
         draft_round_tokens: list[list[list[int]]] = []
-        inter_emit_rounds: list[list[list[int]]] = []
+        intermediate_verified_token_ids: list[list[list[int]]] = []
+        intermediate_accepted_token_ids: list[list[list[int]]] = []
 
         for _ in range(n_inner):
             sm_idxs = list(range(batch_size))
@@ -6040,7 +6147,11 @@ class GPUModelRunner(
             )
             emitted_rows_host = dit_decision_emitted_rows_host(decision)
             if self._spec_step_debug_enabled():
-                inter_emit_rounds.append(emitted_rows_host)
+                v_rows, a_rows = self._hv_spec_debug_verified_top1_and_accepted_rows(
+                    proposal.tokens, verification, decision
+                )
+                intermediate_verified_token_ids.append(v_rows)
+                intermediate_accepted_token_ids.append(a_rows)
             self._advance_intermediate_frontier_after_round(
                 decision,
                 batch_size=batch_size,
@@ -6235,7 +6346,8 @@ class GPUModelRunner(
         if self._spec_step_debug_enabled():
             self._spec_step_debug_hv_snapshot = {
                 "draft_rounds": draft_round_tokens,
-                "inter_rounds": inter_emit_rounds,
+                "intermediate_verified_token_ids": intermediate_verified_token_ids,
+                "intermediate_accepted_token_ids": intermediate_accepted_token_ids,
                 "tail_draft": tail.tokens.detach().cpu().tolist(),
                 "req_ids": [
                     str(self.input_batch.req_ids[i])
@@ -7183,6 +7295,29 @@ class GPUModelRunner(
             logits,
             verity_sm,
         )
+        if (
+            self._spec_step_debug_enabled()
+            and self._spec_step_debug_tp0()
+            and bundle is not None
+            and spec_decode_metadata is not None
+        ):
+            bf = bundle.draft_token_ids.detach().cpu()
+            ti = spec_decode_metadata.draft_token_ids.detach().cpu()
+            shape_ok = bf.shape == ti.shape
+            same = shape_ok and torch.equal(bf, ti)
+            logger.warning(
+                "SPEC_STEP_DEBUG HV_GEOM_CHECK_C bundle_vs_target_metadata_input "
+                "same=%s shape_ok=%s bundle_shape=%s meta_shape=%s bundle_num_draft=%s "
+                "meta_num_draft=%s",
+                same,
+                shape_ok,
+                tuple(bf.shape),
+                tuple(ti.shape),
+                list(bundle.num_draft_tokens),
+                spec_decode_metadata.num_draft_tokens.detach().cpu().tolist(),
+            )
+            if not same:
+                raise AssertionError("SPEC_STEP_DEBUG HV_GEOM_CHECK_C failed")
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
