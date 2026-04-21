@@ -1723,27 +1723,61 @@ class GPUModelRunner(
         for req_index in range(self.input_batch.num_reqs):
             req_id = self.input_batch.req_ids[req_index]
             tgt = self.requests[req_id]
-            committed = self.intermediate_committed_tokens.get(
-                req_id, tgt.num_computed_tokens
-            )
+            # Authoritative frontier is ``tgt`` after ``_update_states`` (scheduler).
+            # ``intermediate_committed_tokens`` is updated in reconcile, but a stale
+            # entry (e.g. 0 when decode advanced) must not pin ``mir`` / ``ib`` behind
+            # ``tgt`` — mirror CAD would then disagree with target-forward tensors in
+            # standalone HV (seq_lens ~ num_scheduled only, vs target positions ~51).
+            committed = int(tgt.num_computed_tokens)
+            self.intermediate_committed_tokens[req_id] = committed
             if req_id in ib.req_id_to_index:
                 mir = self.intermediate_requests[req_id]
-                mir.num_computed_tokens = committed
+                if (
+                    mir.num_computed_tokens != committed
+                    or len(mir.output_token_ids) != len(tgt.output_token_ids)
+                ):
+                    mir.num_computed_tokens = committed
+                    mir.output_token_ids[:] = list(tgt.output_token_ids)
                 mir_idx = ib.req_id_to_index[req_id]
                 ib.num_computed_tokens_cpu[mir_idx] = committed
+                self._refresh_intermediate_ib_prompt_output_tokens(ib, mir, mir_idx)
                 ib.update_req_spec_token_ids(mir, scheduled_spec)
             else:
                 mir = self.intermediate_requests.get(req_id)
                 if mir is None:
                     mir = self._intermediate_shallow_req_clone(tgt)
                     self.intermediate_requests[req_id] = mir
-                mir.num_computed_tokens = committed
+                else:
+                    if (
+                        mir.num_computed_tokens != committed
+                        or len(mir.output_token_ids) != len(tgt.output_token_ids)
+                    ):
+                        mir.num_computed_tokens = committed
+                        mir.output_token_ids[:] = list(tgt.output_token_ids)
                 ib.add_request(mir)
                 mir_idx = ib.req_id_to_index[req_id]
                 ib.num_computed_tokens_cpu[mir_idx] = committed
                 ib.update_req_spec_token_ids(mir, scheduled_spec)
         ib.condense()
         ib.refresh_metadata()
+
+    def _refresh_intermediate_ib_prompt_output_tokens(
+        self, ib: InputBatch, request: CachedRequestState, req_index: int
+    ) -> None:
+        """Rewrite ``ib.token_ids_cpu`` / ``num_tokens_no_spec`` from *request* (prompt + output)."""
+        npt = int(request.num_prompt_tokens)
+        start_idx = npt
+        end_idx = start_idx + len(request.output_token_ids)
+        if request.prompt_token_ids is not None:
+            ib.token_ids_cpu[req_index, :npt] = request.prompt_token_ids
+            ib.is_token_ids[req_index, :npt] = True
+        elif request.prompt_embeds is not None:
+            raise NotImplementedError(
+                "intermediate mirror batch refresh does not support prompt_embeds"
+            )
+        ib.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids
+        ib.is_token_ids[req_index, start_idx:end_idx] = True
+        ib.num_tokens_no_spec[req_index] = request.num_tokens
 
     def _prepare_intermediate_metadata(
         self,
@@ -5681,7 +5715,7 @@ class GPUModelRunner(
         / ``hv_build_prefix_conditioned_inputs`` assume one base query row per request
         then append draft extensions. This path builds ``pack_cad`` from the
         intermediate mirror CAD in ``prep`` (correct ``block_table`` / slots), taking the
-        **last scheduled query row** per request and shrinking ``seq_lens`` by
+        **first scheduled query row** per request and shrinking ``seq_lens`` by
         ``proposal.shape[1]`` so extension KV does not overlap target-written spec slots.
 
         ``next_token_ids`` to ``_prepare_hv_step`` still use prefix-aware
@@ -5720,6 +5754,18 @@ class GPUModelRunner(
             raise RuntimeError(
                 "hierarchical_verification: proposal_tokens row count "
                 f"({prop_rows}) < batch num_reqs ({num_reqs_hv})"
+            )
+
+        if self._spec_step_debug_enabled():
+            nb = min(prop_rows, num_reqs_hv)
+            _rids = [self.input_batch.req_ids[i] for i in range(nb)]
+            logger.warning(
+                "SPEC_STEP_DEBUG HV_INTER_STATE num_computed_ib=%s num_computed_tgt=%s "
+                "intermediate_committed=%s req_ids=%s",
+                ib_inter.num_computed_tokens_cpu[:nb].tolist(),
+                [int(self.requests[rid].num_computed_tokens) for rid in _rids],
+                [self.intermediate_committed_tokens.get(rid) for rid in _rids],
+                [str(r) for r in _rids],
             )
 
         def _scheduled_spec_decode_tokens_override() -> dict[str, list[int]]:
