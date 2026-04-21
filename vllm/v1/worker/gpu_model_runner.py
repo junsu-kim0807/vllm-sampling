@@ -5203,6 +5203,16 @@ class GPUModelRunner(
                     "Mamba2/GDN attention metadata builders on the intermediate verifier."
                 )
         cad = clone_common_attn_metadata(inter_cad)
+        _qsl_tail = int(cad.query_start_loc[-1].item())
+        _tok_n = int(target_token_ids.shape[0])
+        if _qsl_tail != _tok_n:
+            raise RuntimeError(
+                "HV _prepare_hv_step layout mismatch: cad.query_start_loc[-1]= "
+                f"{_qsl_tail} != target_token_ids.shape[0]={_tok_n}. "
+                "Prefix-conditioned verify requires flat token/hidden tensors spanning "
+                "the same scheduled queries as ``cad`` (mirror draft_step / "
+                "intermediate_step scratch layout)."
+            )
         (
             cad,
             target_token_ids,
@@ -5664,13 +5674,15 @@ class GPUModelRunner(
         proposal_tokens: torch.Tensor,
         num_rejected_tokens_gpu: torch.Tensor | None,
     ) -> DitRoundVerification:
-        """Intermediate verify: mirror CAD from frontier prep + legacy-equivalent logits path.
+        """Intermediate verify: mirror CAD + prefix pack aligned to scratch step rows.
 
-        ``_prepare_intermediate_metadata`` supplies ``inter_cad`` / spec metadata for the
-        intermediate mirror batch (debug checks, optional crosscheck). Verifier logits
-        use the same prefix-conditioned pack + ``slice_hv_verification_logits`` path as
-        ``_verify_chunk_with_prefix`` / ``_run_hv_verify_step``, not ``inter_cad`` +
-        scheduler-flat gather (which can disagree with that reference geometry).
+        ``_prepare_intermediate_metadata`` fills ``intermediate_step_input_ids`` /
+        ``intermediate_step_positions`` to match ``inter_cad``'s scheduled span; those
+        tensors (not the target 1-row frontier ``lc["target_*"]``) are fed into
+        ``_prepare_hv_step`` so ``build_prefix_conditioned_inputs`` indexes the same
+        flat layout as the draft frontier path. ``next_token_ids`` per round are taken
+        from ``prefix_tokens`` / ``prefix_lens`` when non-empty, else the round snapshot
+        base ``next_token_ids``.
         """
         if not self._intermediate_kv_frontier_enabled():
             raise RuntimeError(
@@ -5754,6 +5766,56 @@ class GPUModelRunner(
             self._hv_spec_step_debug_geom_check_a(proposal_tokens, prep)
 
         batch_size = int(proposal_tokens.shape[0])
+        total_tok = int(so.total_num_scheduled_tokens)
+        qsl_end = int(inter_cad.query_start_loc[-1].item())
+        if qsl_end != total_tok:
+            raise RuntimeError(
+                "hierarchical_verification: intermediate CAD tail vs scheduled tokens "
+                f"query_start_loc[-1]={qsl_end} total_num_scheduled_tokens={total_tok}"
+            )
+
+        base_next = lc["next_token_ids"]
+        pt = hv_ctx.get("prefix_tokens")
+        pl = hv_ctx.get("prefix_lens")
+        if pt is not None and pl is not None and int(pt.shape[0]) == batch_size:
+            dev = base_next.device
+            ar = torch.arange(batch_size, device=dev, dtype=torch.int64)
+            last_idx = (pl.to(torch.int64) - 1).clamp(min=0)
+            gathered = pt[ar, last_idx].to(torch.int32)
+            empty = pl == 0
+            next_tok_tensor = torch.where(
+                empty,
+                base_next.to(torch.int32),
+                gathered,
+            )
+        else:
+            next_tok_tensor = base_next.to(torch.int32)
+
+        inter_tok_ids = self.intermediate_step_input_ids.gpu[:total_tok].contiguous()
+        inter_positions = self.intermediate_step_positions.gpu[:total_tok].contiguous()
+        hs = int(inter.hidden_size)
+        zbuf = getattr(self, "_hv_inter_verify_zero_hidden", None)
+        if (
+            zbuf is None
+            or zbuf.shape[0] < total_tok
+            or zbuf.shape[1] != hs
+            or zbuf.dtype != inter.hidden_states.dtype
+            or zbuf.device != inter.hidden_states.device
+        ):
+            grow = max(total_tok, 1024)
+            self._hv_inter_verify_zero_hidden = torch.zeros(
+                (grow, hs),
+                dtype=inter.hidden_states.dtype,
+                device=inter.hidden_states.device,
+            )
+            zbuf = self._hv_inter_verify_zero_hidden
+        inter_hidden = zbuf[:total_tok]
+
+        lc["hv_step_target_token_ids"] = inter_tok_ids
+        lc["hv_step_target_positions"] = inter_positions
+        lc["hv_step_target_hidden_states"] = inter_hidden
+        lc["hv_step_next_token_ids"] = next_tok_tensor
+
         prefix_rows = self._hv_prefix_rows_from_prefix_tensors(
             lc["prefix_tokens"],
             lc["prefix_lens"],
@@ -5762,10 +5824,10 @@ class GPUModelRunner(
         pre = self._prepare_hv_step(
             inter,
             inter_cad,
-            target_token_ids=lc["target_token_ids"],
-            target_positions=lc["target_positions"],
-            target_hidden_states=lc["target_hidden_states"],
-            next_token_ids=lc["next_token_ids"],
+            target_token_ids=inter_tok_ids,
+            target_positions=inter_positions,
+            target_hidden_states=inter_hidden,
+            next_token_ids=next_tok_tensor,
             num_rejected_tokens_gpu=lc["num_rejected_tokens_gpu"],
             prefix_rows=prefix_rows,
             candidate_tokens=proposal_tokens,
@@ -5859,10 +5921,16 @@ class GPUModelRunner(
         ref_flat, ref_bonus = _verify_chunk_with_prefix(
             inter,
             cad=lc["cad"],
-            target_token_ids=lc["target_token_ids"],
-            target_positions=lc["target_positions"],
-            target_hidden_states=lc["target_hidden_states"],
-            next_token_ids=lc["next_token_ids"],
+            target_token_ids=lc.get(
+                "hv_step_target_token_ids", lc["target_token_ids"]
+            ),
+            target_positions=lc.get(
+                "hv_step_target_positions", lc["target_positions"]
+            ),
+            target_hidden_states=lc.get(
+                "hv_step_target_hidden_states", lc["target_hidden_states"]
+            ),
+            next_token_ids=lc.get("hv_step_next_token_ids", lc["next_token_ids"]),
             num_rejected_tokens_gpu=lc["num_rejected_tokens_gpu"],
             prefix_rows=prefix_rows,
             draft_tokens=proposal_tokens.to(torch.int32),
