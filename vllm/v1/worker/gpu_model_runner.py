@@ -5674,22 +5674,22 @@ class GPUModelRunner(
         proposal_tokens: torch.Tensor,
         num_rejected_tokens_gpu: torch.Tensor | None,
     ) -> DitRoundVerification:
-        """Intermediate verify: spec mirror metadata + **base** CAD prefix pack.
+        """Intermediate verify: spec mirror ``prep`` + **synthesized** 1-query/req pack.
 
-        ``_prepare_intermediate_metadata`` yields spec mirror ``prep`` (HV_GEOM_CHECK_A
-        / D vs proposal rows; includes spec-conditioned CAD for metadata only).
-        Prefix-conditioned verify
-        must use the **same per-request query width as draft propose** (typically one
-        scheduled decode row per request): ``hv_pack_cad`` from ``run_hv_rounds`` plus
-        ``lc["target_token_ids"]`` / positions of length ``B``. Feeding spec-shaped
-        ``intermediate_step_*`` rows together with spec-conditioned CAD would
-        double-append draft extensions inside ``hv_build_prefix_conditioned_inputs``.
+        ``run_hv_rounds`` passes spec-conditioned ``lc["target_*"]`` (flat
+        ``sum_b num_sched_tokens[b]`` rows), not one row per request. ``_prepare_hv_step``
+        / ``hv_build_prefix_conditioned_inputs`` assume one base query row per request
+        then append draft extensions. This path builds ``pack_cad`` from the
+        intermediate mirror CAD in ``prep`` (correct ``block_table`` / slots), taking the
+        **last scheduled query row** per request and shrinking ``seq_lens`` by
+        ``proposal.shape[1]`` so extension KV does not overlap target-written spec slots.
 
-        ``next_token_ids`` per round follow ``prefix_tokens`` / ``prefix_lens`` when set.
+        ``next_token_ids`` to ``_prepare_hv_step`` still use prefix-aware
+        ``next_tok_tensor``; base-row token ids use ``lc["next_token_ids"]`` (bonus
+        snapshot). Positions at those rows come from ``lc["target_positions"]`` indexed
+        by the same flat row ids.
 
-        Zero hidden states for the pack assume ``inter.pass_hidden_states_to_model`` is
-        false (``DraftModelProposer`` default); Eagle-style hidden passthrough is not
-        supported on this path.
+        Zero hidden states assume ``inter.pass_hidden_states_to_model`` is false.
         """
         if not self._intermediate_kv_frontier_enabled():
             raise RuntimeError(
@@ -5760,18 +5760,6 @@ class GPUModelRunner(
                 "hierarchical_verification: missing legacy_crosscheck snapshot; "
                 "run_hv_rounds() must populate _hv_round_ctx['legacy_crosscheck'] before verify."
             )
-        pack_cad = lc.get("hv_pack_cad")
-        if pack_cad is None:
-            raise RuntimeError(
-                "hierarchical_verification: legacy_crosscheck missing hv_pack_cad "
-                "(base-query CAD for HV prefix pack, same as draft propose). "
-                "run_hv_rounds must set legacy_crosscheck['hv_pack_cad']."
-            )
-        # Prefix pack + ``slice_hv_verification_logits`` use draft-style one query / req.
-        lc["cad"] = pack_cad
-        if self._spec_step_debug_enabled() and self._spec_step_debug_tp0():
-            self._hv_spec_step_debug_geom_check_a(proposal_tokens, prep)
-
         if inter.pass_hidden_states_to_model:
             raise NotImplementedError(
                 "standalone hierarchical_verification intermediate verify does not "
@@ -5780,20 +5768,84 @@ class GPUModelRunner(
             )
 
         batch_size = int(proposal_tokens.shape[0])
-        tt = lc["target_token_ids"]
-        tp = lc["target_positions"]
-        B_pack = int(tt.shape[0])
-        if B_pack != batch_size:
+        Lspec = int(proposal_tokens.shape[1])
+        gid = int(getattr(inter, "kv_cache_gid", -1))
+        cad_map = prep.spec_decode_common_attn_metadata_by_gid or {}
+        inter_cad_full = cad_map.get(gid) or prep.spec_decode_common_attn_metadata
+        if inter_cad_full is None:
             raise RuntimeError(
-                "hierarchical_verification: pack target rows != proposal batch "
-                f"target_token_ids.shape[0]={B_pack} batch_size={batch_size}"
+                "hierarchical_verification: missing intermediate CommonAttentionMetadata "
+                f"for kv_cache_gid={gid}"
             )
-        q_pack = int(pack_cad.query_start_loc[-1].item())
-        if q_pack != B_pack:
+        if int(inter_cad_full.batch_size()) < batch_size:
             raise RuntimeError(
-                "hierarchical_verification: hv_pack_cad query span != base target rows "
-                f"query_start_loc[-1]={q_pack} target_token_ids.shape[0]={B_pack}"
+                "hierarchical_verification: intermediate CAD batch smaller than HV batch "
+                f"cad_batch={int(inter_cad_full.batch_size())} batch_size={batch_size}"
             )
+
+        qsl_src = inter_cad_full.query_start_loc
+        last_rows = (qsl_src[1 : batch_size + 1] - 1).to(dtype=torch.long, device=qsl_src.device)
+        tgt_flat = lc["target_token_ids"]
+        tgt_pos = lc["target_positions"]
+        flat_n = int(tgt_flat.shape[0])
+        q_flat = int(qsl_src[-1].item())
+        if flat_n != q_flat:
+            raise RuntimeError(
+                "hierarchical_verification: target_token_ids length vs intermediate CAD "
+                f"target_token_ids.shape[0]={flat_n} query_start_loc[-1]={q_flat}"
+            )
+
+        # One row per request: target-sampled bonus ids (``run_hv_rounds`` snapshot).
+        nt_flat = lc["next_token_ids"].reshape(-1)
+        if int(nt_flat.shape[0]) != batch_size:
+            raise RuntimeError(
+                "hierarchical_verification: lc['next_token_ids'] must have one entry "
+                f"per batch row; got numel={int(nt_flat.shape[0])} batch_size={batch_size}"
+            )
+        tt_base = nt_flat.to(torch.int32)
+        if tgt_pos.dim() == 1:
+            tp_base = tgt_pos.index_select(0, last_rows)
+        else:
+            tp_base = tgt_pos[:, last_rows]
+
+        hs = int(inter.hidden_size)
+        th_base = torch.zeros(
+            (batch_size, hs),
+            dtype=inter.hidden_states.dtype,
+            device=inter.hidden_states.device,
+        )
+
+        qsl_pack = torch.arange(
+            batch_size + 1, dtype=qsl_src.dtype, device=qsl_src.device
+        )
+        qsl_pack_cpu = torch.arange(
+            batch_size + 1,
+            dtype=inter_cad_full.query_start_loc_cpu.dtype,
+            device=inter_cad_full.query_start_loc_cpu.device,
+        )
+        slot_pack = inter_cad_full.slot_mapping.index_select(0, last_rows)
+        sl_src = inter_cad_full.seq_lens[:batch_size]
+        seq_lens_pack = sl_src - Lspec
+        if bool((seq_lens_pack < 1).any().item()):
+            raise RuntimeError(
+                "hierarchical_verification: seq_lens - num_spec would drop below 1: "
+                f"seq_lens[:{batch_size}]={sl_src.tolist()} Lspec={Lspec} -> {seq_lens_pack.tolist()}"
+            )
+        max_seq_pack = int(seq_lens_pack.max().item())
+
+        pack_cad = inter_cad_full.replace(
+            query_start_loc=qsl_pack,
+            query_start_loc_cpu=qsl_pack_cpu,
+            slot_mapping=slot_pack,
+            seq_lens=seq_lens_pack,
+            num_reqs=batch_size,
+            num_actual_tokens=batch_size,
+            max_query_len=1,
+            max_seq_len=max_seq_pack,
+        )
+        lc["cad"] = pack_cad
+        if self._spec_step_debug_enabled() and self._spec_step_debug_tp0():
+            self._hv_spec_step_debug_geom_check_a(proposal_tokens, prep)
 
         base_next = lc["next_token_ids"]
         pt = hv_ctx.get("prefix_tokens")
@@ -5812,16 +5864,9 @@ class GPUModelRunner(
         else:
             next_tok_tensor = base_next.to(torch.int32)
 
-        hs = int(inter.hidden_size)
-        th_use = torch.zeros(
-            (B_pack, hs),
-            dtype=inter.hidden_states.dtype,
-            device=inter.hidden_states.device,
-        )
-
-        lc["hv_step_target_token_ids"] = tt
-        lc["hv_step_target_positions"] = tp
-        lc["hv_step_target_hidden_states"] = th_use
+        lc["hv_step_target_token_ids"] = tt_base
+        lc["hv_step_target_positions"] = tp_base
+        lc["hv_step_target_hidden_states"] = th_base
         lc["hv_step_next_token_ids"] = next_tok_tensor
 
         prefix_rows = self._hv_prefix_rows_from_prefix_tensors(
@@ -5832,9 +5877,9 @@ class GPUModelRunner(
         pre = self._prepare_hv_step(
             inter,
             pack_cad,
-            target_token_ids=tt,
-            target_positions=tp,
-            target_hidden_states=th_use,
+            target_token_ids=tt_base,
+            target_positions=tp_base,
+            target_hidden_states=th_base,
             next_token_ids=next_tok_tensor,
             num_rejected_tokens_gpu=lc["num_rejected_tokens_gpu"],
             prefix_rows=prefix_rows,
@@ -6300,15 +6345,13 @@ class GPUModelRunner(
                 sampling_metadata=round_sm,
                 use_draft_probs=use_draft_probs,
             )
-            # ``hv_pack_cad``: same base-query CAD as draft propose (one row / req).
-            # ``inter_cad`` from ``_prepare_intermediate_metadata`` is spec-conditioned;
-            # do not pass it to ``_prepare_hv_step`` or prefix packing double-extends drafts.
+            # ``_run_hv_intermediate_verify_from_frontier`` builds a 1-row/req pack CAD
+            # from ``prep`` (intermediate mirror); keeps full spec ``target_*`` for layout.
             self._hv_round_ctx["legacy_crosscheck"] = {
                 "target_token_ids": target_token_ids,
                 "target_positions": target_positions,
                 "target_hidden_states": target_hidden_states,
                 "next_token_ids": next_token_ids,
-                "hv_pack_cad": draft_cad,
                 "prefix_tokens": prefix_tokens,
                 "prefix_lens": prefix_lens,
                 "batch_size": batch_size,
