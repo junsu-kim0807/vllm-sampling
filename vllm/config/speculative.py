@@ -1554,18 +1554,16 @@ class SpeculativeConfig:
     def runner_num_partial_speculative_tokens(self) -> int:
         """Budget axis for **staged partial-accept** histograms (scheduler / metrics).
 
-        For hierarchical D→I rounds this is ``R * L`` (number of inner rounds times
-        chunk length) on adaptive/pivot pipelines: the cumulative draft-proposal token
-        count across intermediate verification rounds **before** the tail and **before**
-        the single authoritative target pass.
+        The unified profiler fills ``partial_accepted_per_req`` from hybrid bundle
+        ``inter_accepted_counts`` (see ``GPUModelRunner._populate_staged_profile_context_from_bundle``),
+        which can exceed a naive ``R * L`` "draft-only" budget. If
+        ``num_partial_spec_tokens`` is too small, ``SpecDecodingStats.observe_draft_with_cost_breakdown``
+        asserts.
 
-        For standalone ``hierarchical_verification``, the cost profiler records
-        ``inter_accepted_counts`` as the sum of per-round ``len(emitted_rows[b])``, which
-        can reach the per-round verify window (up to ``L+1`` per round) and must not be
-        capped at ``R * L`` or ``observe_draft_with_cost_breakdown`` will assert against
-        too-small ``num_partial_spec_tokens``. We therefore align the partial histogram
-        width with ``hv_max_spec_len()`` (same as ``runner_num_speculative_tokens()`` for
-        this method).
+        For standalone ``hierarchical_verification`` and for adaptive/pivot pipelines
+        that share the same hierarchical verification contract, the partial histogram
+        width is therefore aligned with ``runner_num_speculative_tokens()`` (final
+        verification / tensor width ``K_final``), not ``R * L`` alone.
         """
         if self.method == "hierarchical_verification":
             return self.hv_max_spec_len()
@@ -1573,13 +1571,13 @@ class SpeculativeConfig:
             self.method == "adaptive_spechive"
             and self.adaptive_spechive_mode == "hierarchical_verification"
         ):
-            return self.adaptive_spechive_num_rounds * self.num_speculative_tokens
+            return self.runner_num_speculative_tokens()
         if (
             self.method == "pivot"
             and self.get_pivot_runtime_mode().verification_pipeline
             in ("intermediate_then_target", "intermediate_tree_then_target_tree")
         ):
-            return self.pivot_spechive_num_rounds * self.num_speculative_tokens
+            return self.runner_num_speculative_tokens()
         return 0
 
     def use_eagle(self) -> bool:
