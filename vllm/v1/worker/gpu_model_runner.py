@@ -1091,7 +1091,8 @@ class GPUModelRunner(
         )
         self._dit_debug_last_commit_len: dict[str, int] = {}
         self._dit_debug_last_commit_token: dict[str, int] = {}
-        # ``VLLM_SPEC_STEP_DEBUG=1``: log up to 5 HV propose+target-verify traces.
+        # ``VLLM_SPEC_STEP_DEBUG=1``: log up to 5 HV propose+target-verify traces
+        # (tensor-parallel rank 0 only; avoids duplicate lines per TP worker).
         self._spec_step_debug_remaining: int | None = None
         self._spec_step_debug_hv_snapshot: dict[str, Any] | None = None
 
@@ -5798,8 +5799,16 @@ class GPUModelRunner(
     def _spec_step_debug_enabled(self) -> bool:
         return os.environ.get("VLLM_SPEC_STEP_DEBUG", "0") == "1"
 
+    def _spec_step_debug_tp0(self) -> bool:
+        try:
+            return bool(get_tp_group().is_first_rank())
+        except Exception:
+            return True
+
     def _spec_step_debug_try_emit(self) -> bool:
         if not self._spec_step_debug_enabled():
+            return False
+        if not self._spec_step_debug_tp0():
             return False
         if self._spec_step_debug_remaining is None:
             self._spec_step_debug_remaining = 5
@@ -5816,6 +5825,17 @@ class GPUModelRunner(
         sampled_token_ids: torch.Tensor,
     ) -> None:
         """One trace: inner draft rounds, intermediate emitted rows, tail draft, bundle, target I/O."""
+        try:
+            tp_ri = int(get_tp_group().rank_in_group)
+        except Exception:
+            tp_ri = -1
+        logger.info(
+            "SPEC_STEP_DEBUG [0] tp_rank=%s standalone_HV note="
+            "intermediate_verify_uses_mirror_frontier_metadata_direct_gather; "
+            "target_verify_uses_spec_decode_metadata_alignment; "
+            "if_target_first_matches_inner_draft_but_not_bundle_prefix_investigate_row_geometry",
+            tp_ri,
+        )
         logger.info(
             "SPEC_STEP_DEBUG [1] draft_round_token_ids=%s "
             "intermediate_verified_emitted_token_ids=%s tail_draft_token_ids=%s req_ids=%s",
@@ -5844,6 +5864,47 @@ class GPUModelRunner(
             "target_verification_output_sampled_token_ids=%s",
             spec_decode_metadata.draft_token_ids.detach().cpu().tolist(),
             sampled_token_ids.detach().cpu().tolist(),
+        )
+        dr = hv_snapshot.get("draft_rounds")
+        ir = hv_snapshot.get("inter_rounds")
+        td = hv_snapshot.get("tail_draft")
+        first_inner_draft: int | None = None
+        if dr and dr[0] and dr[0][0]:
+            first_inner_draft = int(dr[0][0][0])
+        first_inter_emit: int | None = None
+        if ir and ir[0] and ir[0][0]:
+            row0 = ir[0][0]
+            if row0:
+                first_inter_emit = int(row0[0])
+        first_tail: int | None = None
+        if td and td[0]:
+            first_tail = int(td[0][0])
+        bundle_flat: list[int] = (
+            bundle.draft_token_ids.detach().cpu().tolist()
+            if bundle is not None
+            else []
+        )
+        bundle_first = int(bundle_flat[0]) if bundle_flat else None
+        samp = sampled_token_ids.detach().cpu().tolist()
+        target_first = int(samp[0][0]) if samp and samp[0] else None
+        flags = {
+            "target_eq_bundle_first": target_first == bundle_first,
+            "target_eq_first_inner_draft": target_first == first_inner_draft,
+            "target_eq_first_inter_emitted": target_first == first_inter_emit,
+            "target_eq_first_tail_draft": target_first == first_tail,
+        }
+        logger.info(
+            "SPEC_STEP_DEBUG [4] first_token_ids inner_round0_draft_pos0=%s "
+            "intermediate_emitted_row0_pos0=%s tail_draft_pos0=%s bundle_flat_pos0=%s "
+            "target_sampled_pos0=%s alignment_flags=%s "
+            "(inter_counters_inter_verified_accepted_are_per_round_L_and_emitted_lens; "
+            "mismatch_here_suggests_intermediate_frontier_vs_target_verify_geometry)",
+            first_inner_draft,
+            first_inter_emit,
+            first_tail,
+            bundle_first,
+            target_first,
+            flags,
         )
 
     def run_hv_rounds(
