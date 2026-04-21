@@ -3548,6 +3548,49 @@ class GPUModelRunner(
                     cu_num_tokens,
                     expansion_plan=None,
                 )
+                if scheduled_spec_decode_tokens_override is not None:
+                    # _calc_spec_decode_metadata reads draft rows from self.input_ids.gpu,
+                    # not scratch out_buffers input_ids. With an override map, counts
+                    # already come from the map; align draft_token_ids the same way as
+                    # the pivot packed path (dataclass_replace on the bundle tensor).
+                    flat_override: list[int] = []
+                    for req_idx in range(num_reqs):
+                        nd = int(num_draft_tokens[req_idx])
+                        if nd <= 0:
+                            continue
+                        rid = ib.req_ids[req_idx]
+                        toks = scheduled_spec_decode_tokens_override.get(str(rid))
+                        if toks is None:
+                            toks = scheduled_spec_decode_tokens_override.get(rid)
+                        if toks is None:
+                            raise ValueError(
+                                "scheduled_spec_decode_tokens_override missing entry "
+                                f"for req_id={rid!r} with num_draft_tokens[{req_idx}]={nd}"
+                            )
+                        if len(toks) < nd:
+                            raise ValueError(
+                                "scheduled_spec_decode_tokens_override too short "
+                                f"for req_id={rid!r}: need {nd}, got {len(toks)}"
+                            )
+                        flat_override.extend(int(x) for x in toks[:nd])
+                    expect_flat = int(
+                        spec_decode_metadata.cu_num_draft_tokens[-1].item()
+                    )
+                    if len(flat_override) != expect_flat:
+                        raise ValueError(
+                            "override draft flat length mismatch: "
+                            f"built {len(flat_override)} draft slots, "
+                            f"metadata expects {expect_flat}"
+                        )
+                    ov = torch.tensor(
+                        flat_override,
+                        dtype=spec_decode_metadata.draft_token_ids.dtype,
+                        device=spec_decode_metadata.draft_token_ids.device,
+                    )
+                    spec_decode_metadata = dataclass_replace(
+                        spec_decode_metadata,
+                        draft_token_ids=ov,
+                    )
                 # Origin-only metadata: do **not** clear the pending bundle just because
                 # len(pb.num_draft_tokens) != num_reqs. Batch shrink / reorder is handled
                 # in _sample() via remap_hybrid_bundle_rows_for_metadata (subset survivor).
